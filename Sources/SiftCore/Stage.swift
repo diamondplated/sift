@@ -91,7 +91,11 @@ private func human(_ nInput: Double) -> String {
 /// formatting — round-trips the double's exact binary value and rounds half-to-even on an exact
 /// tie (verified against CPython; see task-6-report.md). Grouping loop mirrors DuckDBKit's
 /// `Cell.grouped`, extended to carry a fractional part and a sign.
-private func grouped(_ n: Double, decimals: Int) -> String {
+///
+/// Not `private`: Source.swift's `estimateRows` reuses this for its `basis` strings (Python's
+/// `f"{n:,}"`), on the same "no NumberFormatter, no locale sensitivity" grounds — see task-9
+/// gotcha #5. Still module-internal, not `public`; nothing outside SiftCore needs it.
+func grouped(_ n: Double, decimals: Int) -> String {
     let formatted = String(format: "%.\(decimals)f", n)
     let negative = formatted.hasPrefix("-")
     let unsigned = negative ? String(formatted.dropFirst()) : formatted
