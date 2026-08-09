@@ -107,3 +107,31 @@ private func entry(_ name: String, _ daysAgo: Int, _ gb: Double) -> StagedEntry 
 @Test func defaultAgeIsTwoWeeks() {
     #expect(defaultMaxAgeDays == 14)
 }
+
+// MARK: - catalog schema (review round 1, I2)
+
+// ~/.sift/stage.duckdb is a persisted, on-disk store both the Python and Swift engines can open
+// during the Plan 5 transition. Pinned against engine/core/stage.py's CATALOG_DDL directly (not
+// against Stage.swift's own catalogDDL), so a reordered column, changed type, or dropped
+// PRIMARY KEY fails here even though it would pass every test that exists in either language.
+@Test func catalogDDLPinsTheSharedSchemaColumnByColumn() {
+    #expect(catalogDDL.contains("CREATE TABLE IF NOT EXISTS _sift_sources"))
+
+    // Verbatim, in order, from CATALOG_DDL.
+    let expectedColumns = [
+        "source_token VARCHAR PRIMARY KEY",
+        "path         VARCHAR",
+        "mtime_ns     BIGINT",
+        "size         BIGINT",
+        "table_name   VARCHAR",
+        "fmt          VARCHAR",
+        "staged_at    TIMESTAMP",
+        "last_used    TIMESTAMP",
+        "row_count    BIGINT",
+        "bytes        BIGINT",
+    ]
+    #expect(catalogDDL.contains(expectedColumns.joined(separator: ",\n    ")))
+
+    // Exactly one PRIMARY KEY, and (checked above) it is on source_token, not floated elsewhere.
+    #expect(catalogDDL.components(separatedBy: "PRIMARY KEY").count == 2)
+}

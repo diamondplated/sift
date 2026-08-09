@@ -12,10 +12,11 @@ import Foundation
 let MB = 1024 * 1024
 let GB = 1024 * MB
 
-/// Below: a full re-parse is under ~100 ms, a view is imperceptible. Public: it is
-/// `shouldStage`'s default `threshold`, and a default argument value must be at least as
-/// accessible as the function it defaults for.
-public let stageMinBytes = 25 * MB
+/// Below: a full re-parse is under ~100 ms, a view is imperceptible. `@usableFromInline` (not
+/// `public`): it is `shouldStage`'s default `threshold`, and a default argument value must be
+/// at least as accessible as the function it defaults for — but nothing in engine/ ever
+/// referenced `STAGE_MIN_BYTES` outside stage.py, so this stays out of SiftCore's public API.
+@usableFromInline let stageMinBytes = 25 * MB
 /// Above: a CTAS is minutes and many GB of disk, so ask first.
 let stageConfirmBytes = 20 * GB
 /// Measured CSV parse rate on an M-series Mac; only the "~20 s" hint.
@@ -136,8 +137,11 @@ public func dropStagingSQL(_ table: String) -> String {
 
 // ------------------------------------------------------- staged-data lifecycle
 
-/// Public for the same reason as `stageMinBytes`: `selectForPurge`'s default arguments.
-public let defaultBudgetBytes = 20 * GB
+/// `@usableFromInline` for the same reason as `stageMinBytes`: `DEFAULT_BUDGET_BYTES` was never
+/// referenced outside stage.py either.
+@usableFromInline let defaultBudgetBytes = 20 * GB
+/// Public, unlike its two siblings above: `DEFAULT_MAX_AGE_DAYS` IS cross-module in Python
+/// (session.py:980), so SiftEngine will need this one too.
 public let defaultMaxAgeDays = 14
 
 /// A row of the `_sift_sources` catalog, as far as purge decisions are concerned.
