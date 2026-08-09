@@ -11,3 +11,8 @@ Sift.app/
 .DS_Store
 # Swift
 shell/.build/
+
+# Native rewrite
+.build/
+Vendor/
+Sources/CDuckDB/duckdb.h
