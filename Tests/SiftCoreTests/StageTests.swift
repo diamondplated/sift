@@ -45,6 +45,34 @@ func columnarFormatsAreNeverStaged(fmt: Fmt) {
     #expect(shouldStage(fmt: .csv, sizeBytes: 25 * MB, freeBytes: free).stage == true)
 }
 
+// MARK: - human() — the locale trap
+//
+// `human()` is the module's only number formatter and its output is read by a user in every
+// `StageDecision.reason`, all three of `estimateRows`' `basis` strings, and both of
+// `ramWarning`'s numbers. Not one of those strings was asserted in either language: changing
+// `grouped`'s separator from "," to " " left all 195 tests green. Python's `f"{n:,.1f}"` is
+// always a comma group separator and a period decimal point regardless of locale, so these are
+// the values, verbatim.
+
+@Test(arguments: [
+    (1023.0, "1,023 B"),                 // last byte before the KB step, and grouped
+    (1024.0, "1.0 KB"),                  // first KB
+    (1_048_576.0, "1.0 MB"),             // first MB
+    (1_073_741_823.0, "1,024.0 MB"),     // 1 GB - 1 B: rounds to a grouped "1,024.0 MB", not "1.0 GB"
+    (5_629_499_534_213_120.0, "5,120.0 TB"),   // 5 PiB — past the last named unit, still grouped
+])
+func humanUsesACommaGroupSeparatorAndAPeriodDecimalAtEveryUnitBoundary(n: Double, want: String) {
+    #expect(human(n) == want)
+}
+
+// One reason string end to end, so the format is pinned where the user actually meets it.
+@Test func stageReasonQuotesTheSizeThroughHuman() {
+    #expect(
+        shouldStage(fmt: .csv, sizeBytes: 500 * MB, freeBytes: free).reason
+            == "500.0 MB of text — a native copy makes scrolling and grouping instant"
+    )
+}
+
 // MARK: - ctas_sql / swap_sql
 
 // Turning off preserve_insertion_order makes the swap VISIBLE as the grid reshuffling.

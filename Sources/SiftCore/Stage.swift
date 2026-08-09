@@ -75,7 +75,12 @@ public func shouldStage(
 /// <unit>"` for KB/MB/GB/TB. Deliberately NOT NumberFormatter — without an explicit `.locale` it
 /// follows `Locale.current`, and a blob-size string that changes shape with the user's region
 /// already shipped twice on this branch. `grouped(_:decimals:)` below hand-rolls the formatting.
-private func human(_ nInput: Double) -> String {
+///
+/// Not `private`, for the same reason `grouped` below isn't: StageTests pins its output at the
+/// unit boundaries directly. Every string it produces is read by a user (every
+/// `StageDecision.reason`), and before that test existed, changing the group separator from ","
+/// to " " left all 195 tests green.
+func human(_ nInput: Double) -> String {
     var n = nInput
     for unit in ["B", "KB", "MB", "GB"] {
         if abs(n) < 1024 {

@@ -90,6 +90,20 @@ private let cols: [String: Column] = Dictionary(uniqueKeysWithValues: colsList.m
     #expect(sql.contains("IS NOT NULL AND CAST(\"region\" AS VARCHAR) <> ''"))
 }
 
+// "NULL vs '' vs 'N/A' stay three distinct things" is a spec §11 frozen contract and the
+// product's entire pitch, and the sentinel list is what makes the third one work. Only the
+// literal `n/a` was reachable from any fixture: deleting 9 of the 16 sentinels left all 195 tests
+// green, because the test above asserts the FILTER clause's shape and never its contents. This
+// asserts the rendered tuple verbatim, in order.
+@Test func profileExtraPinsTheNullishSentinelsVerbatim() {
+    let sql = profileExtraSQL(q("t"), [Column(name: "region", type: "VARCHAR")])
+    #expect(sql.contains(
+        "AND lower(trim(CAST(\"region\" AS VARCHAR))) IN ("
+            + "'', 'na', 'n/a', 'null', 'none', 'nil', '-', '--', '—', '?', "
+            + "'#n/a', '#na', 'nan', 'not available', 'unknown', '.')"
+    ))
+}
+
 // MARK: - uncastable_sql / bad_row_count_sql
 
 @Test func uncastableSkipsTextColumnsButKeepsTheShape() throws {

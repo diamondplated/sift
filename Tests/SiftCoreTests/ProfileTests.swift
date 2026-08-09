@@ -170,3 +170,26 @@ func chooseViewPicksThePanel(type: String, approx: Int, n: Int, want: ColumnProf
     #expect(looksLikeExcelSerialDates(money) == false)
     #expect(looksLikeExcelSerialDates(text) == false)
 }
+
+// MARK: - the null_percentage fallback
+
+// The last remaining path that can put a plausible wrong `nNull` on screen, and untested in BOTH
+// languages. Python's `round()` is banker's rounding (half-to-even); Swift's `.rounded()` default
+// is half-away-from-zero, and the two disagree only at an exact .5 — which is where both of these
+// land, one rounding down to even and one rounding up to even, so this cannot be satisfied by
+// "always truncate" either.
+@Test func nullPercentageFallbackRoundsHalfToEvenLikePython() {
+    let col = Column(name: "a", type: "BIGINT")
+    let summ = ["a": SummarizeRow(nullPercentage: 50.0)]
+
+    // 50% of 5 rows = 2.5 -> 2 (down to even). Half-away-from-zero would say 3.
+    #expect(buildProfile(cols: [col], summ: summ, nRows: 5)[0].nNull == 2)
+    // 50% of 7 rows = 3.5 -> 4 (up to even).
+    #expect(buildProfile(cols: [col], summ: summ, nRows: 7)[0].nNull == 4)
+
+    // The fallback only fires when the FILTER pass has not run: a real c0__null wins outright,
+    // even when it disagrees with the percentage.
+    #expect(
+        buildProfile(cols: [col], summ: summ, extra: ["c0__null": 1], nRows: 5)[0].nNull == 1
+    )
+}

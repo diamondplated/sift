@@ -95,6 +95,20 @@ private func firstLineByteCount(_ path: String) -> Int {
     #expect(est.rows == 0)
 }
 
+// The `basis` strings are shown on hover and go through the same locale-trap formatter as
+// `human()` (Python's `f"{n:,}"`). Asserted verbatim — no test in either language pinned one, so
+// a group-separator change was invisible. 200 lines of 10 bytes is exactly 2,000 B, chosen so the
+// number is large enough to be grouped at all.
+@Test func basisNamesTheByteCountWithACommaGroupSeparator() throws {
+    let dir = try freshTempDir()
+    let p = (dir as NSString).appendingPathComponent("grouped.csv")
+    try String(repeating: "abcdefghi\n", count: 200).write(toFile: p, atomically: true, encoding: .utf8)
+    let est = estimateRows(path: p)
+    #expect(est.rows == 200)
+    #expect(est.confidence == .exact)
+    #expect(est.basis == "counted every byte (2,000 B)")
+}
+
 @Test func noTrailingNewlineStillCountsTheLastRow() throws {
     let dir = try freshTempDir()
     let p = (dir as NSString).appendingPathComponent("nt.csv")

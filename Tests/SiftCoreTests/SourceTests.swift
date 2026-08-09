@@ -180,6 +180,51 @@ private func detectFormatMatchesExpectation(file: FixtureFile, want: Fmt) throws
     #expect(head.filter { $0 == 0x0A }.count == 4)   // 3 junk lines + the header
 }
 
+// MARK: - the `columns=` ordering landmine
+//
+// `read_csv(columns={…})` disables auto-detection and binds each entry POSITIONALLY against the
+// file, so file-column order is a correctness dependency: a wrong order silently assigns the
+// wrong type to every column — a plausible-wrong-value bug in the one product that exists not to
+// produce those. It carries a 12-line LANDMINE comment in Types.swift and was the headline risk
+// of two tasks, and nothing asserted it: `allVarcharRelationDropsTheColumnTypesFromReadExpr`
+// above only asserts the argument is ABSENT, and SnippetTests compares the snippet against a
+// query built from this same `readExpr`, so a scramble cancels out on both sides. Mutating
+// `columnsArgValue` to `columns.reversed()` left all 195 tests green. These two assert the whole
+// expression verbatim instead.
+
+@Test func readExprRendersColumnsInFileOrderNeitherSortedNorReversed() {
+    // Names deliberately in no alphabetical relation to their file order (sorted would be
+    // alpha/bravo/mike/zulu, reversed would be bravo/mike/alpha/zulu), and every column carries a
+    // DIFFERENT type, so any permutation renders a visibly different string.
+    let cols = [
+        Column(name: "zulu_when", type: "TIMESTAMP"),
+        Column(name: "alpha_id", type: "BIGINT"),
+        Column(name: "mike_amount", type: "DECIMAL(12,2)"),
+        Column(name: "bravo_note", type: "VARCHAR"),
+    ]
+    let spec = SourceSpec(
+        key: SourceKey(path: "/data/orders.csv", mtimeNs: 0, size: 0), fmt: .csv,
+        readFn: "read_csv",
+        readArgs: ["delim": .text(","), "header": .bool(true), "skip": .int(0)],
+        columns: cols
+    )
+    #expect(readExpr(spec: spec) == """
+        read_csv('/data/orders.csv', delim=',', header=true, skip=0, \
+        columns={'zulu_when': 'TIMESTAMP', 'alpha_id': 'BIGINT', \
+        'mike_amount': 'DECIMAL(12,2)', 'bravo_note': 'VARCHAR'})
+        """)
+}
+
+@Test func readExprOmitsColumnsEntirelyForAnEmptyColumnList() {
+    // `columns={}` is a DuckDB parse error, and Python never emits the argument when there is
+    // nothing to put in it. The `!spec.columns.isEmpty` guard that mirrors that was unpinned too.
+    let spec = SourceSpec(
+        key: SourceKey(path: "/data/orders.csv", mtimeNs: 0, size: 0), fmt: .csv,
+        readFn: "read_csv", readArgs: ["header": .bool(true)], columns: []
+    )
+    #expect(readExpr(spec: spec) == "read_csv('/data/orders.csv', header=true)")
+}
+
 @Test func deltaVersionReadsTheLatestCommittedVersionFromTheLogFilenames() throws {
     // Not from Python's suite (no test_delta_version exists there either — it's only exercised
     // indirectly through build_source, which is deferred); delta_version is pure, so it's ported
