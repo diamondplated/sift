@@ -131,3 +131,17 @@ private func one(_ sql: String) throws -> Cell {
     #expect(try one("SELECT TIME '12:34:56.123456'") == .text("12:34:56.123456"))
     #expect(try one("SELECT TIME '12:34:56'") == .text("12:34:56"))
 }
+
+@Test func distinguishesZonedTimestampsFromNaiveOnes() throws {
+    // The bug this pins: a naive TIMESTAMP used to get a spurious Z, making it
+    // indistinguishable from a genuinely zoned value. Python renders naive bare and
+    // aware with an offset; so do we.
+    #expect(try one("SELECT TIMESTAMP '2026-08-09 12:34:56'") == .text("2026-08-09T12:34:56"))
+    #expect(try one("SELECT TIMESTAMPTZ '2026-08-09 12:34:56+00'")
+            == .text("2026-08-09T12:34:56+00:00"))
+}
+
+@Test func decodesTimeWithTimezone() throws {
+    #expect(try one("SELECT TIMETZ '12:34:56+02:00'") == .text("12:34:56+02:00"))
+    #expect(try one("SELECT TIMETZ '12:34:56-05:30'") == .text("12:34:56-05:30"))
+}

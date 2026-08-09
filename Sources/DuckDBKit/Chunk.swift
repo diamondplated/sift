@@ -61,7 +61,12 @@ public struct Chunk {
             // A nil data pointer means the value lives elsewhere (STRUCT/ARRAY/UNION
             // keep theirs in child vectors), NOT that the rows are NULL. Reporting
             // NULL here would invent missing data.
-            return [Cell](repeating: .text("⟨unreadable \(meta.typeName)⟩"), count: rowCount)
+            //
+            // meta.typeID.rawValue, not meta.typeName: ResultSet.typeName collapses
+            // every type it doesn't special-case — including STRUCT, ARRAY and UNION,
+            // the exact types that reach this branch — down to the single string
+            // "OTHER", which names nothing.
+            return [Cell](repeating: .text("⟨unreadable type \(meta.typeID.rawValue)⟩"), count: rowCount)
         }
 
         var out = [Cell](repeating: .null, count: rowCount)
@@ -283,9 +288,18 @@ public struct Chunk {
         return (y + (m <= 2 ? 1 : 0), m, d)
     }
 
+    /// `String(format: "%04d", -99)` gives "-099" — the "0" pad character sits between
+    /// the sign and the digits, so it pads the whole signed number to 4 characters, not
+    /// the magnitude to 4 digits. ISO 8601 expanded form wants "-0099": the minus sign
+    /// PLUS 4 digits of magnitude. Formatting the sign and the magnitude separately is
+    /// what gets that right for any BC year.
+    private static func year4(_ year: Int) -> String {
+        year < 0 ? "-" + String(format: "%04d", -year) : String(format: "%04d", year)
+    }
+
     static func isoDate(daysSinceEpoch: Int) -> String {
         let c = civilFromDays(daysSinceEpoch)
-        return String(format: "%04d-%02d-%02d", c.year, c.month, c.day)
+        return "\(year4(c.year))-" + String(format: "%02d-%02d", c.month, c.day)
     }
 
     /// Formats a count of sub-second units since the epoch.
@@ -293,7 +307,13 @@ public struct Chunk {
     /// `perSecond` is the unit scale (1 for seconds, 1_000 for millis, 1_000_000 for
     /// micros, 1_000_000_000 for nanos); `fracDigits` is how many digits that scale
     /// needs. The fraction is emitted only when non-zero, matching Python's
-    /// datetime.isoformat(), which is what the engine this replaces produces.
+    /// datetime.isoformat(), which omits the fraction entirely for a whole-second
+    /// value but never trims within it — isoformat() always prints microseconds at
+    /// full 6-digit width once there is a fraction at all, and the DECIMAL fix a few
+    /// lines away in Cell.swift exists for the identical reason: dropping a trailing
+    /// zero misrepresents the column's declared precision. A decisecond column and a
+    /// microsecond column must not render identically just because both happen to end
+    /// in zeros.
     ///
     /// Integer division throughout: routing micros through Double and a formatter
     /// dropped sub-second precision AND rounded .999999 up to the next second.
@@ -306,13 +326,12 @@ public struct Chunk {
         let c = civilFromDays(days)
         let secOfDay = rem / perSecond
         let frac = rem % perSecond
-        var s = String(format: "%04d-%02d-%02dT%02d:%02d:%02d",
-                       c.year, c.month, c.day,
+        var s = "\(year4(c.year))-" + String(format: "%02d-%02dT%02d:%02d:%02d",
+                       c.month, c.day,
                        secOfDay / 3600, (secOfDay % 3600) / 60, secOfDay % 60)
         if frac != 0 && fracDigits > 0 {
             var digits = String(frac)
             while digits.count < fracDigits { digits = "0" + digits }
-            while digits.hasSuffix("0") { digits.removeLast() }   // isoformat trims
             s += "." + digits
         }
         return s + suffix
@@ -326,7 +345,6 @@ public struct Chunk {
         if frac != 0 {
             var digits = String(frac)
             while digits.count < 6 { digits = "0" + digits }
-            while digits.hasSuffix("0") { digits.removeLast() }
             s += "." + digits
         }
         return s
@@ -343,7 +361,6 @@ public struct Chunk {
         if d.time.micros != 0 {
             var digits = String(d.time.micros)
             while digits.count < 6 { digits = "0" + digits }
-            while digits.hasSuffix("0") { digits.removeLast() }
             s += "." + digits
         }
         let mag = abs(Int(d.offset))   // offset is bounded to +/-16h, nowhere near Int32.min
