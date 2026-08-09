@@ -8,6 +8,9 @@ extension Connection {
         let prepared = duckdb_prepare(handle, sql, &stmt)
         defer { duckdb_destroy_prepare(&stmt) }
 
+        // Not redundant with the execute check below. MEASURED against libduckdb 1.5.5:
+        // calling duckdb_execute_prepared on a statement whose prepare FAILED segfaults
+        // (exit 139). This guard is crash-preventing, not cosmetic.
         if prepared != DuckDBSuccess {
             let msg = duckdb_prepare_error(stmt).map(String.init(cString:)) ?? ""
             throw DuckDBError(msg)
