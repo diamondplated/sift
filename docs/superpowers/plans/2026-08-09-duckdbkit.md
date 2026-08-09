@@ -541,11 +541,26 @@ public enum Cell: Sendable, Equatable {
         case .text(let v):     return v
         case .decimal(let v):  return "\(v)"
         case .blob(let n):
-            let f = NumberFormatter()
-            f.numberStyle = .decimal
-            let s = f.string(from: NSNumber(value: n)) ?? String(n)
-            return "<blob \(s) B>"
+            return "<blob \(Self.grouped(n)) B>"
         }
+    }
+
+    /// Comma-grouped, unconditionally — matching the Python engine's `f"{n:,}"`, which
+    /// is what the grid currently renders.
+    ///
+    /// Deliberately NOT NumberFormatter. Without an explicit `.locale` it follows
+    /// `Locale.current`, and the same value renders four different ways — MEASURED:
+    /// en_US "1,234", de_DE "1.234", fr_FR "1 234", en_US_POSIX "1234". A blob size
+    /// that changes shape with the user's region is a bug, and one that passes CI only
+    /// because the runner happens to be en_US is a worse one.
+    static func grouped(_ n: Int) -> String {
+        let digits = String(n.magnitude)
+        var out = ""
+        for (i, c) in digits.enumerated() {
+            if i > 0 && (digits.count - i) % 3 == 0 { out.append(",") }
+            out.append(c)
+        }
+        return n < 0 ? "-" + out : out
     }
 }
 ```
@@ -589,10 +604,16 @@ Append to `Tests/DuckDBKitTests/SmokeTests.swift`:
 
 ```swift
 @Test func blobDisplayMatchesThePythonEngineFormat() {
-    // session.jsonable renders a blob as "<blob 1,234 B>" — thousands separator and
-    // all. The grid shows this string, so the format is a contract, not a detail.
+    // The grid renders this string, so the format is a contract, not a detail — and it
+    // must not vary with the machine's region. See Cell.grouped for the measurements.
+    #expect(Cell.blob(0).display == "<blob 0 B>")
     #expect(Cell.blob(3).display == "<blob 3 B>")
+    #expect(Cell.blob(999).display == "<blob 999 B>")
+    #expect(Cell.blob(1000).display == "<blob 1,000 B>")
     #expect(Cell.blob(1234).display == "<blob 1,234 B>")
+    #expect(Cell.blob(999999).display == "<blob 999,999 B>")
+    #expect(Cell.blob(1000000).display == "<blob 1,000,000 B>")
+    #expect(Cell.blob(1234567890).display == "<blob 1,234,567,890 B>")
 }
 
 @Test func nullDisplaysAsEmptyAndKnowsItIsNull() {
@@ -607,9 +628,12 @@ Append to `Tests/DuckDBKitTests/SmokeTests.swift`:
 Run: `swift build && swift test`
 Expected: PASS — 9 tests (7 from Tasks 1-2, 2 new). No warnings.
 
-If `blobDisplayMatchesThePythonEngineFormat` fails on the separator, the machine's
-locale is not en_US. Do not weaken the test; note it in your report — the format is a
-contract and this needs to be resolved deliberately.
+`Cell.grouped` deliberately does not use `NumberFormatter`. Without an explicit
+`.locale` it follows `Locale.current`, so the same byte count renders four different
+ways — MEASURED: en_US `1,234`, de_DE `1.234`, fr_FR `1 234`, en_US_POSIX `1234`. That
+is a production bug, not a test detail: `display` is what the grid renders, and it must
+match the Python engine's unconditional-comma `f"{n:,}"`. Hand-rolled grouping is
+deterministic by construction and needs no locale pinning.
 
 - [ ] **Step 5: Commit**
 
