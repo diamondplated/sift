@@ -1,0 +1,97 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  engine:
+    name: Engine tests (Python ${{ matrix.python }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.12", "3.13"]
+
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python }}
+          cache: pip
+
+      - name: Install pinned dependencies
+        run: pip install -r requirements.txt -r requirements-dev.txt
+
+      # Extension binaries are per-DuckDB-version and fetched from the extension
+      # repository. conftest.py skips extension-dependent tests rather than failing
+      # if this step can't reach the network, so CI stays honest either way.
+      - name: Install DuckDB extensions
+        run: |
+          python - <<'PY'
+          import duckdb
+          c = duckdb.connect()
+          for ext in ("delta", "excel"):
+              c.execute(f"INSTALL {ext}")
+              c.execute(f"LOAD {ext}")
+          print("extensions ready")
+          PY
+
+      - name: Run tests
+        run: python -m pytest engine/tests -q
+
+  static:
+    name: Route table and JS syntax
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - run: pip install -r requirements.txt
+
+      # The web layer has no build step, so a syntax error in index.html would
+      # otherwise only surface by opening the app.
+      - name: Check the inline script parses
+        run: |
+          sed -n '/^<script>/,/^<\/script>/p' web/index.html | sed '1d;$d' > /tmp/sift.js
+          node --check /tmp/sift.js
+
+      - name: Import the app and count routes
+        run: |
+          python -c "import sys; sys.path.insert(0, 'engine'); import app; \
+            n = len(app.app.routes); print(f'{n} routes'); assert n > 10, n"
+
+  shell:
+    name: Swift shell builds
+    runs-on: macos-15
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - name: Build the native window
+        working-directory: shell
+        run: swift build -c release

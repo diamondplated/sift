@@ -1,0 +1,1864 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Sift</title>
+<style>
+  :root {
+    --ground:#eef1f2; --panel:#f9fafa; --raised:#ffffff; --line:#d5dce0; --line-soft:#e2e7ea;
+    --ink:#22313c; --ink-2:#5b6e7c; --ink-3:#8ba0ad; --accent:#F05323; --accent-ink:#fff;
+    --fresh:#1e8e5a; --stale:#b07d1e; --error:#c4404c; --info:#2b7ec2; --num:#1a6f80;
+    --chip-bg:#e8edef; --console-bg:#1a232b; --console-ink:#b9c9d4;
+    --shadow:0 1px 3px rgba(20,30,38,.12);
+    --bar:rgba(240,83,35,.20); --row-alt:#fbfcfd; --hi:rgba(240,83,35,.10);
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --ground:#10161b; --panel:#161f26; --raised:#1c2731; --line:#2c3a46; --line-soft:#223039;
+      --ink:#d8e2ea; --ink-2:#8ca0af; --ink-3:#5f7280; --accent:#FF7247; --accent-ink:#20110b;
+      --fresh:#4cc38a; --stale:#e0b45a; --error:#e5646e; --info:#58a6e8; --num:#57c3d4;
+      --chip-bg:#223039; --console-bg:#0c1216; --console-ink:#9fb4c0;
+      --shadow:0 1px 4px rgba(0,0,0,.4);
+      --bar:rgba(255,114,71,.22); --row-alt:#19232b; --hi:rgba(255,114,71,.12);
+    }
+  }
+  * { box-sizing:border-box; }
+  html,body { margin:0; height:100%; overflow:hidden; }
+  body {
+    font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",system-ui,sans-serif;
+    font-size:13px; line-height:1.45; background:var(--ground); color:var(--ink);
+    display:flex; flex-direction:column;
+  }
+  .mono { font-family:ui-monospace,"SF Mono","JetBrains Mono",Menlo,Consolas,monospace;
+          font-variant-numeric:tabular-nums; }
+  button { font:inherit; color:inherit; background:none; border:none; cursor:pointer; }
+  button:focus-visible, [tabindex]:focus-visible { outline:2px solid var(--accent); outline-offset:2px; }
+  input, textarea, select { font:inherit; color:inherit; }
+
+  /* ---------------------------------------------------------------- topbar */
+  .topbar { display:flex; align-items:center; gap:10px; padding:6px 12px; flex:none;
+            border-bottom:1px solid var(--line); background:var(--raised); }
+  .brand { display:flex; align-items:baseline; gap:6px; font-weight:800; letter-spacing:.14em;
+           font-size:12px; color:var(--accent); }
+  .brand small { color:var(--ink-3); font-weight:600; letter-spacing:.06em; font-size:9.5px; }
+  .tabs { display:flex; gap:2px; overflow-x:auto; flex:1; min-width:0; }
+  .tab { display:flex; align-items:center; gap:6px; padding:4px 9px; border-radius:6px 6px 0 0;
+         font-size:12px; color:var(--ink-2); border:1px solid transparent; white-space:nowrap;
+         max-width:230px; }
+  .tab:hover { background:var(--chip-bg); }
+  .tab.on { background:var(--ground); border-color:var(--line); border-bottom-color:var(--ground);
+            color:var(--ink); font-weight:650; }
+  .tab .nm { overflow:hidden; text-overflow:ellipsis; }
+  .tab .fmt { font-size:9px; letter-spacing:.1em; text-transform:uppercase; color:var(--ink-3);
+              font-family:ui-monospace,Menlo,monospace; }
+  .tab .x { color:var(--ink-3); font-size:14px; line-height:1; padding:0 1px; }
+  .tab .x:hover { color:var(--error); }
+  .chip { display:inline-flex; align-items:center; gap:5px; padding:3px 9px; background:var(--chip-bg);
+          border-radius:5px; font-size:11.5px; color:var(--ink-2); white-space:nowrap;
+          font-family:ui-monospace,Menlo,monospace; }
+  .chip.warn { background:color-mix(in srgb,var(--stale) 20%,transparent); color:var(--stale);
+               font-weight:650; cursor:pointer; }
+  .chip.bad { background:color-mix(in srgb,var(--error) 18%,transparent); color:var(--error);
+              font-weight:650; cursor:pointer; }
+  .chip .est { border-bottom:1px dotted currentColor; cursor:help; }
+  .btn { padding:4px 11px; border-radius:6px; border:1px solid var(--line); font-size:12px;
+         font-weight:600; background:var(--raised); white-space:nowrap; }
+  .btn:hover { border-color:var(--ink-3); }
+  .btn.primary { background:var(--accent); color:var(--accent-ink); border-color:transparent; }
+  .btn.sm { padding:2px 8px; font-size:11px; font-weight:500; }
+
+  /* ------------------------------------------------------------------ main */
+  /* The grid is the point, so it always keeps a usable share of the width. The side panels
+     collapse — automatically as the window narrows, and manually via the topbar toggles. */
+  .main { display:grid; grid-template-columns:216px minmax(0,1fr) 340px; flex:1; min-height:0; }
+  body.no-rail .main { grid-template-columns:minmax(0,1fr) 340px; }
+  body.no-insp .main { grid-template-columns:216px minmax(0,1fr); }
+  body.no-rail.no-insp .main { grid-template-columns:minmax(0,1fr); }
+  body.no-rail .rail, body.no-insp .insp { display:none; }
+  @media (max-width:1240px) { .main { grid-template-columns:184px minmax(0,1fr) 302px; }
+    body.no-insp .main { grid-template-columns:184px minmax(0,1fr); } }
+  /* Too narrow to give a panel its own column: it floats over the grid instead of shrinking it,
+     and starts closed. */
+  body.float-insp .insp { position:fixed; top:0; right:0; bottom:0; width:min(334px,90vw);
+    z-index:40; box-shadow:-6px 0 24px rgba(0,0,0,.28); }
+  body.float-rail .rail { position:fixed; top:0; left:0; bottom:0; width:min(240px,80vw);
+    z-index:41; box-shadow:6px 0 24px rgba(0,0,0,.28); }
+  body.float-insp .main, body.float-rail .main { grid-template-columns:minmax(0,1fr); }
+  .tgl { padding:3px 7px; border-radius:5px; border:1px solid var(--line); font-size:11px;
+         color:var(--ink-2); }
+  .tgl.on { background:var(--accent); color:var(--accent-ink); border-color:transparent; }
+
+  /* ---------------------------------------------------------------- native shell
+     Inside Sift.app the chrome is AppKit: a vibrant sidebar and a unified toolbar. So the page
+     drops its own topbar and rail entirely — two sets of chrome is exactly what made this feel
+     like a web page in a window. The page keeps only the grid and the inspector, and lets the
+     window's own background show through so the vibrancy reads properly. */
+  body.native { background:transparent; }
+  body.native .topbar, body.native .rail { display:none !important; }
+  body.native .main { grid-template-columns:minmax(0,1fr) 340px !important; }
+  body.native.no-insp .main { grid-template-columns:minmax(0,1fr) !important; }
+  body.native .gridwrap { background:var(--raised); }
+  body.native .insp { background:transparent; }
+  /* One content surface: without this the transparent toolbar shows the darker --ground behind it
+     as a band above the lighter grid — the "rough seam" between the sidebar and the rest. */
+  body.native .centre { background:var(--raised); }
+  /* Collapse the filter-hint strip when no table is open (renderToolbar leaves it empty), so there
+     is no leftover dark bar above the empty state. */
+  .toolbar:empty { display:none; }
+  /* Roomier metrics: native Mac tables breathe more than a web grid, and the cramped 22px row was
+     a big part of why the content read as cheap. Row height goes through a variable because the
+     grid's virtualization math depends on it — ROW_H in the script must match. */
+  body.native { font-size:13.5px; --row-h:27px; }
+  body.native .toolbar { padding:7px 14px; min-height:38px; }
+  body.native .hcell { padding:5px 9px; }
+  body.native .gcell { padding:4px 9px; font-size:12.5px; }
+  body.native .col-row { padding:6px 14px; }
+  body.native .vrow { padding:5px 7px; }
+  body.native .insp-body { padding-top:2px; }
+  .rail { border-right:1px solid var(--line); background:var(--panel); overflow-y:auto;
+          display:flex; flex-direction:column; }
+  .rail h3, .insp h3 { margin:11px 12px 4px; font-size:9.5px; letter-spacing:.16em; font-weight:700;
+            color:var(--ink-3); text-transform:uppercase; font-family:ui-monospace,Menlo,monospace; }
+  .src { display:block; width:100%; text-align:left; padding:5px 12px; font-size:12px;
+         color:var(--ink-2); border-left:2px solid transparent; }
+  .src:hover { background:var(--chip-bg); color:var(--ink); }
+  .src.on { border-left-color:var(--accent); color:var(--ink); background:var(--hi); }
+  .src .nm { font-weight:600; display:block; overflow:hidden; text-overflow:ellipsis;
+             white-space:nowrap; }
+  .src .meta { font-size:10px; color:var(--ink-3); font-family:ui-monospace,Menlo,monospace; }
+  .dropzone { margin:8px 10px; padding:14px 10px; border:1.5px dashed var(--line);
+              border-radius:8px; text-align:center; font-size:11.5px; color:var(--ink-3); }
+  .dropzone.hot { border-color:var(--accent); background:var(--hi); color:var(--ink); }
+  .pastebox { margin:0 10px 8px; display:flex; gap:4px; }
+  .pastebox input { flex:1; min-width:0; padding:4px 7px; border-radius:5px;
+                    border:1px solid var(--line); background:var(--raised); font-size:11.5px; }
+  .rail-note { margin:2px 12px 10px; font-size:10.5px; color:var(--ink-3); line-height:1.4; }
+
+  /* ------------------------------------------------------------ centre pane */
+  .centre { display:flex; flex-direction:column; min-width:0; background:var(--ground); }
+  .toolbar { display:flex; align-items:center; gap:6px; padding:5px 10px; flex:none; min-height:32px;
+             border-bottom:1px solid var(--line-soft); flex-wrap:wrap; }
+  .fchip { display:inline-flex; align-items:center; gap:5px; padding:2px 7px; border-radius:5px;
+           background:var(--hi); border:1px solid color-mix(in srgb,var(--accent) 35%,transparent);
+           font-size:11px; font-family:ui-monospace,Menlo,monospace; }
+  .fchip b { font-weight:700; }
+  .fchip .x { color:var(--ink-3); font-size:13px; line-height:1; }
+  .fchip .x:hover { color:var(--error); }
+  .sqlwrap { flex:none; border-bottom:1px solid var(--line-soft); background:var(--console-bg); }
+  .sqlwrap textarea { width:100%; min-height:76px; resize:vertical; padding:9px 11px; border:none;
+      background:transparent; color:var(--console-ink); font-family:ui-monospace,Menlo,monospace;
+      font-size:11.5px; line-height:1.55; display:block; }
+  .sqlwrap textarea:focus { outline:none; }
+  .sqlbar { display:flex; align-items:center; gap:8px; padding:5px 10px;
+            border-top:1px solid rgba(255,255,255,.07); font-size:11px; color:var(--ink-3); }
+  .sqlbar .own { color:var(--accent); font-weight:700; }
+
+  .gridwrap { flex:1; min-height:0; position:relative; overflow:hidden; background:var(--raised); }
+  .ghead { position:absolute; top:0; left:0; right:0; height:46px; z-index:3; overflow:hidden;
+           background:var(--panel); border-bottom:1px solid var(--line); }
+  .ghead-inner { display:flex; height:100%; }
+  .hcell { flex:none; padding:3px 7px; overflow:hidden;
+           display:flex; flex-direction:column; justify-content:space-between; cursor:pointer;
+           position:relative; }
+  .hcell:hover { background:var(--hi); }
+  .hcell .hn { font-weight:700; font-size:11.5px; overflow:hidden; text-overflow:ellipsis;
+               white-space:nowrap; display:flex; align-items:center; gap:3px; }
+  .hcell .ht { font-size:9px; letter-spacing:.06em; color:var(--ink-3);
+               font-family:ui-monospace,Menlo,monospace; text-transform:uppercase;
+               overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .hcell .hbar { position:absolute; left:0; bottom:0; height:2px; background:var(--ink-3);
+                 opacity:.55; }
+  .hcell .hbar.nul { background:var(--stale); }
+  .hcell .caret { color:var(--accent); font-size:9px; }
+  .hcell .dcount { font-size:9px; color:var(--ink-3); font-family:ui-monospace,Menlo,monospace; }
+  .gscroll { position:absolute; inset:46px 0 0 0; overflow:auto; }
+  .gspacer { position:relative; }
+  .grows { position:absolute; top:0; left:0; will-change:transform; }
+  .grow { display:flex; height:var(--row-h,22px); align-items:stretch; }
+  .grow:nth-child(even) { background:var(--row-alt); }
+  .grow:hover { background:var(--hi); }
+  .gcell { flex:none; padding:2px 7px; overflow:hidden; white-space:nowrap; text-overflow:ellipsis;
+           font-size:12px; }
+  .gcell.n { text-align:right; font-family:ui-monospace,Menlo,monospace;
+             font-variant-numeric:tabular-nums; color:var(--num); }
+  .gcell.t { text-align:right; font-family:ui-monospace,Menlo,monospace; color:var(--ink-2); }
+  .gcell.b { text-align:center; font-family:ui-monospace,Menlo,monospace; }
+  .gcell.x { font-family:ui-monospace,Menlo,monospace; font-size:11px; color:var(--ink-2); }
+  .gcell .nul { font-style:italic; color:var(--ink-3); }
+  /* NULL and empty string MUST look different — that distinction is why people open this tool. */
+  .gcell .empt { display:inline-block; min-width:22px; border-bottom:1px dotted var(--ink-3); }
+  .gcell .tru { color:var(--fresh); } .gcell .fal { color:var(--ink-3); }
+  .rownum { flex:none; width:62px; text-align:right; padding:2px 7px; color:var(--ink-3);
+            font-family:ui-monospace,Menlo,monospace; font-size:10.5px; background:var(--panel);
+            position:sticky; left:0; z-index:1; }
+  /* Opaque so it fully hides any previously-rendered rows behind it. Base (inset:46px) is the
+     "no rows match" message — it sits below the sticky header, which stays usable so filters can
+     be adjusted. `.full` (inset:0) is the no-file-open state and covers the whole pane. */
+  .gempty { position:absolute; inset:46px 0 0 0; display:flex; flex-direction:column;
+            align-items:center; justify-content:center; gap:14px; color:var(--ink-3);
+            text-align:center; padding:32px; background:var(--raised); z-index:4; font-size:12.5px; }
+  .gempty.full { inset:0; z-index:6; }
+  .gempty .ico { width:66px; height:66px; border-radius:16px; display:flex; align-items:center;
+                 justify-content:center; font-size:30px;
+                 background:color-mix(in srgb,var(--accent) 14%,transparent); color:var(--accent);
+                 border:1px solid color-mix(in srgb,var(--accent) 28%,transparent); }
+  .gempty h2 { margin:0; font-size:16px; font-weight:650; color:var(--ink); }
+  .gempty p { margin:0; font-size:12.5px; max-width:340px; line-height:1.5; }
+  .gempty .open { padding:7px 16px; border-radius:8px; border:none; background:var(--accent);
+                  color:var(--accent-ink); font-size:13px; font-weight:650; cursor:pointer; }
+  .gempty .open:hover { filter:brightness(1.06); }
+  .gempty.drop { background:var(--hi); }
+  .gempty.drop .ico { transform:scale(1.06); }
+  .gempty .fmts { display:flex; flex-wrap:wrap; gap:5px; justify-content:center; max-width:360px; }
+  .gempty .fmts span { font-size:10px; letter-spacing:.06em; text-transform:uppercase;
+                       font-family:ui-monospace,Menlo,monospace; color:var(--ink-3);
+                       background:var(--chip-bg); padding:2px 8px; border-radius:5px; }
+  /* Loading rows read as "coming" rather than "broken". A row of dots looked like corruption. */
+  .gcell.skel { display:flex; align-items:center; }
+  .gcell.skel i { display:block; height:8px; border-radius:4px; background:var(--line);
+                  width:70%; animation:shim 1.15s ease-in-out infinite; }
+  .gcell.skel.n i { margin-left:auto; width:52%; }
+  @keyframes shim { 0%,100% { opacity:.45; } 50% { opacity:.9; } }
+  @media (prefers-reduced-motion: reduce) { .gcell.skel i { animation:none; } }
+
+  /* -------------------------------------------------------------- inspector */
+  .insp { border-left:1px solid var(--line); background:var(--panel); display:flex;
+          flex-direction:column; min-width:0; }
+  .insp-tabs { display:flex; gap:2px; padding:8px 10px 0; border-bottom:1px solid var(--line);
+               flex:none; }
+  .itab { padding:4px 10px 6px; font-size:11.5px; font-weight:600; color:var(--ink-2);
+          border-bottom:2px solid transparent; margin-bottom:-1px; }
+  .itab.on { color:var(--ink); border-bottom-color:var(--accent); }
+  .insp-body { flex:1; overflow-y:auto; padding:0 0 20px; }
+  .col-row { display:flex; align-items:center; gap:6px; padding:4px 12px; font-size:11.5px;
+             border-bottom:1px solid var(--line-soft); cursor:pointer; }
+  .col-row:hover { background:var(--hi); }
+  .col-row.on { background:var(--hi); }
+  .col-row .cn { flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;
+                 font-weight:600; }
+  .col-row .ct { font-size:9px; color:var(--ink-3); font-family:ui-monospace,Menlo,monospace;
+                 text-transform:uppercase; }
+  .col-row .cd { font-size:10px; color:var(--ink-3); font-family:ui-monospace,Menlo,monospace;
+                 min-width:46px; text-align:right; }
+  .nulbar { width:34px; height:5px; background:var(--line); border-radius:3px; overflow:hidden;
+            flex:none; display:flex; }
+  .nulbar i { display:block; height:100%; }
+  .nulbar i.nl { background:var(--stale); } .nulbar i.em { background:var(--info); }
+  .nulbar i.bd { background:var(--error); }
+
+  .panel { padding:10px 12px; }
+  .panel h4 { margin:0 0 1px; font-size:13px; display:flex; align-items:baseline; gap:6px; }
+  .panel h4 .ty { font-size:9px; color:var(--ink-3); font-family:ui-monospace,Menlo,monospace;
+                  text-transform:uppercase; font-weight:500; }
+  .panel .sub { font-size:11px; color:var(--ink-3); margin-bottom:8px;
+                font-family:ui-monospace,Menlo,monospace; }
+  .stats { display:grid; grid-template-columns:1fr 1fr; gap:2px 10px; font-size:11px;
+           margin-bottom:9px; }
+  .stats div { display:flex; justify-content:space-between; gap:6px;
+               border-bottom:1px dotted var(--line); padding:2px 0; }
+  .stats span:first-child { color:var(--ink-3); }
+  .stats span:last-child { font-family:ui-monospace,Menlo,monospace; }
+  .vsearch { width:100%; padding:4px 8px; border-radius:5px; border:1px solid var(--line);
+             background:var(--raised); font-size:11.5px; margin-bottom:6px; }
+  .vrow { position:relative; display:flex; align-items:center; gap:6px; padding:3px 6px;
+          font-size:11.5px; cursor:pointer; border-radius:4px; overflow:hidden; }
+  .vrow:hover { background:var(--chip-bg); }
+  .vrow.sel { box-shadow:inset 0 0 0 1px var(--accent); }
+  .vrow .fill { position:absolute; inset:0 auto 0 0; background:var(--bar); z-index:0; }
+  .vrow .lbl { position:relative; z-index:1; flex:1; min-width:0; overflow:hidden;
+               text-overflow:ellipsis; white-space:nowrap; }
+  .vrow .lbl.sent { color:var(--stale); font-family:ui-monospace,Menlo,monospace; font-size:11px; }
+  .vrow .cnt { position:relative; z-index:1; font-family:ui-monospace,Menlo,monospace;
+               font-size:10.5px; color:var(--ink-2); }
+  .vrow .pct { position:relative; z-index:1; font-family:ui-monospace,Menlo,monospace;
+               font-size:10px; color:var(--ink-3); min-width:36px; text-align:right; }
+  .hist { display:flex; align-items:flex-end; gap:1px; height:96px; margin:4px 0 6px;
+          padding-bottom:1px; border-bottom:1px solid var(--line); }
+  .hist i { flex:1; background:var(--accent); opacity:.75; min-height:1px; border-radius:1px 1px 0 0; }
+  .hist i:hover { opacity:1; }
+  .hist i.nul { background:var(--stale); flex:0 0 9px; margin-right:5px; }
+  .axis { display:flex; justify-content:space-between; font-size:9.5px; color:var(--ink-3);
+          font-family:ui-monospace,Menlo,monospace; margin-bottom:8px; }
+  .lens { display:flex; border:1px solid var(--line); border-radius:6px; overflow:hidden;
+          margin-bottom:8px; }
+  .lens button { flex:1; padding:3px 0; font-size:10px; letter-spacing:.1em; color:var(--ink-2);
+                 border-right:1px solid var(--line); font-family:ui-monospace,Menlo,monospace; }
+  .lens button:last-child { border-right:none; }
+  .lens button.on { background:var(--accent); color:var(--accent-ink); font-weight:700; }
+
+  /* ------------------------------------------------------------ modal/toast */
+  .scrim { position:fixed; inset:0; background:rgba(10,16,20,.5); display:flex;
+           align-items:center; justify-content:center; z-index:50; padding:20px; }
+  .modal { background:var(--raised); border:1px solid var(--line); border-radius:11px;
+           box-shadow:0 12px 40px rgba(0,0,0,.35); max-width:min(760px,94vw);
+           max-height:86vh; overflow:auto; padding:16px 18px; }
+  .modal h3 { margin:0 0 3px; font-size:15px; }
+  .modal .sub { color:var(--ink-2); font-size:12px; margin-bottom:12px; }
+  .modal .row { display:flex; gap:8px; align-items:center; margin-top:9px; flex-wrap:wrap; }
+  .modal input[type=text] { flex:1; min-width:220px; padding:5px 9px; border-radius:6px;
+                            border:1px solid var(--line); background:var(--panel); font-size:12px; }
+  .code { background:var(--console-bg); color:var(--console-ink); padding:10px 12px;
+          border-radius:8px; font-family:ui-monospace,Menlo,monospace; font-size:11px;
+          white-space:pre; overflow-x:auto; margin:8px 0; max-height:340px; }
+  table.plain { width:100%; border-collapse:collapse; font-size:11.5px; }
+  table.plain th { text-align:left; font-size:9.5px; letter-spacing:.1em; color:var(--ink-3);
+      text-transform:uppercase; font-family:ui-monospace,Menlo,monospace; padding:4px 6px;
+      border-bottom:1px solid var(--line); position:sticky; top:0; background:var(--raised); }
+  table.plain td { padding:3px 6px; border-bottom:1px solid var(--line-soft);
+                   font-family:ui-monospace,Menlo,monospace; }
+  table.plain td.bad { color:var(--error); font-weight:700; }
+  .toast { position:fixed; bottom:16px; left:50%; transform:translateX(-50%); z-index:70;
+           background:var(--console-bg); color:var(--console-ink); padding:9px 15px;
+           border-radius:8px; font-size:12px; box-shadow:var(--shadow); max-width:70vw; }
+  .toast.err { background:var(--error); color:#fff; }
+  .banner { display:flex; align-items:center; gap:9px; margin:6px 10px 0; padding:5px 11px;
+            font-size:11.5px; border-radius:7px; flex:none;
+            background:color-mix(in srgb,var(--stale) 14%,transparent); color:var(--stale); }
+  .banner.info { background:color-mix(in srgb,var(--info) 12%,transparent); color:var(--info); }
+  .banner .grow1 { flex:1; }
+  .prog { height:3px; background:var(--line); border-radius:2px; width:120px; overflow:hidden; }
+  .prog i { display:block; height:100%; background:var(--accent); }
+  .kbd { font-family:ui-monospace,Menlo,monospace; font-size:10px; background:var(--chip-bg);
+         padding:1px 4px; border-radius:3px; color:var(--ink-3); }
+</style>
+</head>
+<body>
+
+<div class="topbar">
+  <div class="brand">SIFT <small id="engine"></small></div>
+  <div class="tabs" id="tabs"></div>
+  <div id="topchips" style="display:flex;gap:6px;align-items:center"></div>
+  <button class="tgl" id="tgl-rail" title="sources panel">☰</button>
+  <button class="tgl" id="tgl-insp" title="column panel">▤</button>
+</div>
+
+<div id="banners"></div>
+
+<div class="main">
+  <aside class="rail">
+    <h3>Open sources</h3>
+    <div id="srclist"></div>
+    <div class="dropzone" id="dropzone">Drop a file here<br><span style="font-size:10.5px">
+      CSV · Parquet · JSON · XLSX · folder · Delta</span></div>
+    <div class="pastebox">
+      <input id="pathbox" type="text" placeholder="…or paste a path (⌥⌘C in Finder)" spellcheck="false">
+      <button class="btn sm" id="btn-openpath">Open</button>
+    </div>
+    <div class="rail-note" id="dropnote"></div>
+    <h3>Data</h3>
+    <div style="padding:0 10px 12px;display:flex;flex-direction:column;gap:5px">
+      <button class="btn sm" id="btn-merge">Merge tables…</button>
+      <button class="btn sm" id="btn-export">Export…</button>
+      <button class="btn sm" id="btn-staged">Staged data…</button>
+    </div>
+  </aside>
+
+  <main class="centre">
+    <div class="toolbar" id="toolbar"></div>
+    <div class="sqlwrap" id="sqlwrap" style="display:none">
+      <textarea id="sqlbox" spellcheck="false" placeholder="SELECT …"></textarea>
+      <div class="sqlbar">
+        <span id="sqlstate">mirrors the filters above</span>
+        <span style="flex:1"></span>
+        <button class="btn sm" id="btn-runsql">Run <span class="kbd">⌘↵</span></button>
+        <button class="btn sm" id="btn-resetsql">Reset to filters</button>
+      </div>
+    </div>
+    <div class="gridwrap" id="gridwrap">
+      <div class="ghead" id="ghead"><div class="ghead-inner" id="ghead-inner"></div></div>
+      <div class="gscroll" id="gscroll"><div class="gspacer" id="gspacer">
+        <div class="grows" id="grows"></div></div></div>
+      <div class="gempty" id="gempty">Drop a file, or paste a path, to begin.</div>
+    </div>
+  </main>
+
+  <aside class="insp">
+    <div class="insp-tabs">
+      <button class="itab on" data-itab="schema">Schema</button>
+      <button class="itab" data-itab="column">Column</button>
+      <button class="itab" data-itab="source">Source</button>
+    </div>
+    <div class="insp-body" id="insp-body"></div>
+  </aside>
+</div>
+
+<script>
+"use strict";
+const TOKEN = "__SIFT_TOKEN__";
+const MAX_UPLOAD_MB = parseInt("__SIFT_MAX_UPLOAD_MB__", 10) || 512;
+// True inside Sift.app. The native shell intercepts drops at the AppKit layer, where the real
+// POSIX path is available — an HTML5 drop only ever yields a pathless File object. So in the shell
+// the page must NOT handle drops itself, or it would fall back to copying multi-GB files for no
+// reason. The shell calls window.siftOpenPaths() instead.
+const NATIVE = __SIFT_NATIVE__;
+
+// Must match --row-h in the stylesheet, or the scroll mapping drifts from what is drawn.
+const ROW_H = NATIVE ? 27 : 22;
+// [key, label, extension] — the formats DuckDB's COPY can write (session.py EXPORT_FORMATS is the
+// authority on the keys). The native sidebar's download menu lists the same six.
+const EXPORT_FORMATS = [
+  ["parquet", "Parquet (zstd)", "parquet"], ["csv", "CSV", "csv"], ["tsv", "TSV", "tsv"],
+  ["json", "JSON (array)", "json"], ["ndjson", "NDJSON (lines)", "ndjson"], ["xlsx", "Excel", "xlsx"],
+];
+/* Browsers clamp element height, and the limit differs by engine (Chromium clamps at 2^24-2 =
+   16,777,214 px; WebKit, which the native shell uses, differs again). Past the clamp a naive
+   spacer breaks silently: the thumb stops tracking the data and rows repeat.
+
+   Rather than hardcode a guess, probe the real limit once. A conservative hardcoded 8M cost real
+   feel — it made the spacer shorter than necessary, which made scrolling more compressed than it
+   had to be. */
+const SPACER_CAP = (() => {
+  const probe = document.createElement("div");
+  probe.style.cssText = "position:absolute;left:-9999px;top:0;width:1px;visibility:hidden";
+  document.body.appendChild(probe);
+  let best = 1_000_000;
+  for (const h of [1e6, 4e6, 8e6, 1.6e7, 3.3e7, 6.6e7]) {
+    probe.style.height = h + "px";
+    if (probe.getBoundingClientRect().height >= h - 1) best = h; else break;
+  }
+  probe.remove();
+  return Math.floor(best * 0.98);   // a little headroom below the exact clamp
+})();
+const BLOCK = 500, OVERSCAN = 8, MAX_BLOCKS = 24;
+
+const $ = (id) => document.getElementById(id);
+const state = {
+  tables: [], active: null, engine: null, cols: [], widths: [], detail: null,
+  profile: null, itab: "schema", col: null, colData: null, colLens: null,
+  total: 0, firstRow: 0, blocks: new Map(), order: [],
+  sqlMode: false, colSeq: 0,
+};
+
+/* ------------------------------------------------------------------- api */
+async function api(path, opts = {}) {
+  const res = await fetch(path, {
+    ...opts,
+    headers: { "X-Sift-Token": TOKEN, ...(opts.body ? { "Content-Type": "application/json" } : {}),
+               ...(opts.headers || {}) },
+  });
+  if (!res.ok) {
+    let msg = `${res.status} ${res.statusText}`;
+    try { const j = await res.json(); if (j.error) msg = j.error; } catch (_) {}
+    throw new Error(msg);
+  }
+  return res.json();
+}
+const post = (p, body, signal) =>
+  api(p, { method: "POST", body: JSON.stringify(body || {}), ...(signal ? { signal } : {}) });
+
+let toastTimer;
+function toast(msg, isErr) {
+  document.querySelectorAll(".toast").forEach((t) => t.remove());
+  const el = document.createElement("div");
+  el.className = "toast" + (isErr ? " err" : "");
+  el.textContent = msg;
+  document.body.appendChild(el);
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => el.remove(), isErr ? 7000 : 3200);
+}
+const fail = (e) => toast(e.message || String(e), true);
+
+/* ---------------------------------------------------------------- format */
+const fmtInt = (n) => (n === null || n === undefined ? "" : Number(n).toLocaleString());
+function human(b) {
+  if (b === null || b === undefined) return "";
+  const u = ["B", "KB", "MB", "GB", "TB"];
+  let i = 0, n = Number(b);
+  while (n >= 1024 && i < u.length - 1) { n /= 1024; i++; }
+  return (i === 0 ? n.toFixed(0) : n.toFixed(1)) + " " + u[i];
+}
+const pct = (f) => (f * 100).toFixed(f < 0.01 && f > 0 ? 2 : 1) + "%";
+
+const NUMERIC_STR = /^-?\d+(\.\d+)?$/;
+// Group digits WITHOUT going through Number(). BIGINT and DECIMAL arrive as strings precisely
+// because Number() would round them — `Number("9007199254740993")` is 9007199254740992, and
+// formatting that would reintroduce the corruption the string transport exists to prevent.
+function groupDigits(s) {
+  const neg = s.startsWith("-");
+  const [ip, fp] = (neg ? s.slice(1) : s).split(".");
+  const grouped = ip.replace(/\B(?=(\d{3})+(?!\d))/g, ",");
+  return (neg ? "-" : "") + grouped + (fp === undefined ? "" : "." + fp);
+}
+function cellHTML(v, col) {
+  if (v === null || v === undefined) return '<span class="nul">null</span>';
+  if (v === "") return '<span class="empt" title="empty string, not null"></span>';
+  switch (col.kind) {
+    case "number": {
+      // Strings here are exact values from the engine — format them as text, never as Numbers.
+      if (typeof v === "string") {
+        return NUMERIC_STR.test(v) ? groupDigits(v) : esc(v);
+      }
+      // DECIMAL scale fixes the fraction digits, so decimal points line up down the column.
+      const m = /DECIMAL\((\d+),\s*(\d+)\)/i.exec(col.type);
+      const s = m ? parseInt(m[2], 10) : null;
+      const n = Number(v);
+      if (!isFinite(n)) return esc(String(v));
+      if (s !== null) return n.toLocaleString(undefined, { minimumFractionDigits: s,
+                                                          maximumFractionDigits: s });
+      return Number.isInteger(n) ? n.toLocaleString() : n.toLocaleString(undefined,
+             { maximumFractionDigits: 6 });
+    }
+    case "bool":
+      return v === true || v === "true"
+        ? '<span class="tru">true</span>' : '<span class="fal">false</span>';
+    case "temporal":
+      return esc(String(v).replace("T", " ").replace(/\.\d+$/, ""));
+    case "nested":
+      return esc(typeof v === "string" ? v : JSON.stringify(v));
+    default:
+      return esc(String(v));
+  }
+}
+const cellClass = (k) => k === "number" ? "n" : k === "temporal" ? "t"
+  : k === "bool" ? "b" : (k === "nested" || k === "blob") ? "x" : "";
+function esc(s) {
+  return s.replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;",
+    '"': "&quot;", "'": "&#39;" }[c]));
+}
+
+/* ------------------------------------------------------------ table state */
+async function refreshState() {
+  const s = await api("/api/state");
+  state.tables = s.tables;
+  state.engine = s.engine;
+  $("engine").textContent = `duckdb ${s.engine.duckdb}`;
+  if (!state.active && s.tables.length) state.active = s.tables[0].table;
+  if (state.active && !s.tables.some((t) => t.table === state.active))
+    state.active = s.tables.length ? s.tables[0].table : null;
+  renderTabs(); renderRail(); renderBanners(); renderTopChips(); pushNativeState();
+}
+
+async function selectTable(name, force) {
+  if (state.active === name && !force) return;
+  state.active = name;
+  state.col = null; state.colData = null; state.colLens = null; state.profile = null;
+  await loadTable();
+}
+
+async function loadTable() {
+  resetGrid();
+  if (!state.active) {
+    state.cols = []; state.detail = null;
+    renderTabs(); renderRail(); renderGrid(); renderInspector(); renderTopChips(); renderToolbar();
+    return;
+  }
+  try {
+    const d = await api(`/api/table/${encodeURIComponent(state.active)}`);
+    state.detail = d;
+    state.cols = d.columns;
+    state.sqlMode = !!d.sql_mode;
+    state.total = d.rows.value || 0;
+    $("sqlbox").value = d.sql || "";
+    renderTabs(); renderRail(); renderTopChips(); renderToolbar(); renderBanners();
+    renderHead(); renderGrid();
+    await fetchBlock(0);
+    renderGrid();
+    loadProfile();
+  } catch (e) { fail(e); }
+}
+
+async function loadProfile() {
+  const want = state.active;
+  try {
+    const p = await api(`/api/profile/${encodeURIComponent(want)}`);
+    if (state.active !== want) return;
+    state.profile = p.columns;
+    renderHead(); renderInspector();
+  } catch (_) { /* profile is best-effort; the grid works without it */ }
+}
+
+function profOf(name) {
+  return (state.profile || []).find((c) => c.name === name) || null;
+}
+
+/* ------------------------------------------------------------------ grid */
+function computeWidths(cols) {
+  return cols.map((c) => {
+    const p = profOf(c.name);
+    const byName = c.name.length * 7.6 + 26;
+    const byData = p && p.max_len ? Math.min(p.max_len, 42) * 7.4 + 20 : 120;
+    const w = Math.max(76, Math.min(320, Math.max(byName, byData)));
+    return Math.round(w);
+  });
+}
+function resetGrid() {
+  // Abort first: a switch of table or filter makes every outstanding block irrelevant, and letting
+  // them land would paint the previous table's rows into the new one.
+  abortAllBlocks();
+  state.blocks.clear(); state.order = [];
+  state.firstRow = 0; state.total = 0;
+  $("gscroll").scrollTop = 0;
+}
+const visibleRows = () => Math.max(1, Math.ceil($("gscroll").clientHeight / ROW_H));
+const spacerH = () => Math.min(state.total * ROW_H, SPACER_CAP);
+const isCapped = () => state.total * ROW_H > SPACER_CAP;
+const maxFirst = () => Math.max(0, state.total - visibleRows());
+
+function renderHead() {
+  const inner = $("ghead-inner");
+  state.widths = computeWidths(state.cols);
+  let h = `<div class="rownum" style="height:100%"></div>`;
+  state.cols.forEach((c, i) => {
+    const p = profOf(c.name);
+    const sort = (state.detail?.spec?.sort || []).find((s) => s[0] === c.name);
+    const caret = sort ? (sort[1] === "asc" ? "▲" : "▼") : "";
+    let bars = "";
+    if (p && p.n > 0) {
+      const nl = (p.n_null / p.n) * 100, em = (p.n_empty / p.n) * 100;
+      const bd = (p.n_uncastable / p.n) * 100;
+      bars = `<div class="hbar nul" style="width:${(nl + em + bd).toFixed(1)}%"></div>`;
+    }
+    const dc = p ? (p.exact_distinct ?? p.approx_distinct) : null;
+    const dctxt = p ? (p.exact_distinct === null || p.exact_distinct === undefined ? "≈" : "") +
+      compact(dc) : "";
+    h += `<div class="hcell" style="width:${state.widths[i]}px" data-col="${esc(c.name)}"
+            title="${esc(c.name)} — ${esc(c.type)}${p ? `\n${fmtInt(p.n_null)} null, ` +
+            `${fmtInt(p.n_empty)} empty, ${dctxt} distinct` : ""}\nclick: values · shift-click: sort">
+        <div class="hn"><span style="overflow:hidden;text-overflow:ellipsis">${esc(c.name)}</span>
+          <span class="caret">${caret}</span></div>
+        <div class="ht">${esc(c.type)}<span class="dcount" style="float:right">${dctxt}</span></div>
+        ${bars}</div>`;
+  });
+  inner.innerHTML = h;
+  inner.querySelectorAll(".hcell").forEach((el) => {
+    el.onclick = (ev) => {
+      const col = el.dataset.col;
+      if (ev.shiftKey) { cycleSort(col); return; }
+      state.col = col; state.itab = "column"; loadColumn(col); renderInspector();
+    };
+  });
+}
+const compact = (n) => n === null || n === undefined ? "" :
+  n < 1000 ? String(n) : n < 1e6 ? (n / 1e3).toFixed(n < 1e4 ? 1 : 0) + "k"
+  : (n / 1e6).toFixed(1) + "M";
+
+// Build the empty state and — critically — clear the old rows/headers so nothing shows behind it.
+function showEmptyState(mode) {
+  const e = $("gempty");
+  $("grows").innerHTML = "";
+  if (mode === "nofile") $("ghead-inner").innerHTML = "";
+  e.style.display = "flex";
+  if (mode === "nofile") {
+    e.className = "gempty full";
+    e.innerHTML = `<div class="ico">⚡</div>
+      <h2>Nothing open yet</h2>
+      <p>Drop a file anywhere here, or open one — it loads instantly and stays on disk, so size
+         isn't the constraint it usually is.</p>
+      <button class="open" id="empty-open">＋&nbsp;&nbsp;Open a File…</button>
+      <div class="fmts">${["csv", "parquet", "json", "ndjson", "xlsx", "delta table", "folder"]
+        .map((f) => `<span>${f}</span>`).join("")}</div>`;
+    const b = $("empty-open");
+    if (b) b.onclick = triggerOpen;
+  } else {
+    e.className = "gempty";
+    e.textContent = mode === "nocols" ? "No columns." : "No rows match the current filters.";
+  }
+}
+
+function renderGrid() {
+  const empty = $("gempty");
+  if (!state.active) { showEmptyState("nofile"); return; }
+  if (!state.cols.length) { showEmptyState("nocols"); return; }
+  if (state.total === 0 && state.blocks.size && !(state.blocks.get(0) || []).length) {
+    showEmptyState("norows"); return;
+  }
+  empty.style.display = "none";
+  $("gspacer").style.height = Math.max(spacerH(), 1) + "px";
+  const totalW = 62 + state.widths.reduce((a, b) => a + b, 0);
+  $("gspacer").style.width = totalW + "px";
+  $("ghead-inner").style.width = totalW + "px";
+
+  const from = Math.max(0, state.firstRow - OVERSCAN);
+  const to = Math.min(Math.max(state.total, 1), state.firstRow + visibleRows() + OVERSCAN);
+  let html = "";
+  for (let r = from; r < to; r++) {
+    const row = rowAt(r);
+    html += `<div class="grow"><div class="rownum">${(r + 1).toLocaleString()}</div>`;
+    if (row) {
+      state.cols.forEach((c, i) => {
+        html += `<div class="gcell ${cellClass(c.kind)}" style="width:${state.widths[i]}px"
+          title="${row[i] === null ? "null" : row[i] === "" ? "empty string" :
+          esc(String(row[i])).slice(0, 300)}">${cellHTML(row[i], c)}</div>`;
+      });
+    } else {
+      state.cols.forEach((c, i) => {
+        html += `<div class="gcell skel ${cellClass(c.kind)}"
+          style="width:${state.widths[i]}px"><i></i></div>`;
+      });
+    }
+    html += "</div>";
+  }
+  const rows = $("grows");
+  rows.innerHTML = html;
+  // The rows layer is offset by where the window starts, not by scrollTop, which diverges from
+  // row position above the cap — there the spacer is shorter than the data, so anchor to viewport.
+  rows.style.transform = isCapped()
+    ? `translateY(${$("gscroll").scrollTop - (state.firstRow - from) * ROW_H}px)`
+    : `translateY(${from * ROW_H}px)`;
+  ensureBlocks();
+}
+function rowAt(r) {
+  const b = state.blocks.get(Math.floor(r / BLOCK));
+  return b ? b[r % BLOCK] : null;
+}
+function setFirstRow(n) {
+  const v = Math.max(0, Math.min(maxFirst(), Math.round(n)));
+  if (v === state.firstRow) return false;
+  state.firstRow = v;
+  return true;
+}
+function onScroll() {
+  // No "ignore the next event" flag here on purpose. There used to be one, to stop a programmatic
+  // jump from being re-read; but if the assignment happened to be a no-op no event fired, the flag
+  // stayed armed, and it then swallowed a real scroll — leaving the grid stuck on one row.
+  // scrollTop -> row is deterministic and idempotent, so recomputing is simply safe.
+  const sc = $("gscroll");
+  if (!isCapped()) {
+    setFirstRow(sc.scrollTop / ROW_H);
+  } else {
+    const span = spacerH() - sc.clientHeight;
+    const frac = span > 0 ? sc.scrollTop / span : 0;
+    setFirstRow(frac * maxFirst());
+  }
+  scheduleRender();
+}
+/* Deliberately NO wheel handler.
+
+   An earlier version intercepted the wheel above the height cap and moved by whole rows, to keep
+   scrolling row-accurate. That was a bad trade: preventDefault kills momentum and rubber-banding,
+   which is most of what makes scrolling feel native on a Mac — and because the cap was set
+   conservatively low, the interception was active on almost any interesting file.
+
+   Now native scrolling always drives the viewport. Below the cap it is exactly 1:1. Above it,
+   scrolling is proportional (one wheel tick covers more rows than it "should"), which is the
+   unavoidable cost of a spacer shorter than the data. Row-accurate movement is available from the
+   keyboard instead — see keyNav — which is a better place for precision than the wheel. */
+
+/* Precise navigation, since proportional scrolling cannot land on an exact row. */
+function keyNav(ev) {
+  const tag = (document.activeElement?.tagName || "").toLowerCase();
+  if (tag === "input" || tag === "textarea") return;
+  const page = Math.max(1, visibleRows() - 1);
+  let target = null;
+  switch (ev.key) {
+    case "ArrowDown": target = state.firstRow + 1; break;
+    case "ArrowUp": target = state.firstRow - 1; break;
+    case "PageDown": target = state.firstRow + page; break;
+    case "PageUp": target = state.firstRow - page; break;
+    case "Home": if (ev.metaKey || ev.ctrlKey) target = 0; break;
+    case "End": if (ev.metaKey || ev.ctrlKey) target = maxFirst(); break;
+    case "g": if (ev.metaKey) { ev.preventDefault(); return gotoRow(); } break;
+    default: return;
+  }
+  if (target === null) return;
+  ev.preventDefault();
+  jumpToRow(target);
+}
+
+function jumpToRow(row) {
+  if (!setFirstRow(row)) return;
+  const sc = $("gscroll");
+  if (isCapped()) {
+    const span = spacerH() - sc.clientHeight;
+    sc.scrollTop = maxFirst() > 0 ? (state.firstRow / maxFirst()) * span : 0;
+  } else {
+    sc.scrollTop = state.firstRow * ROW_H;
+  }
+  scheduleRender();
+}
+
+function gotoRow() {
+  const answer = prompt(`Go to row (1 – ${fmtInt(state.total)}):`);
+  if (!answer) return;
+  const n = parseInt(String(answer).replace(/[^0-9]/g, ""), 10);
+  if (!isFinite(n)) return;
+  jumpToRow(Math.max(0, Math.min(maxFirst(), n - 1)));
+}
+/* Render at most once per animation frame.
+   Scroll events fire far faster than 60Hz during a drag, and each one used to rebuild every visible
+   cell. Coalescing collapses a burst into one paint. */
+let renderQueued = false;
+function scheduleRender() {
+  if (renderQueued) return;
+  renderQueued = true;
+  let ran = false;
+  const run = () => {
+    if (ran) return;
+    ran = true;
+    renderQueued = false;
+    renderGrid();
+  };
+  requestAnimationFrame(run);
+  // rAF does NOT fire while the window is hidden or fully occluded. Without this fallback a page
+  // that loaded its data in the background stayed on skeleton rows until it was brought forward —
+  // caught in testing, and it would have looked exactly like "the grid never loads".
+  setTimeout(run, 100);
+}
+
+/* Which blocks the viewport needs, nearest-first so the rows actually on screen win the race. */
+function neededBlocks() {
+  const first = Math.floor(Math.max(0, state.firstRow - OVERSCAN) / BLOCK);
+  const last = Math.floor((state.firstRow + visibleRows() + OVERSCAN) / BLOCK);
+  const centre = (state.firstRow + visibleRows() / 2) / BLOCK;
+  const out = [];
+  for (let b = first; b <= last; b++) out.push(b);
+  return out.sort((x, y) => Math.abs(x - centre) - Math.abs(y - centre));
+}
+
+const inflight = new Map();   // block -> AbortController
+
+function ensureBlocks() {
+  const need = neededBlocks();
+  const keep = new Set(need);
+  // Abort anything we have scrolled past. Measured before this existed: a 60-event drag fired 78
+  // requests, and the block under the cursor queued behind ones already off screen — 63% of scroll
+  // time showed placeholders even though a block takes only ~27ms to fetch.
+  for (const [b, controller] of inflight) {
+    if (!keep.has(b)) {
+      controller.abort();
+      inflight.delete(b);
+    }
+  }
+  for (const b of need) {
+    if (!state.blocks.has(b) && !inflight.has(b)) fetchBlock(b);
+  }
+}
+
+async function fetchBlock(b) {
+  if (inflight.has(b) || state.blocks.has(b)) return;
+  const controller = new AbortController();
+  inflight.set(b, controller);
+  const want = state.active;
+  try {
+    const d = state.sqlMode
+      ? await post("/api/sql", { table: want, sql: $("sqlbox").value,
+                                 offset: b * BLOCK, limit: BLOCK }, controller.signal)
+      : await api(`/api/rows/${encodeURIComponent(want)}?offset=${b * BLOCK}&limit=${BLOCK}`,
+                  { signal: controller.signal });
+    if (state.active !== want) return;
+    state.blocks.set(b, d.rows);
+    state.order.push(b);
+    while (state.order.length > MAX_BLOCKS) {
+      const old = state.order.shift();
+      if (old !== b) state.blocks.delete(old);
+    }
+    if (d.cols && d.cols.length && (!state.cols.length || state.sqlMode)) {
+      state.cols = d.cols; renderHead();
+    }
+    if (d.total && d.total.value !== null && d.total.value !== undefined) {
+      state.total = d.total.value;
+    } else if (d.rows.length < BLOCK) {
+      state.total = b * BLOCK + d.rows.length;   // SQL mode: extend as we discover the end
+    } else {
+      state.total = Math.max(state.total, (b + 1) * BLOCK + 1);
+    }
+    scheduleRender();
+  } catch (e) {
+    // An abort is the expected outcome for a block we scrolled past, not a failure to report.
+    if (e.name !== "AbortError" && state.active === want) fail(e);
+  } finally {
+    inflight.delete(b);
+  }
+}
+
+function abortAllBlocks() {
+  for (const [, c] of inflight) c.abort();
+  inflight.clear();
+}
+
+function cycleSort(col) {
+  const cur = (state.detail?.spec?.sort || []).find((s) => s[0] === col);
+  const next = !cur ? [[col, "asc"]] : cur[1] === "asc" ? [[col, "desc"]] : [];
+  applySpec(state.detail.spec.filters, next);
+}
+async function applySpec(filters, sort) {
+  try {
+    const r = await post("/api/spec", { table: state.active, filters, sort });
+    state.detail.spec = { filters, sort };
+    $("sqlbox").value = r.sql;
+    resetGrid();
+    await fetchBlock(0);          // this is what computes and returns the filtered total
+    renderToolbar(); renderHead(); renderGrid();
+    // Deliberately NOT awaited: the chip's "N of M" is nice to have, and blocking the grid on a
+    // second round trip made every filter click feel like it lagged.
+    refreshState().catch(() => {});
+    if (state.col) loadColumn(state.col);
+  } catch (e) { fail(e); }
+}
+function addFilter(col, op, values) {
+  const f = (state.detail?.spec?.filters || []).filter((x) => x.col !== col || x.op !== op);
+  f.push({ col, op, values: values || [] });
+  applySpec(f, state.detail?.spec?.sort || []);
+}
+function removeFilter(i) {
+  const f = [...(state.detail?.spec?.filters || [])];
+  f.splice(i, 1);
+  applySpec(f, state.detail?.spec?.sort || []);
+}
+
+/* --------------------------------------------------------------- toolbar */
+function renderToolbar() {
+  const tb = $("toolbar");
+  if (!state.active) { tb.innerHTML = ""; return; }
+  const f = state.detail?.spec?.filters || [];
+  let h = "";
+  if (state.sqlMode) {
+    h += `<span class="chip warn">SQL mode — filters frozen</span>`;
+  } else if (f.length) {
+    h += f.map((x, i) => `<span class="fchip"><b>${esc(x.col)}</b> ${esc(opLabel(x))}
+      <button class="x" data-rm="${i}" title="remove">×</button></span>`).join("");
+    h += `<button class="btn sm" id="btn-clearf">clear all</button>`;
+  } else {
+    h += `<span style="font-size:11.5px;color:var(--ink-3)">No filters — click a column
+      header to see its values, shift-click to sort.</span>`;
+  }
+  h += `<span style="flex:1"></span>`;
+  h += `<button class="btn sm" id="btn-togglesql">${$("sqlwrap").style.display === "none"
+    ? "Show SQL" : "Hide SQL"}</button>`;
+  tb.innerHTML = h;
+  tb.querySelectorAll("[data-rm]").forEach((b) =>
+    (b.onclick = () => removeFilter(parseInt(b.dataset.rm, 10))));
+  const c = $("btn-clearf"); if (c) c.onclick = () => applySpec([], state.detail.spec.sort || []);
+  $("btn-togglesql").onclick = () => {
+    const w = $("sqlwrap");
+    w.style.display = w.style.display === "none" ? "block" : "none";
+    renderToolbar();
+  };
+}
+function opLabel(f) {
+  const v = (f.values || []).map((x) => x === null ? "␀ NULL" : String(x));
+  switch (f.op) {
+    case "is_null": return "is null";
+    case "not_null": return "is not null";
+    case "is_empty": return "is empty";
+    case "in": return v.length > 2 ? `in ${v.length} values` : `= ${v.join(", ")}`;
+    case "not_in": return `≠ ${v.join(", ")}`;
+    case "contains": return `contains “${v[0]}”`;
+    case "between": return `${v[0]} … ${v[1]}`;
+    default: return `${f.op} ${v.join(", ")}`;
+  }
+}
+
+/* --------------------------------------------------------------- the rail */
+function renderTabs() {
+  $("tabs").innerHTML = state.tables.map((t) => `
+    <button class="tab ${t.table === state.active ? "on" : ""}" data-t="${esc(t.table)}">
+      <span class="fmt">${esc(t.fmt.replace("glob_", "▤"))}</span>
+      <span class="nm">${esc(t.table)}</span>
+      <span class="x" data-close="${esc(t.table)}">×</span></button>`).join("");
+  $("tabs").querySelectorAll(".tab").forEach((el) => {
+    el.onclick = (ev) => {
+      if (ev.target.dataset.close) { closeTable(ev.target.dataset.close); return; }
+      selectTable(el.dataset.t);
+    };
+  });
+}
+// The row-count phrase, one decision tree, shared by the chip (browser) and the native toolbar.
+function rowText(t) {
+  const r = t.rows;
+  if (r.value === null || t.counting) return "counting…";
+  if (r.filtered && r.unfiltered) return `${fmtInt(r.value)} of ${fmtInt(r.unfiltered)} rows`;
+  return `${r.exact ? "" : "≈ "}${fmtInt(r.value)} rows`;
+}
+// The "fmt · size · rows · staged" subtitle, defined once. The native sidebar receives this string
+// over the bridge (see pushNativeState) rather than re-formatting it in Swift.
+function sourceSubtitle(t) {
+  const parts = [t.fmt === "merge" ? "merged" : t.fmt.replace("glob_", "▤ ")];
+  if (t.size) parts.push(human(t.size));          // a derived merge view has no file size
+  if (t.rows.value !== null) parts.push(`${fmtInt(t.rows.value)} rows`);
+  if (t.staged) parts.push("staged");
+  return parts.join(" · ");
+}
+function renderRail() {
+  $("srclist").innerHTML = state.tables.length ? state.tables.map((t) => `
+    <button class="src ${t.table === state.active ? "on" : ""}" data-t="${esc(t.table)}">
+      <span class="nm">${esc(t.table)}</span>
+      <span class="meta">${esc(sourceSubtitle(t))}</span>
+    </button>`).join("") :
+    `<div class="rail-note">Nothing open yet.</div>`;
+  $("srclist").querySelectorAll(".src").forEach((el) =>
+    (el.onclick = () => selectTable(el.dataset.t)));
+  $("dropnote").innerHTML = NATIVE
+    ? `Files are read <b>in place</b> — nothing is copied, so a 20 GB file opens as fast as a
+       2 MB one. Drop here, on the Dock icon, or use Finder's Open With.`
+    : `Dropping into the browser <b>copies</b> the file (under ${MAX_UPLOAD_MB} MB) because the page
+       is not told where it lives. Dropping onto the <b>Sift app icon</b>, or pasting a path, reads
+       it in place — instantly, at any size.`;
+}
+async function closeTable(name) {
+  try { await post("/api/close", { table: name }); } catch (e) { return fail(e); }
+  if (state.active === name) { state.active = null; state.detail = null; state.cols = []; }
+  await refreshState();
+  if (!state.active && state.tables.length) await selectTable(state.tables[0].table);
+  else await loadTable();
+}
+
+function renderTopChips() {
+  const t = state.tables.find((x) => x.table === state.active);
+  if (!t) { $("topchips").innerHTML = ""; return; }
+  let h = "";
+  const r = t.rows;
+  // Estimate case keeps a dotted-underline tooltip explaining the basis — the one chip-only extra.
+  const est = r.value !== null && !t.counting && !r.exact && !r.filtered;
+  h += est
+    ? `<span class="chip"><span class="est" title="${esc(r.basis || "")}">${rowText(t)}</span></span>`
+    : `<span class="chip">${rowText(t)}</span>`;
+  h += `<span class="chip">${t.n_cols} cols</span>`;
+  if (t.bad_rows) {
+    h += `<span class="chip bad" id="chip-bad">${fmtInt(t.bad_rows)} row${
+      t.bad_rows === 1 ? "" : "s"} dropped ▸</span>`;
+  }
+  if (t.staged) h += `<span class="chip" title="${esc(t.stage_reason || "")}">staged</span>`;
+  if (t.delta_version !== null && t.delta_version !== undefined)
+    h += `<span class="chip">delta v${t.delta_version}</span>`;
+  if (t.copied_from_browser) h += `<span class="chip" title="copied because the browser withheld
+    the path">copied</span>`;
+  $("topchips").innerHTML = h;
+  const cb = $("chip-bad"); if (cb) cb.onclick = showBadRows;
+}
+
+function renderBanners() {
+  const t = state.tables.find((x) => x.table === state.active);
+  const b = $("banners");
+  let h = "";
+  if (t && t.staging) {
+    h += `<div class="banner"><span>Staging into native storage — the grid may be slower for
+      about ${t.staging.est_seconds || "?"}s.</span>
+      <div class="prog"><i style="width:${((t.staging.pct || 0) * 100).toFixed(0)}%"></i></div>
+      <span class="grow1"></span>
+      <button class="btn sm" data-cancel="${esc(t.staging.job_id)}">Cancel</button></div>`;
+  }
+  (t?.notes || []).forEach((n) => { h += `<div class="banner info">${esc(n)}</div>`; });
+  const missing = Object.entries(state.engine?.extensions || {})
+    .filter(([, v]) => !v).map(([k]) => k);
+  if (missing.length) h += `<div class="banner">DuckDB extension${missing.length > 1 ? "s" : ""}
+    unavailable: ${missing.join(", ")}. Delta folders and .xlsx will be refused rather than read
+    incorrectly. Fix with one online run of <span class="kbd">INSTALL ${missing.join("; INSTALL ")}
+    </span>.</div>`;
+  b.innerHTML = h;
+  b.querySelectorAll("[data-cancel]").forEach((el) =>
+    (el.onclick = () => post("/api/cancel", { job_id: el.dataset.cancel }).catch(fail)));
+}
+
+/* ---------------------------------------------------------- the inspector */
+function renderInspector() {
+  document.querySelectorAll(".itab").forEach((t) =>
+    t.classList.toggle("on", t.dataset.itab === state.itab));
+  const body = $("insp-body");
+  if (!state.active) { body.innerHTML = `<div class="panel sub">Nothing open.</div>`; return; }
+  if (state.itab === "schema") return renderSchema(body);
+  if (state.itab === "source") return renderSource(body);
+  return renderColumn(body);
+}
+function renderSchema(body) {
+  let h = `<h3>${state.cols.length} columns</h3>`;
+  state.cols.forEach((c) => {
+    const p = profOf(c.name);
+    let bar = "";
+    if (p && p.n) {
+      const w = (x) => ((x / p.n) * 100).toFixed(1);
+      bar = `<span class="nulbar" title="${fmtInt(p.n_null)} null · ${fmtInt(p.n_empty)} empty ·
+        ${fmtInt(p.n_nullish)} null-like · ${fmtInt(p.n_uncastable)} won't cast">
+        <i class="nl" style="width:${w(p.n_null)}%"></i>
+        <i class="em" style="width:${w(p.n_empty)}%"></i>
+        <i class="bd" style="width:${w(p.n_uncastable)}%"></i></span>`;
+    }
+    const d = p ? (p.exact_distinct ?? p.approx_distinct) : null;
+    h += `<div class="col-row ${state.col === c.name ? "on" : ""}" data-col="${esc(c.name)}">
+      <span class="cn">${esc(c.name)}</span>${bar}
+      <span class="cd">${p ? (p.exact_distinct == null ? "≈" : "") + compact(d) : ""}</span>
+      <span class="ct">${esc(shortType(c.type))}</span></div>`;
+  });
+  if (!state.profile) h += `<div class="rail-note">Profiling…</div>`;
+  body.innerHTML = h;
+  body.querySelectorAll(".col-row").forEach((el) => (el.onclick = () => {
+    state.col = el.dataset.col; state.itab = "column"; loadColumn(state.col); renderInspector();
+  }));
+}
+const shortType = (t) => t.replace("TIMESTAMP WITH TIME ZONE", "TSTZ")
+  .replace("DECIMAL", "DEC").replace(/VARCHAR/, "STR").replace(/BOOLEAN/, "BOOL");
+
+function renderSource(body) {
+  const t = state.tables.find((x) => x.table === state.active);
+  const d = state.detail;
+  if (!t || !d) { body.innerHTML = ""; return; }
+  let h = `<div class="panel"><h4>${esc(t.table)}</h4>
+    <div class="sub" style="word-break:break-all">${esc(t.path)}</div><div class="stats">
+    <div><span>format</span><span>${esc(t.fmt)}</span></div>
+    <div><span>size</span><span>${human(t.size)}</span></div>
+    <div><span>columns</span><span>${t.n_cols}</span></div>
+    <div><span>rows</span><span>${t.rows.value === null ? "…" : fmtInt(t.rows.value)}</span></div>`;
+  if (t.rows.physical !== null && t.rows.physical !== t.rows.value)
+    h += `<div><span>physical rows</span><span>${fmtInt(t.rows.physical)}</span></div>`;
+  if (t.bad_cells) h += `<div><span>bad cells</span><span>${fmtInt(t.bad_cells)}</span></div>`;
+  if (t.staged) h += `<div><span>staged</span><span>yes</span></div>`;
+  if (t.sheet) h += `<div><span>sheet</span><span>${esc(t.sheet)}</span></div>`;
+  if (t.delta_version != null) h += `<div><span>delta version</span><span>${t.delta_version}</span></div>`;
+  h += `</div>`;
+  if (t.rows.basis) h += `<div class="sub">${esc(t.rows.basis)}</div>`;
+  if (t.sheets && t.sheets.length > 1) {
+    h += `<h3 style="margin-left:0">Sheets</h3>`;
+    t.sheets.forEach((s) => {
+      h += `<div class="col-row" data-sheet="${esc(s.name)}"><span class="cn">${esc(s.name)}</span>
+        <span class="cd">${s.empty ? "empty" : `${fmtInt(s.rows)}×${s.cols}`}</span></div>`;
+    });
+  }
+  // Staging, made explicit: what it is, and a per-file toggle.
+  const stageable = ["csv", "glob_csv", "xlsx", "json", "ndjson"].includes(t.fmt);
+  h += `<h3 style="margin-left:0">Staging</h3>`;
+  if (t.staged) {
+    h += `<div class="rail-note" style="margin-left:0">Staged: a native copy lives on disk, so
+      scrolling and grouping this file are instant. It uses disk and holds a copy of the data.</div>
+      <button class="btn sm" id="btn-unstage">Read from source instead</button>`;
+  } else if (stageable) {
+    h += `<div class="rail-note" style="margin-left:0">Reading the file in place. <b>Stage</b> it to
+      keep a native copy — scrolling and grouping become instant on large files, at the cost of some
+      disk and a copy of the data.${t.stage_reason ? " " + esc(t.stage_reason) + "." : ""}</div>
+      <button class="btn sm" id="btn-stage">Stage this file</button>`;
+  } else {
+    h += `<div class="rail-note" style="margin-left:0">${t.fmt === "merge"
+      ? "A merged view — export it if you want a saved copy."
+      : "Already columnar with per-file statistics, so staging would not make it faster."}</div>`;
+  }
+  if (d.sniff_prompt) {
+    h += `<h3 style="margin-left:0">Detected dialect</h3><div class="code">${
+      esc(String(d.sniff_prompt)).replace(/, /g, ",\n  ")}</div>`;
+  }
+  h += `</div>`;
+  body.innerHTML = h;
+  const sb = $("btn-stage");
+  if (sb) sb.onclick = () => post("/api/stage", { table: state.active, force: true })
+    .then(() => toast("Staging…")).catch(fail);
+  const ub = $("btn-unstage");
+  if (ub) ub.onclick = async () => {
+    try { await post("/api/unstage", { table: state.active });
+          await refreshState(); await loadTable(); toast("Now reading from source"); }
+    catch (e) { fail(e); }
+  };
+  body.querySelectorAll("[data-sheet]").forEach((el) => (el.onclick = () =>
+    post("/api/open", { path: t.path, sheet: el.dataset.sheet })
+      .then(async (nt) => { await refreshState(); await selectTable(nt.table, true); })
+      .catch(fail)));
+}
+
+async function loadColumn(col) {
+  const want = ++state.colSeq, tbl = state.active;
+  const p = profOf(col);
+  const mode = state.colLens || (p ? p.view : "topn");
+  try {
+    let d;
+    if (mode === "hist") d = await api(`/api/histogram/${encodeURIComponent(tbl)}/${encodeURIComponent(col)}`);
+    else if (mode === "highcard") d = await api(`/api/highcard/${encodeURIComponent(tbl)}/${encodeURIComponent(col)}`);
+    else d = await api(`/api/distinct/${encodeURIComponent(tbl)}/${encodeURIComponent(col)}?limit=200&search=${
+      encodeURIComponent(colSearch)}`);
+    if (want !== state.colSeq || state.active !== tbl) return;
+    state.colData = { mode, ...d };
+    renderInspector();
+  } catch (e) { fail(e); }
+}
+let colSearch = "", blockTimer;
+function renderColumn(body) {
+  const col = state.col;
+  if (!col) { body.innerHTML = `<div class="panel sub">Click a column.</div>`; return; }
+  const p = profOf(col), d = state.colData;
+  const c = state.cols.find((x) => x.name === col) || { type: "" };
+  let h = `<div class="panel"><h4>${esc(col)} <span class="ty">${esc(c.type)}</span></h4>`;
+  const lens = ["topn", "hist", "highcard"];
+  h += `<div class="lens">` + lens.map((l) =>
+    `<button data-lens="${l}" class="${(d?.mode || "topn") === l ? "on" : ""}">${
+      l === "topn" ? "VALUES" : l === "hist" ? "SPREAD" : "IDENTITY"}</button>`).join("") + `</div>`;
+
+  if (p) {
+    // Prefer the distinct panel's own count: it is exact when cardinality is low enough to bother,
+    // and it reflects the active filters. The profile only ever carries the cheap HLL estimate.
+    const exact = d?.n_distinct?.exact;
+    const dv = exact ? d.n_distinct.value : (p.exact_distinct ?? p.approx_distinct);
+    h += `<div class="stats">
+      <div><span>rows</span><span>${fmtInt(p.n)}</span></div>
+      <div><span>distinct</span><span>${exact ? "" : "≈ "}${fmtInt(dv)}</span></div>
+      <div><span>null</span><span>${fmtInt(p.n_null)}</span></div>
+      <div><span>empty ''</span><span>${fmtInt(p.n_empty)}</span></div>`;
+    if (p.n_nullish) h += `<div><span>null-like</span><span title="NA, N/A, -, ?, whitespace">${
+      fmtInt(p.n_nullish)}</span></div>`;
+    if (p.n_uncastable) h += `<div><span>won't cast</span><span style="color:var(--error)">${
+      fmtInt(p.n_uncastable)}</span></div>`;
+    if (p.min !== null) h += `<div><span>min</span><span>${esc(String(p.min)).slice(0, 22)}</span></div>`;
+    if (p.max !== null) h += `<div><span>max</span><span>${esc(String(p.max)).slice(0, 22)}</span></div>`;
+    if (p.avg !== null && p.avg !== undefined)
+      h += `<div><span>mean</span><span>${Number(p.avg).toLocaleString(undefined,
+        { maximumFractionDigits: 3 })}</span></div>`;
+    if (p.q50) h += `<div><span>median</span><span>${esc(String(p.q50)).slice(0, 22)}</span></div>`;
+    if (p.max_len) h += `<div><span>max length</span><span>${fmtInt(p.max_len)}</span></div>`;
+    h += `</div>`;
+  }
+
+  if (!d) { h += `<div class="sub">loading…</div></div>`; body.innerHTML = h; bindLens(body); return; }
+
+  if (d.mode === "hist") {
+    if (d.degenerate) {
+      h += `<div class="sub">No spread to plot — ${esc(d.reason || "")}.</div>`;
+    } else {
+      const mx = Math.max(1, ...d.buckets.map((b) => b.n));
+      const byIdx = new Map(d.buckets.map((b) => [b.b, b]));
+      let bars = "";
+      if (d.n_null) bars += `<i class="nul" style="height:${
+        Math.max(2, (d.n_null / Math.max(mx, d.n_null)) * 100).toFixed(1)}%"
+        title="${fmtInt(d.n_null)} null (excluded from the buckets)"></i>`;
+      for (let i = 0; i < d.bins; i++) {
+        const b = byIdx.get(i);
+        const n = b ? b.n : 0;
+        bars += `<i style="height:${Math.max(n ? 2 : 0, (n / mx) * 100).toFixed(1)}%"
+          title="${b ? `${fmtInt(n)} rows\n${b.b_min} … ${b.b_max}` : "0 rows"}"></i>`;
+      }
+      h += `<div class="hist">${bars}</div><div class="axis"><span>${esc(String(p?.min ?? ""))
+        .slice(0, 18)}</span><span>${esc(String(p?.max ?? "")).slice(0, 18)}</span></div>`;
+      h += `<div class="sub">${d.bins} buckets${d.n_null ? ` · ${fmtInt(d.n_null)} null shown
+        separately in amber` : ""}</div>`;
+    }
+  } else if (d.mode === "highcard") {
+    h += `<div class="sub">${fmtInt(d.approx_distinct)} distinct of ${fmtInt(d.n)} rows (${
+      pct(d.n ? d.approx_distinct / d.n : 0)}) — this looks like an identifier, so a ranked list
+      would tell you nothing.</div>`;
+    if (d.lengths && d.lengths.length) {
+      const mx = Math.max(...d.lengths.map((x) => x.n));
+      h += `<div class="hist" style="height:56px">` + d.lengths.map((x) =>
+        `<i style="height:${((x.n / mx) * 100).toFixed(1)}%" title="length ${x.len}: ${
+          fmtInt(x.n)} rows"></i>`).join("") + `</div>
+        <div class="axis"><span>len ${d.lengths[0].len}</span>
+        <span>len ${d.lengths[d.lengths.length - 1].len}</span></div>`;
+    }
+    h += `<h3 style="margin-left:0">Sample</h3>`;
+    h += (d.sample || []).map((v) => `<div class="vrow"><span class="lbl mono">${
+      v === null ? "␀ NULL" : esc(String(v))}</span></div>`).join("");
+  } else {
+    h += `<input class="vsearch" id="vsearch" placeholder="search values…"
+      value="${esc(colSearch)}">`;
+    const rows = d.values || [];
+    h += rows.map((v, i) => {
+      const sent = v.label === "␀ NULL" || v.label === "␀ EMPTY";
+      return `<div class="vrow ${v.selected ? "sel" : ""}" data-i="${i}">
+        <span class="fill" style="width:${(v.frac * 100).toFixed(2)}%"></span>
+        <span class="lbl ${sent ? "sent" : ""}">${esc(v.label)}</span>
+        <span class="cnt">${fmtInt(v.n)}</span>
+        <span class="pct">${pct(v.frac)}</span></div>`;
+    }).join("");
+    const dv = d.n_distinct;
+    h += `<div class="sub" style="margin-top:8px">showing ${d.shown} of ${
+      dv.exact ? "" : "≈ "}${fmtInt(dv.value)} values`;
+    if (d.other_n) h += ` · ${fmtInt(d.other_n)} rows in the tail`;
+    h += ` · ${d.ms} ms</div>`;
+    h += `<div class="rail-note" style="margin-left:0">Click to filter · ⌘-click to add ·
+      right-click to exclude. This list ignores its own column's filter, so everything stays
+      visible.</div>`;
+  }
+  h += `</div>`;
+  body.innerHTML = h;
+  bindLens(body);
+
+  const vs = $("vsearch");
+  if (vs) {
+    vs.oninput = () => {
+      colSearch = vs.value;
+      clearTimeout(blockTimer);
+      blockTimer = setTimeout(() => loadColumn(col), 200);
+    };
+  }
+  body.querySelectorAll(".vrow[data-i]").forEach((el) => {
+    const v = (state.colData.values || [])[parseInt(el.dataset.i, 10)];
+    if (!v) return;
+    el.onclick = (ev) => {
+      if (v.label === "␀ NULL") return addFilter(col, "is_null", []);
+      if (v.label === "␀ EMPTY") return addFilter(col, "is_empty", []);
+      if (ev.metaKey || ev.ctrlKey) {
+        const cur = (state.detail.spec.filters || []).find((f) => f.col === col && f.op === "in");
+        const vals = cur ? [...cur.values] : [];
+        const at = vals.indexOf(v.value);
+        if (at >= 0) vals.splice(at, 1); else vals.push(v.value);
+        return vals.length ? addFilter(col, "in", vals)
+          : applySpec((state.detail.spec.filters || []).filter((f) => f.col !== col),
+                      state.detail.spec.sort || []);
+      }
+      addFilter(col, "in", [v.value]);
+    };
+    el.oncontextmenu = (ev) => { ev.preventDefault(); addFilter(col, "not_in", [v.value]); };
+  });
+}
+function bindLens(body) {
+  body.querySelectorAll("[data-lens]").forEach((b) => (b.onclick = () => {
+    state.colLens = b.dataset.lens; loadColumn(state.col);
+  }));
+}
+
+/* ----------------------------------------------------------------- modals */
+function modal(html, wide) {
+  const scrim = document.createElement("div");
+  scrim.className = "scrim";
+  scrim.innerHTML = `<div class="modal" style="${wide ? "width:760px" : "width:520px"}">${html}</div>`;
+  scrim.onclick = (e) => { if (e.target === scrim) scrim.remove(); };
+  document.addEventListener("keydown", function esc2(e) {
+    if (e.key === "Escape") { scrim.remove(); document.removeEventListener("keydown", esc2); }
+  });
+  document.body.appendChild(scrim);
+  return scrim;
+}
+
+async function showBadRows() {
+  try {
+    const d = await api(`/api/badrows/${encodeURIComponent(state.active)}`);
+    let h = `<h3>${fmtInt(d.rows)} row${d.rows === 1 ? "" : "s"} dropped</h3>
+      <div class="sub">${fmtInt(d.cells)} cell${d.cells === 1 ? "" : "s"} could not be cast to the
+      detected type, so DuckDB skipped the whole row. These are <b>not</b> in the grid or in any
+      aggregate. Reading the column as text instead keeps them.</div>`;
+    if (d.data && d.data.length) {
+      h += `<div style="max-height:44vh;overflow:auto"><table class="plain"><thead><tr>` +
+        d.cols.map((c) => `<th>${esc(c.name)}</th>`).join("") + `</tr></thead><tbody>`;
+      d.data.forEach((r) => {
+        const badCols = Array.isArray(r[0]) ? r[0] : [];
+        h += "<tr>" + r.map((v, i) => {
+          const nm = d.cols[i].name;
+          const isBad = badCols.includes(nm);
+          return `<td class="${isBad ? "bad" : ""}">${v === null ? "" :
+            esc(String(Array.isArray(v) ? v.join(", ") : v)).slice(0, 60)}</td>`;
+        }).join("") + "</tr>";
+      });
+      h += `</tbody></table></div>`;
+    }
+    h += `<div class="row"><button class="btn primary" id="bad-close">Close</button></div>`;
+    const m = modal(h, true);
+    m.querySelector("#bad-close").onclick = () => m.remove();
+  } catch (e) { fail(e); }
+}
+
+async function showStaged() {
+  try {
+    const d = await api("/api/staged");
+    let h = `<h3>Staged data</h3><div class="sub">Native copies kept in <span class="kbd">${
+      esc(d.home)}</span> so reopening a large file is instant. This is <b>a real copy of your data on
+      this machine</b>: anything untouched for ${d.max_age_days} days is purged automatically, and the
+      total is capped at ${d.budget_gb} GB.</div>`;
+    if (!d.entries.length) {
+      h += `<div class="sub">Nothing staged.</div>`;
+    } else {
+      h += `<table class="plain"><thead><tr><th>table</th><th>source</th><th>size</th>
+        <th>last used</th><th></th></tr></thead><tbody>`;
+      d.entries.forEach((e) => {
+        h += `<tr><td>${esc(e.table)}</td>
+          <td style="max-width:280px;overflow:hidden;text-overflow:ellipsis"
+              title="${esc(e.path)}">${esc(e.path.split("/").pop())}
+              ${e.source_missing ? '<span style="color:var(--error)"> (source gone)</span>' : ""}
+              ${e.source_changed ? '<span style="color:var(--stale)"> (source changed)</span>' : ""}</td>
+          <td>${human(e.bytes)}</td><td>${esc(String(e.last_used || "").slice(0, 16))}</td>
+          <td><button class="btn sm" data-purge="${esc(e.table)}">drop</button></td></tr>`;
+      });
+      h += `</tbody></table><div class="sub" style="margin-top:8px">${human(d.total_bytes)}
+        total of ${d.budget_gb} GB.</div>`;
+    }
+    h += `<div class="row"><button class="btn" id="purge-all">Clear all staged data</button>
+      <span style="flex:1"></span><button class="btn primary" id="st-close">Close</button></div>`;
+    const m = modal(h, true);
+    m.querySelector("#st-close").onclick = () => m.remove();
+    m.querySelector("#purge-all").onclick = async () => {
+      await post("/api/purge", { all: true }).catch(fail);
+      m.remove(); showStaged(); refreshState();
+    };
+    m.querySelectorAll("[data-purge]").forEach((b) => (b.onclick = async () => {
+      await post("/api/purge", { tables: [b.dataset.purge] }).catch(fail);
+      m.remove(); showStaged(); refreshState();
+    }));
+  } catch (e) { fail(e); }
+}
+
+// Copy-as-snippet UI is deliberately gone for now — it returns as a "send to Snowflake" extension.
+// The /api/snippet endpoint and core/snippet.py stay as that feature's foundation.
+
+function showExport() {
+  const t = state.tables.find((x) => x.table === state.active);
+  if (!t) return;
+  const dir = t.path.replace(/\/[^/]*$/, "");
+  const h = `<h3>Export current result</h3>
+    <div class="sub">Writes what the grid is showing — filters, sort, or your SQL — using DuckDB's
+    COPY. The only thing Sift ever writes.</div>
+    <div class="row"><input type="text" id="ex-dest" value="${esc(dir)}/${esc(t.table)}_export.parquet">
+    </div>
+    <div class="row"><select id="ex-fmt" style="padding:5px 8px;border-radius:6px;
+      border:1px solid var(--line);background:var(--panel)">
+      ${EXPORT_FORMATS.map(([k, label, ext]) =>
+        `<option value="${k}" data-ext="${ext}">${label}</option>`).join("")}</select>
+      <label style="font-size:12px"><input type="checkbox" id="ex-ow"> overwrite if it exists</label>
+      <span style="flex:1"></span>
+      <button class="btn" id="ex-cancel">Cancel</button>
+      <button class="btn primary" id="ex-go">Export</button></div>`;
+  const m = modal(h);
+  m.querySelector("#ex-cancel").onclick = () => m.remove();
+  m.querySelector("#ex-fmt").onchange = (e) => {
+    const ext = e.target.selectedOptions[0].dataset.ext;
+    const i = m.querySelector("#ex-dest");
+    i.value = i.value.replace(/\.[a-z0-9]+$/i, "." + ext);
+  };
+  m.querySelector("#ex-go").onclick = async () => {
+    try {
+      const d = await post("/api/export", {
+        table: state.active, dest: m.querySelector("#ex-dest").value,
+        format: m.querySelector("#ex-fmt").value,
+        overwrite: m.querySelector("#ex-ow").checked,
+      });
+      m.remove();
+      toast(`Wrote ${human(d.bytes)} to ${d.dest} in ${d.ms} ms`);
+    } catch (e) { fail(e); }
+  };
+}
+
+// Blend two open tables into a new dataset. The overlap probe is a preview here, not the product —
+// the product is the joined view that lands in the sidebar.
+async function showMerge(preLeft) {
+  if (state.tables.length < 2) return toast("Open at least two tables to merge them.");
+  const opt = (sel) => state.tables.map((t) =>
+    `<option value="${esc(t.table)}" ${t.table === sel ? "selected" : ""}>${esc(t.table)}</option>`).join("");
+  const left0 = preLeft || state.active || state.tables[0].table;
+  const right0 = state.tables.find((t) => t.table !== left0)?.table;
+  const h = `<h3>Merge tables</h3>
+    <div class="sub">Join two tables into a new dataset. It appears in the sidebar as a view —
+    instant, no copy — and you can explore or export it like any other source.</div>
+    <div class="row">
+      <select id="mg-l" style="padding:5px 8px;border-radius:6px;border:1px solid var(--line);background:var(--panel)">${opt(left0)}</select>
+      <select id="mg-how" style="padding:5px 8px;border-radius:6px;border:1px solid var(--line);background:var(--panel)">
+        <option value="inner">inner join</option><option value="left">left join</option>
+        <option value="right">right join</option><option value="full">full join</option></select>
+      <select id="mg-r" style="padding:5px 8px;border-radius:6px;border:1px solid var(--line);background:var(--panel)">${opt(right0)}</select>
+    </div>
+    <div id="mg-keys"></div>
+    <div class="row"><input type="text" id="mg-name" placeholder="new table name (optional)"></div>
+    <div id="mg-preview"></div>
+    <div class="row"><span style="flex:1"></span>
+      <button class="btn" id="mg-cancel">Cancel</button>
+      <button class="btn primary" id="mg-go" disabled>Merge →</button></div>`;
+  const m = modal(h, true);
+  m.querySelector("#mg-cancel").onclick = () => m.remove();
+  const keysBox = m.querySelector("#mg-keys");
+  const preview = m.querySelector("#mg-preview");
+  const goBtn = m.querySelector("#mg-go");
+
+  const pickedKeys = () => [...keysBox.querySelectorAll("[data-k]:checked")].map((x) => x.dataset.k);
+
+  async function loadKeys() {
+    const left = m.querySelector("#mg-l").value, right = m.querySelector("#mg-r").value;
+    preview.innerHTML = "";
+    goBtn.disabled = true;
+    if (left === right) { keysBox.innerHTML = `<div class="sub">Pick two different tables.</div>`; return; }
+    try {
+      const d = await api(`/api/joincols?left=${encodeURIComponent(left)}&right=${encodeURIComponent(right)}`);
+      if (!d.candidates.length) {
+        keysBox.innerHTML = `<div class="sub">These two share no column names — nothing to join on.</div>`;
+        return;
+      }
+      keysBox.innerHTML = `<div class="sub">Join on — tick one or more keys:</div>` +
+        d.candidates.map((c) => `<label class="col-row" style="cursor:pointer">
+          <input type="checkbox" data-k="${esc(c.col)}" ${c.compatible ? "" : "disabled"}>
+          <span class="cn">${esc(c.col)}</span>
+          <span class="ct">${esc(c.left_type)} / ${esc(c.right_type)}</span>
+          ${c.compatible ? "" : '<span class="cd" style="color:var(--stale)">type mismatch</span>'}
+          </label>`).join("");
+      keysBox.querySelectorAll("[data-k]").forEach((cb) => (cb.onchange = probe));
+    } catch (e) { fail(e); }
+  }
+
+  async function probe() {
+    const left = m.querySelector("#mg-l").value, right = m.querySelector("#mg-r").value;
+    const on = pickedKeys();
+    goBtn.disabled = on.length === 0;
+    if (!on.length) { preview.innerHTML = ""; return; }
+    try {
+      const r = await post("/api/join_probe", { left, right, on });
+      preview.innerHTML = `<div class="code">${fmtInt(r.matched)} of ${fmtInt(r.left_distinct)}` +
+        ` distinct ${on.join(" + ")} in ${esc(left)} match ${esc(right)} → ${pct(r.pct)}` +
+        `${r.unmatched ? `\n${fmtInt(r.unmatched)} unmatched (kept only by a left/full join)` : ""}</div>`;
+    } catch (e) { fail(e); }
+  }
+
+  m.querySelector("#mg-l").onchange = loadKeys;
+  m.querySelector("#mg-r").onchange = loadKeys;
+  goBtn.onclick = async () => {
+    try {
+      const t = await post("/api/merge", {
+        left: m.querySelector("#mg-l").value, right: m.querySelector("#mg-r").value,
+        on: pickedKeys(), how: m.querySelector("#mg-how").value,
+        name: m.querySelector("#mg-name").value.trim() || null,
+      });
+      m.remove();
+      await refreshState();
+      await selectTable(t.table, true);
+      toast(`Merged into ${t.table} — ${fmtInt(t.rows.value)} rows`);
+    } catch (e) { fail(e); }
+  };
+  loadKeys();
+}
+
+/* --------------------------------------------------------------- opening */
+async function openPath(path, sheet) {
+  if (!path) return;
+  try {
+    const t = await post("/api/open", { path, sheet });
+    await refreshState();
+    await selectTable(t.table, true);
+    toast(`Opened ${t.table}`);
+  } catch (e) {
+    // A workbook with several sheets is better answered with a picker than a guess.
+    if (/\.xlsx?$/i.test(path) && !sheet) return maybeSheetPicker(path);
+    fail(e);
+  }
+}
+async function maybeSheetPicker(path) {
+  try {
+    const d = await api(`/api/sheets?path=${encodeURIComponent(path)}`);
+    const h = `<h3>${esc(path.split("/").pop())}</h3>
+      <div class="sub">${d.sheets.length} sheets — pick what to open.</div>` +
+      d.sheets.map((s) => `<label class="col-row" style="cursor:pointer">
+        <input type="checkbox" data-s="${esc(s.name)}" ${s.empty ? "disabled" : "checked"}>
+        <span class="cn">${esc(s.name)}</span>
+        <span class="cd">${s.empty ? "empty" : `${fmtInt(s.rows)} × ${s.cols}`}</span></label>`).join("") +
+      `<div class="row"><span style="flex:1"></span><button class="btn" id="sh-x">Cancel</button>
+       <button class="btn primary" id="sh-go">Open</button></div>`;
+    const m = modal(h);
+    m.querySelector("#sh-x").onclick = () => m.remove();
+    m.querySelector("#sh-go").onclick = async () => {
+      const names = [...m.querySelectorAll("[data-s]:checked")].map((x) => x.dataset.s);
+      m.remove();
+      for (const n of names) await openPath(path, n);
+    };
+  } catch (e) { fail(e); }
+}
+
+/* Called by the native shell (DropWebView / AppDelegate) with real filesystem paths — from an
+   in-window drop, a Dock-icon drop, Finder "Open With", or File > Open. */
+window.siftOpenPaths = async (paths) => {
+  for (const p of paths || []) {
+    if (/\.xlsx?$/i.test(p)) await maybeSheetPicker(p);
+    else await openPath(p);
+  }
+};
+// Drag feedback in both places it can show: the rail dropzone (browser) and the empty-state pane.
+function setDropHint(on) {
+  $("dropzone")?.classList.toggle("hot", on);
+  $("gempty")?.classList.toggle("drop", on);
+}
+window.siftDragHint = (on) => setDropHint(!!on);   // called by the native shell during an AppKit drag
+
+// Open a file: native uses NSOpenPanel via the shell; browser triggers a hidden <input type=file>.
+function triggerOpen() {
+  if (NATIVE && window.webkit?.messageHandlers?.sift) {
+    window.webkit.messageHandlers.sift.postMessage({ type: "open" });
+    return;
+  }
+  let inp = $("empty-file");
+  if (!inp) {
+    inp = document.createElement("input");
+    inp.type = "file"; inp.id = "empty-file"; inp.style.display = "none";
+    inp.onchange = () => { for (const f of inp.files) uploadFile(f); inp.value = ""; };
+    document.body.appendChild(inp);
+  }
+  inp.click();
+}
+
+/* ---------------------------------------------------------------- native bridge
+   In the shell, the chrome is AppKit: a vibrant sidebar and a unified toolbar. The page stays the
+   single source of truth for engine state (it already has /api/state plus the SSE stream), and
+   pushes what the native chrome needs to draw. Having Swift poll separately would give two views of
+   the world that can disagree. */
+const shell = () => (NATIVE ? window.webkit?.messageHandlers?.sift : null);
+
+function pushNativeState() {
+  const s = shell();
+  if (!s) return;
+  const t = state.tables.find((x) => x.table === state.active);
+  let summary = "";
+  if (t) {
+    summary = `${rowText(t)} · ${t.n_cols} cols`;
+    if (t.bad_rows) summary += ` · ${fmtInt(t.bad_rows)} dropped`;
+  }
+  s.postMessage({
+    type: "state",
+    active: state.active || null,
+    rowSummary: summary,
+    tables: state.tables.map((x) => ({
+      name: x.table, fmt: x.fmt, size: x.size, rows: x.rows.value,
+      unfiltered: x.rows.unfiltered ?? null, staged: !!x.staged,
+      badRows: x.bad_rows || 0, path: x.path, subtitle: sourceSubtitle(x),
+    })),
+  });
+}
+
+/* Called from the native sidebar and toolbar. */
+window.siftSelectTable = (name) => selectTable(name);
+window.siftCloseTable = (name) => closeTable(name);
+// Stage/unstage a specific file from the native row menu. Stage is a background job (SSE updates);
+// unstage is immediate, so refresh and reload if it's the active table.
+window.siftStage = async (name, on) => {
+  try {
+    if (on) { await post("/api/stage", { table: name, force: true }); toast("Staging…"); }
+    else {
+      await post("/api/unstage", { table: name });
+      await refreshState();
+      if (name === state.active) await loadTable();
+      toast(`${name}: now reading from source`);
+    }
+  } catch (e) { fail(e); }
+};
+// The native sidebar picks a destination with NSSavePanel, then hands it here so the actual write
+// goes through the one export path (and one toast) rather than a second HTTP client in Swift.
+window.siftExport = async (table, dest, format) => {
+  try {
+    const d = await post("/api/export", { table, dest, format, overwrite: true });
+    toast(`Wrote ${human(d.bytes)} to ${d.dest} in ${d.ms} ms`);
+  } catch (e) { fail(e); }
+};
+window.siftAction = (what) => {
+  if (what === "export") showExport();
+  else if (what === "staged") showStaged();
+  else if (what === "merge") showMerge();
+  else if (what === "inspector") { open.insp = !open.insp; autoLayout(); }
+  else if (what === "close" && state.active) closeTable(state.active);
+};
+
+async function uploadFile(file) {
+  if (file.size > MAX_UPLOAD_MB * 1024 * 1024) {
+    const gb = (file.size / 1024 ** 3).toFixed(1);
+    const h = `<h3>${esc(file.name)} is ${gb} GB</h3>
+      <div class="sub">The browser will not tell Sift where this file lives, so it would have to be
+      copied first — about ${Math.round(file.size / (200 * 1024 * 1024))}s, and twice the disk.
+      <br><br><b>Faster:</b> press <span class="kbd">⌥⌘C</span> on the file in Finder and paste the
+      path below, or drop it on the Sift app icon. Either reads it in place, instantly.</div>
+      <div class="row"><input type="text" id="up-path" placeholder="/Users/you/data/${esc(file.name)}">
+        <button class="btn primary" id="up-open">Open</button></div>
+      <div class="row"><span style="flex:1"></span>
+        <button class="btn" id="up-cancel">Cancel</button></div>`;
+    const m = modal(h);
+    m.querySelector("#up-cancel").onclick = () => m.remove();
+    m.querySelector("#up-open").onclick = () => {
+      const p = m.querySelector("#up-path").value.trim();
+      m.remove(); openPath(p);
+    };
+    return;
+  }
+  toast(`Copying ${file.name} (${human(file.size)})…`);
+  const fd = new FormData();
+  fd.append("file", file);
+  fd.append("size", String(file.size));
+  try {
+    const res = await fetch("/api/upload", { method: "POST", headers: { "X-Sift-Token": TOKEN },
+                                             body: fd });
+    if (!res.ok) {
+      let msg = res.statusText;
+      try { msg = (await res.json()).error || msg; } catch (_) {}
+      throw new Error(msg);
+    }
+    const t = await res.json();
+    await refreshState();
+    await selectTable(t.table, true);
+  } catch (e) { fail(e); }
+}
+
+/* ------------------------------------------------------------------ wire */
+/* Panels yield to the grid as the window narrows, because the grid is the point.
+     >=1040px  rail + grid + inspector, all in flow
+     >=780px   grid + inspector; the rail floats on demand
+     <780px    grid only; both panels float on demand, closed by default
+   `open` holds what the user has explicitly asked for at the current breakpoint. */
+const open = { rail: true, insp: true };
+function autoLayout() {
+  const w = window.innerWidth;
+  const b = document.body.classList;
+  if (NATIVE) {
+    // AppKit owns the sidebar; the page only decides whether the inspector has its own column.
+    open.rail = false;
+    b.remove("float-rail", "no-rail");
+    const floats = w < 700;
+    b.toggle("float-insp", floats && open.insp);
+    b.toggle("no-insp", !open.insp || (floats && !open.insp));
+    $("tgl-insp").classList.toggle("on", open.insp);
+    scheduleRender();
+    return;
+  }
+  const railFloats = w < 1040, inspFloats = w < 780;
+
+  b.toggle("float-rail", railFloats && open.rail);
+  b.toggle("float-insp", inspFloats && open.insp);
+  b.toggle("no-rail", railFloats && !open.rail);
+  b.toggle("no-insp", inspFloats && !open.insp);
+  if (!railFloats && !open.rail) b.add("no-rail");
+  if (!inspFloats && !open.insp) b.add("no-insp");
+
+  $("tgl-rail").classList.toggle("on", open.rail);
+  $("tgl-insp").classList.toggle("on", open.insp);
+  scheduleRender();
+}
+function setBreakpointDefaults() {
+  // Floating panels start closed — an overlay that covers the grid on load is worse than no panel.
+  const w = window.innerWidth;
+  open.rail = !NATIVE && w >= 1040;
+  open.insp = w >= (NATIVE ? 700 : 780);
+}
+
+function wire() {
+  const gs = $("gscroll");
+  gs.addEventListener("scroll", () => { onScroll(); $("ghead").scrollLeft = gs.scrollLeft;
+    $("ghead-inner").style.transform = `translateX(${-gs.scrollLeft}px)`; });
+  // No wheel handler on purpose — see the comment above keyNav. Native scrolling keeps its momentum.
+  gs.tabIndex = 0;
+  gs.addEventListener("keydown", keyNav);
+  document.addEventListener("keydown", (e) => {
+    // Global, so arrows work without clicking the grid first — but never while typing.
+    if (["ArrowDown", "ArrowUp", "PageDown", "PageUp", "Home", "End"].includes(e.key)
+        || (e.key === "g" && e.metaKey)) keyNav(e);
+  });
+  // Coalesced (via autoLayout's scheduleRender): dragging a window edge or the native sidebar
+  // divider fires resize far faster than 60Hz, and each event used to rebuild every visible cell
+  // synchronously. Crossing a breakpoint re-applies the defaults; resizing within one keeps the
+  // user's choice.
+  let lastW = window.innerWidth;
+  window.addEventListener("resize", () => {
+    const w = window.innerWidth;
+    const bp = (x) => (x >= 1040 ? 2 : x >= 780 ? 1 : 0);
+    if (bp(w) !== bp(lastW)) setBreakpointDefaults();
+    lastW = w;
+    autoLayout();
+  });
+  $("tgl-rail").onclick = () => {
+    open.rail = !open.rail;
+    if (open.rail && window.innerWidth < 780) open.insp = false;  // only one overlay at a time
+    autoLayout();
+  };
+  $("tgl-insp").onclick = () => {
+    open.insp = !open.insp;
+    if (open.insp && window.innerWidth < 780) open.rail = false;
+    autoLayout();
+  };
+  // Clicking the grid dismisses a floating panel, the usual drawer behaviour.
+  $("gridwrap").addEventListener("mousedown", () => {
+    const b = document.body.classList;
+    if (b.contains("float-rail") || b.contains("float-insp")) {
+      if (window.innerWidth < 1040) open.rail = false;
+      if (window.innerWidth < 780) open.insp = false;
+      autoLayout();
+    }
+  });
+
+  document.querySelectorAll(".itab").forEach((t) => (t.onclick = () => {
+    state.itab = t.dataset.itab; renderInspector();
+  }));
+
+  $("btn-openpath").onclick = () => { const v = $("pathbox").value.trim();
+    $("pathbox").value = ""; openPath(v); };
+  $("pathbox").onkeydown = (e) => { if (e.key === "Enter") $("btn-openpath").click(); };
+  $("btn-staged").onclick = showStaged;
+  $("btn-export").onclick = showExport;
+  $("btn-merge").onclick = () => showMerge();
+
+  $("btn-runsql").onclick = runSQL;
+  $("btn-resetsql").onclick = async () => {
+    try {
+      const r = await post("/api/sqlexit", { table: state.active });
+      state.sqlMode = false; $("sqlbox").value = r.sql;
+      $("sqlstate").textContent = "mirrors the filters above";
+      $("sqlstate").classList.remove("own");
+      resetGrid(); await loadTable();
+    } catch (e) { fail(e); }
+  };
+  $("sqlbox").addEventListener("input", () => {
+    // Taking over the box is a one-way door: no attempt is made to parse SQL back into UI state,
+    // because round-tripping SQL→filters is where tools like this go to die. Reset is the exit.
+    $("sqlstate").textContent = "your SQL — filters and header controls are frozen";
+    $("sqlstate").classList.add("own");
+  });
+  $("sqlbox").addEventListener("keydown", (e) => {
+    if ((e.metaKey || e.ctrlKey) && e.key === "Enter") { e.preventDefault(); runSQL(); }
+  });
+
+  const dz = $("dropzone");
+  if (NATIVE) {
+    // AppKit owns drops here and calls siftOpenPaths() with real paths. Swallow the browser's
+    // default so a stray drop cannot navigate the web view away from the app.
+    ["dragover", "drop"].forEach((ev) =>
+      document.addEventListener(ev, (e) => e.preventDefault()));
+  } else {
+    ["dragenter", "dragover"].forEach((ev) => document.addEventListener(ev, (e) => {
+      e.preventDefault(); setDropHint(true);
+    }));
+    ["dragleave", "drop"].forEach((ev) => document.addEventListener(ev, (e) => {
+      if (ev === "dragleave" && e.relatedTarget) return;
+      setDropHint(false);
+    }));
+    document.addEventListener("drop", async (e) => {
+      e.preventDefault();
+      for (const f of [...(e.dataTransfer?.files || [])]) await uploadFile(f);
+    });
+  }
+  $("pathbox").addEventListener("paste", () => setTimeout(() => {
+    const v = $("pathbox").value.trim();
+    if (v.startsWith("/") && !v.includes("\n")) { $("pathbox").value = ""; openPath(v); }
+  }, 0));
+
+  document.addEventListener("keydown", (e) => {
+    if (e.metaKey && e.key >= "1" && e.key <= "9") {
+      const i = parseInt(e.key, 10) - 1;
+      if (state.tables[i]) { e.preventDefault(); selectTable(state.tables[i].table); }
+    }
+  });
+}
+
+async function runSQL() {
+  const sql = $("sqlbox").value;
+  state.sqlMode = true;
+  resetGrid();
+  try {
+    const d = await post("/api/sql", { table: state.active, sql, offset: 0, limit: BLOCK });
+    state.cols = d.cols;
+    state.blocks.set(0, d.rows);
+    state.order = [0];
+    state.total = d.rows.length < BLOCK ? d.rows.length : BLOCK + 1;
+    renderHead(); renderGrid(); renderToolbar();
+    toast(`${d.rows.length} rows in ${d.ms} ms`);
+  } catch (e) { fail(e); }
+}
+
+/* ------------------------------------------------------------------- SSE */
+function listen() {
+  const es = new EventSource(`/api/events?t=${encodeURIComponent(TOKEN)}`);
+  es.onmessage = async (ev) => {
+    let m;
+    try { m = JSON.parse(ev.data); } catch (_) { return; }
+    if (m.type === "hello") { await refreshState(); if (state.active) await loadTable(); return; }
+    if (["opened", "closed", "purged"].includes(m.type)) { await refreshState(); return; }
+    if (["count", "counting", "state", "staging", "staged", "rejects"].includes(m.type)) {
+      await refreshState();
+      const t = state.tables.find((x) => x.table === state.active);
+      if (m.table === state.active && t) {
+        if (m.type === "staged") {
+          // The relation was swapped view→native table, so cached rows are stale.
+          state.blocks.clear(); state.order = [];
+          state.total = t.rows.value || 0;
+          await fetchBlock(Math.floor(state.firstRow / BLOCK));
+          renderGrid();
+        } else if (m.type === "count") {
+          // An exact count changes only the scroll extent, not row contents — keep the blocks.
+          state.total = t.rows.value || 0;
+          renderGrid();
+        }
+      }
+      return;
+    }
+    if (m.type === "profile" && m.table === state.active) { loadProfile(); return; }
+    if (m.type === "error") { toast(m.msg || "engine error", true); await refreshState(); }
+  };
+  es.onerror = () => { /* EventSource retries on its own */ };
+}
+
+if (NATIVE) document.body.classList.add("native");
+wire();
+setBreakpointDefaults();
+autoLayout();
+listen();
+refreshState().then(() => { if (state.active) loadTable(); }).catch(fail);
+</script>
+</body>
+</html>

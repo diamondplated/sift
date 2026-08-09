@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "sift",
+      "runtimeExecutable": "./dev.sh",
+      "runtimeArgs": [],
+      "port": 8642
+    }
+  ]
+}

@@ -1,0 +1,13 @@
+.venv/
+__pycache__/
+.pytest_cache/
+# Runtime state: staged data, browser-drop spill, and the built app bundle.
+spill/
+stage.duckdb
+stage.duckdb.wal
+Sift.app/
+*.icns
+# macOS
+.DS_Store
+# Swift
+shell/.build/
