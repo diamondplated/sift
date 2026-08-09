@@ -172,6 +172,11 @@ public func renderSQL(_ spec: QuerySpec, cols: [String: Column]) -> String {
             preds.append("\(c) IS NOT NULL")
         case .isEmpty:
             preds.append("CAST(\(c) AS VARCHAR) = ''")
+        // Deliberate defensive deviation (noted in Task 4's review): Python indexes
+        // f.values[0]/[1] here unconditionally and would raise IndexError on a malformed filter
+        // (empty values for contains, fewer than two for between). These two branches guard with
+        // `if let` / `count >= 2` instead and silently drop the predicate. Behavior is otherwise
+        // unchanged, and the blast radius is small — renderSQL is display-only, never executed.
         case .contains:
             if let v = f.values.first {
                 preds.append("CAST(\(c) AS VARCHAR) ILIKE \(literal(.text("%\(pyStr(v))%")))")
