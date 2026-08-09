@@ -201,6 +201,14 @@ func fact6_deltaTimeTravelUsesVersionArrowNotAtVersion() throws {
     let versioned = try c.query("SELECT count(*) FROM delta_scan('\(root)', version => 1)").allRows()[0][0]
     #expect(versioned == .int(100))
 
+    // version => 0 is the assertion that actually proves time travel SELECTS a different
+    // version rather than merely parsing and being ignored: 100 == 100 above is consistent
+    // with either. Before the remove in version 1, both parquet files were live, so version 0
+    // must see all 150 rows — the tombstoned-but-still-on-disk row count, same number a raw
+    // glob would report.
+    let atVersionZero = try c.query("SELECT count(*) FROM delta_scan('\(root)', version => 0)").allRows()[0][0]
+    #expect(atVersionZero == .int(150), "version => 0 must predate the tombstone and see both files")
+
     let scanned = try c.query("SELECT count(*) FROM delta_scan('\(root)')").allRows()[0][0]
     #expect(scanned == .int(100), "delta_scan must honor the tombstone, not the raw 150")
 

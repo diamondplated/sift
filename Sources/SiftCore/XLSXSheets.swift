@@ -10,10 +10,18 @@ import Foundation
 
 /// Run `/usr/bin/unzip -p <path> <entry>` and return the entry's raw bytes.
 ///
-/// Drains stdout and stderr concurrently while the process runs — `unzip` writes its "caution:
-/// filename not matched" diagnostics to stderr, and a large worksheet's stdout can exceed the
-/// pipe buffer, so reading either pipe synchronously after `waitUntilExit()` risks a deadlock
-/// (the child blocks writing to a full pipe nobody is draining yet).
+/// One blocking drain on the calling thread, not a pair of `DispatchQueue.global()` tasks: this
+/// invocation never writes to the child's stdin, so there is nothing this thread could be
+/// blocking that the child is waiting on, and draining stdout synchronously (whatever its size —
+/// `readDataToEndOfFile()` loops internally until the pipe closes) cannot deadlock. stderr is
+/// read only after the process exits, not concurrently with stdout: `unzip -p` only ever writes
+/// a short diagnostic line there ("caution: filename not matched: ..."), never bulk data, so it
+/// can't fill a pipe buffer and block the child before it exits. (An earlier version of this
+/// function used two `DispatchQueue.global().async` drains plus a `DispatchGroup` — that pattern
+/// is what caused a measured deadlock in the test suite, which shared a GCD-thread-hungry
+/// subprocess fixture across many parallel tests; see task-9-report.md's review-fix section.
+/// This function ships in the app, so it needed the same fix even though nothing here was ever
+/// observed hanging directly — the exhaustion risk was real regardless.)
 private func runUnzip(path: String, entry: String) throws -> Data {
     let process = Process()
     process.executableURL = URL(fileURLWithPath: "/usr/bin/unzip")
@@ -29,23 +37,9 @@ private func runUnzip(path: String, entry: String) throws -> Data {
         throw UnsupportedSource("could not run unzip for \(path): \(error.localizedDescription)")
     }
 
-    // Safe despite the mutation happening off the current isolation domain: group.wait() below
-    // is the barrier — nothing reads either var until both async blocks have signaled `leave()`.
-    nonisolated(unsafe) var outData = Data()
-    nonisolated(unsafe) var errData = Data()
-    let group = DispatchGroup()
-    group.enter()
-    DispatchQueue.global().async {
-        outData = outPipe.fileHandleForReading.readDataToEndOfFile()
-        group.leave()
-    }
-    group.enter()
-    DispatchQueue.global().async {
-        errData = errPipe.fileHandleForReading.readDataToEndOfFile()
-        group.leave()
-    }
-    group.wait()
+    let outData = outPipe.fileHandleForReading.readDataToEndOfFile()
     process.waitUntilExit()
+    let errData = errPipe.fileHandleForReading.readDataToEndOfFile()
 
     guard process.terminationStatus == 0 else {
         let msg = String(data: errData, encoding: .utf8) ?? "unzip exited \(process.terminationStatus)"
@@ -140,16 +134,20 @@ private func parseCellRef(_ s: Substring) -> (col: Int, row: Int)? {
     return (col, row)
 }
 
-/// A workbook with no `<dimension>` reports (0, 0). See the doc note on `listSheets` for why
-/// that's deliberate: `SheetInfo.empty` (`rows <= 1`) then reads this sheet as empty, but the
-/// picker still offers it rather than hiding it entirely.
+/// A workbook with no `<dimension>` element at all reports (0, 0) — see `worksheetDimension`
+/// below, which is what actually returns that default when parsing finds no `ref` attribute.
 private func parseDimensionRef(_ ref: String) -> (rows: Int, cols: Int) {
     let parts = ref.split(separator: ":", maxSplits: 1, omittingEmptySubsequences: false)
     guard let start = parseCellRef(parts[0]) else { return (0, 0) }
     guard parts.count > 1, let end = parseCellRef(parts[1]) else {
-        return (1, 1)   // single-cell ref, e.g. "A1"
+        return (rows: start.row, cols: start.col)   // single-cell ref, e.g. "A1"
     }
-    return (rows: end.row - start.row + 1, cols: end.col - start.col + 1)
+    // openpyxl's max_row/max_column are the END coordinates outright, not a span from the
+    // start: `<dimension ref="B2:C10"/>` is 10 rows deep and 3 columns wide (both counted from
+    // row/col 1), MEASURED against openpyxl reading the same file — not `(10-2+1)=9` rows. Every
+    // fixture before amp.xlsx happened to be anchored at A1, where the two formulas coincide,
+    // which is exactly how this was wrong without a ported test catching it.
+    return (rows: end.row, cols: end.col)
 }
 
 private func worksheetDimension(_ data: Data) -> (rows: Int, cols: Int) {
@@ -176,8 +174,11 @@ private func resolveWorksheetEntry(_ target: String) -> String {
 /// is read out of each worksheet XML, never `<sheetData>`. DuckDB's `read_xlsx` can read a
 /// *named* sheet but offers no way to list them, which is the entire reason this exists.
 ///
-/// A workbook with no `<dimension>` reports `rows: 0, cols: 0` and is treated as **non-empty**
-/// by `SheetInfo.empty` (`rows <= 1`), so the picker still offers it rather than hiding it.
+/// A workbook with no `<dimension>` element reports `rows: 0, cols: 0` for that sheet, which
+/// makes `SheetInfo.empty` (`rows <= 1`) true — but `list_sheets`/`listSheets` never drops the
+/// sheet from the returned list over it, and `build_source`'s `sheets[0]` fallback still picks
+/// it as the default when every sheet is empty. The picker is offered the sheet either way;
+/// what changes is only whether it's auto-selected ahead of a non-empty sibling.
 public func listSheets(path: String) throws -> [SheetInfo] {
     let workbookXML = try runUnzip(path: path, entry: "xl/workbook.xml")
     let sheets = try parseWorkbookSheets(workbookXML)
@@ -185,10 +186,18 @@ public func listSheets(path: String) throws -> [SheetInfo] {
     let relsData = try? runUnzip(path: path, entry: "xl/_rels/workbook.xml.rels")
     let targets = relsData.map(parseRelationships) ?? [:]
 
-    return sheets.enumerated().map { index, sheet in
-        let target = targets[sheet.rId] ?? "xl/worksheets/sheet\(index + 1).xml"
+    return try sheets.enumerated().map { index, sheet in
+        // Fallback is relative to `xl/` (no leading "xl/" of its own) so it matches the shape
+        // `resolveWorksheetEntry` expects from a rels Target — passing "xl/worksheets/sheetN.xml"
+        // through there produced "xl/xl/worksheets/sheetN.xml" and unzip failed every time the
+        // rels file was unreadable, MEASURED by deleting it and re-zipping.
+        let target = targets[sheet.rId] ?? "worksheets/sheet\(index + 1).xml"
         let entry = resolveWorksheetEntry(target)
-        let dims = (try? runUnzip(path: path, entry: entry)).map(worksheetDimension) ?? (rows: 0, cols: 0)
+        // Not `try?`: a worksheet entry that fails to read (wrong resolved path, corrupt
+        // archive, anything) must refuse loudly. Silently reporting 0×0 — indistinguishable
+        // from the legitimate no-`<dimension>` case above — is a wrong number presented with the
+        // same confidence as a right one, in the one product that exists not to do that.
+        let dims = worksheetDimension(try runUnzip(path: path, entry: entry))
         return SheetInfo(name: sheet.name, rows: dims.rows, cols: dims.cols)
     }
 }

@@ -207,37 +207,35 @@ func makeNDJSON(dir: String, name: String = "events.ndjson", rows: Int = 200) th
 
 // MARK: - Gzip CSV
 
-/// Foundation has no gzip writer, so this shells out to `/usr/bin/gzip -c`. The write happens
-/// on a background queue so a larger CSV can't deadlock against gzip's output pipe filling up
-/// before we get around to draining it — ponytail: fine at fixture sizes either way, but this
-/// is the version that stays correct if `rows` grows.
+/// Foundation has no gzip writer, so this shells out to `/usr/bin/gzip -c`. Both ends are real
+/// files, not pipes — no `DispatchQueue.global()` writer/reader needed, and so no dependency on
+/// a GCD worker thread being free to run one. That dependency was real: the previous
+/// Pipe-plus-background-queue version deadlocked the test suite when enough parallel tests each
+/// built a corpus at once and starved the global concurrent queue of the thread the writer block
+/// needed — MEASURED, not hypothetical; see task-9-report.md's review-fix section. Redirecting
+/// stdin/stdout to files sidesteps the whole class of failure: the kernel drains both ends, no
+/// GCD thread required.
 func makeGzipCSV(dir: String, name: String = "sales.csv.gz", rows: Int = 500) throws -> String {
     let path = join(dir, name)
     var text = "id,region\n"
     for i in 0..<rows {
         text += "\(i),\(i % 2 == 0 ? "South" : "West")\n"
     }
-    let input = Data(text.utf8)
+    let inputPath = join(dir, ".\(UUID().uuidString).csv")
+    try text.write(toFile: inputPath, atomically: true, encoding: .utf8)
+    defer { try? FileManager.default.removeItem(atPath: inputPath) }
+    FileManager.default.createFile(atPath: path, contents: nil)
 
     let process = Process()
     process.executableURL = URL(fileURLWithPath: "/usr/bin/gzip")
     process.arguments = ["-c"]
-    let inPipe = Pipe()
-    let outPipe = Pipe()
-    process.standardInput = inPipe
-    process.standardOutput = outPipe
+    process.standardInput = FileHandle(forReadingAtPath: inputPath)
+    process.standardOutput = FileHandle(forWritingAtPath: path)
     try process.run()
-
-    DispatchQueue.global().async {
-        inPipe.fileHandleForWriting.write(input)
-        try? inPipe.fileHandleForWriting.close()
-    }
-    let compressed = outPipe.fileHandleForReading.readDataToEndOfFile()
     process.waitUntilExit()
     guard process.terminationStatus == 0 else {
         throw DuckDBError("gzip exited \(process.terminationStatus)")
     }
-    try compressed.write(to: URL(fileURLWithPath: path))
     return path
 }
 

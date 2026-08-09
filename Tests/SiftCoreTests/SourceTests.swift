@@ -24,6 +24,15 @@ import DuckDBKit
 // ports — the assertions are new, not lifted from Python) that exercise those same functions by
 // constructing a SourceSpec/SniffHints by hand instead. Everything above that line is a
 // verbatim port.
+//
+// These tests all read the one lazily-built `sharedData` corpus and run in parallel with no
+// suite-level serialization trait — that's deliberate, not an oversight. An earlier version
+// needed `.serialized` because building the corpus spawned a `/usr/bin/gzip` subprocess whose
+// completion depended on a GCD worker thread (Fixtures.swift's old `makeGzipCSV`), and enough
+// parallel tests blocking on the corpus's first-access lock at once could starve that thread —
+// a measured deadlock. `makeGzipCSV` now redirects stdin/stdout to real files instead of a
+// Pipe, which removes the GCD dependency entirely rather than just lowering the odds of hitting
+// it, so serialization is no longer needed here. See task-9-report.md's review-fix section.
 
 private let sharedData = try! corpus()
 
@@ -31,6 +40,16 @@ private func freshTempDir() throws -> String {
     let dir = FileManager.default.temporaryDirectory.appendingPathComponent("sift-source-\(UUID().uuidString)")
     try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
     return dir.path
+}
+
+// MARK: - detect_format
+
+@Test func magicBytesBeatTheExtension() throws {
+    // A .csv that is really parquet is a genuinely common way to receive data.
+    let dir = try freshTempDir()
+    let lying = (dir as NSString).appendingPathComponent("actually_parquet.csv")
+    try Data(contentsOf: URL(fileURLWithPath: sharedData.parquet)).write(to: URL(fileURLWithPath: lying))
+    #expect(try detectFormat(lying) == .parquet)
 }
 
 /// A `KeyPath<FixtureCorpus, String>` would read more directly, but `@Test(arguments:)` requires
@@ -51,145 +70,120 @@ private enum FixtureFile: Sendable {
     }
 }
 
-// `.serialized`: every test below reads the one lazily-built `sharedData` corpus, and building
-// it spawns a `/usr/bin/gzip` subprocess (Fixtures.swift's `makeGzipCSV`) whose completion
-// depends on a `DispatchQueue.global()` task getting a worker thread. Left to run in parallel
-// (Swift Testing's default), a dozen-plus tests all block on `sharedData`'s first-access lock at
-// once, which can starve the limited global concurrent queue of the very thread the gzip
-// pipe-writer needs to finish — a real, MEASURED deadlock (swift-testing never even printed its
-// "Test run started" banner; see task-9-report.md's "what surprised me" section). Serializing
-// this suite is the fix: at most one of these tests touches `sharedData` at a time, so the
-// once-lock is never contended by more waiters than the thread pool can service.
-@Suite(.serialized)
-struct SourceTests {
-    // MARK: - detect_format
+@Test(arguments: [
+    (FixtureFile.cleanCSV, Fmt.csv), (.semiCSV, .csv), (.weirdCSV, .csv), (.gzCSV, .csv),
+    (.parquet, .parquet), (.ndjson, .ndjson), (.xlsx, .xlsx),
+])
+private func detectFormatMatchesExpectation(file: FixtureFile, want: Fmt) throws {
+    #expect(try detectFormat(file.path(in: sharedData)) == want)
+}
 
-    @Test func magicBytesBeatTheExtension() throws {
-        // A .csv that is really parquet is a genuinely common way to receive data.
-        let dir = try freshTempDir()
-        let lying = (dir as NSString).appendingPathComponent("actually_parquet.csv")
-        try Data(contentsOf: URL(fileURLWithPath: sharedData.parquet)).write(to: URL(fileURLWithPath: lying))
-        #expect(try detectFormat(lying) == .parquet)
+@Test func legacyXlsIsRefusedWithAUsefulMessage() throws {
+    #expect(throws: LegacyXls.self) { try detectFormat(sharedData.fakeXLS) }
+    do {
+        _ = try detectFormat(sharedData.fakeXLS)
+        Issue.record("expected LegacyXls")
+    } catch let e as LegacyXls {
+        #expect(e.message.contains(".xlsx"))
+    } catch {
+        Issue.record("wrong error type: \(error)")
     }
+}
 
-    @Test(arguments: [
-        (FixtureFile.cleanCSV, Fmt.csv), (.semiCSV, .csv), (.weirdCSV, .csv), (.gzCSV, .csv),
-        (.parquet, .parquet), (.ndjson, .ndjson), (.xlsx, .xlsx),
-    ])
-    fileprivate func detectFormatMatchesExpectation(file: FixtureFile, want: Fmt) throws {
-        #expect(try detectFormat(file.path(in: sharedData)) == want)
+@Test func deltaDirectoryIsDetectedNotGlobbed() throws {
+    #expect(isDeltaDir(sharedData.delta))
+    #expect(try detectFormat(sharedData.delta) == .delta)
+}
+
+@Test func folderOfParquetIsAGlob() throws {
+    #expect(try detectFormat(sharedData.hive) == .globParquet)
+}
+
+@Test func folderWithNothingReadableIsRefused() throws {
+    let dir = try freshTempDir()
+    let sub = (dir as NSString).appendingPathComponent("sub")
+    try FileManager.default.createDirectory(atPath: sub, withIntermediateDirectories: true)
+    #expect(throws: UnsupportedSource.self) { try detectFormat(sub) }
+}
+
+// MARK: - hive_keys / glob_escape
+
+@Test func hiveKeysRequireAConsistentLayout() throws {
+    let files = filesWithExtension(".parquet", under: sharedData.hive)
+    #expect(hiveKeys(directory: sharedData.hive, files: files) == ["dt", "region"])
+    // One file at the wrong depth makes the layout inconsistent, and DuckDB errors on
+    // hive_partitioning in that case — so Sift must fall back to a plain glob.
+    let stray = (sharedData.hive as NSString).appendingPathComponent("stray.parquet")
+    #expect(hiveKeys(directory: sharedData.hive, files: files + [stray]) == [])
+}
+
+@Test func globEscapeProtectsBracketedDirectoryNames() {
+    #expect(globEscape("/data/x[2026]") == "/data/x[[]2026[]]")
+}
+
+// MARK: - estimate_rows / header_byte_offset
+
+@Test func emptyFileDoesNotExplode() {
+    #expect(estimateRows(path: sharedData.empty).rows == 0)
+}
+
+// MARK: - supplementary (new tests for ported functions whose ORIGINAL test needed
+// build_source/sniff_csv — see the file header)
+
+@Test func allVarcharRelationDropsTheColumnTypesFromReadExpr() throws {
+    // Stands in for test_all_varchar_relation_drops_the_column_types: build_source is deferred,
+    // so the CSV SourceSpec it would have produced for dirty_csv is constructed by hand here
+    // instead (same shape build_source's CSV branch always produces: delim/quote/escape/header/
+    // skip/ignore_errors/allow_quoted_nulls plus the ordered columns list).
+    let cols = [
+        Column(name: "order_id", type: "BIGINT"), Column(name: "region", type: "VARCHAR"),
+        Column(name: "amount", type: "DOUBLE"), Column(name: "note", type: "VARCHAR"),
+    ]
+    let spec = SourceSpec(
+        key: SourceKey(path: sharedData.dirtyCSV, mtimeNs: 0, size: 0), fmt: .csv, readFn: "read_csv",
+        readArgs: [
+            "delim": .text(","), "header": .bool(true), "skip": .int(0),
+            "ignore_errors": .bool(true), "allow_quoted_nulls": .bool(false),
+        ],
+        columns: cols
+    )
+    let raw = readExpr(spec: spec, allVarchar: true)
+    #expect(raw.contains("all_varchar=true"))
+    #expect(!raw.contains("columns="))
+
+    let con = try Database.inMemory().connect()
+    let types = try con.query("DESCRIBE SELECT * FROM \(raw)").allRows().map { row -> String in
+        guard case .text(let t) = row[1] else { return "" }
+        return t
     }
+    #expect(Set(types) == ["VARCHAR"])
+}
 
-    @Test func legacyXlsIsRefusedWithAUsefulMessage() throws {
-        #expect(throws: LegacyXls.self) { try detectFormat(sharedData.fakeXLS) }
-        do {
-            _ = try detectFormat(sharedData.fakeXLS)
-            Issue.record("expected LegacyXls")
-        } catch let e as LegacyXls {
-            #expect(e.message.contains(".xlsx"))
-        } catch {
-            Issue.record("wrong error type: \(error)")
-        }
-    }
+@Test func supportsAllVarcharOnlyForTextFormats() {
+    // Stands in for test_supports_all_varchar_only_for_text_formats: supports_all_varchar reads
+    // only spec.fmt, so a hand-built spec (any read_fn/columns — irrelevant to this function)
+    // exercises exactly the same branch build_source's real dirty_csv/parquet specs would.
+    let key = SourceKey(path: "/x", mtimeNs: 0, size: 0)
+    #expect(supportsAllVarchar(SourceSpec(key: key, fmt: .csv, readFn: "read_csv")))
+    // Parquet carries real types, so there is no sniffing to get wrong and no reject count to
+    // compute.
+    #expect(!supportsAllVarchar(SourceSpec(key: key, fmt: .parquet, readFn: "read_parquet")))
+}
 
-    @Test func deltaDirectoryIsDetectedNotGlobbed() throws {
-        #expect(isDeltaDir(sharedData.delta))
-        #expect(try detectFormat(sharedData.delta) == .delta)
-    }
+@Test func headerByteOffsetCountsPreambleAndHeader() throws {
+    // Stands in for test_header_byte_offset_counts_preamble_and_header: sniff_csv is deferred,
+    // so the SniffHints it would have produced for weird_csv (preamble=3 junk lines, then a real
+    // header — see Fixtures.swift's makeCSV) is supplied directly instead of sniffed.
+    let off = headerByteOffset(path: sharedData.weirdCSV, sniff: SniffHints(skip: 3, header: true))
+    #expect(off > 0)
+    let head = FileHandle(forReadingAtPath: sharedData.weirdCSV)!.readData(ofLength: off)
+    #expect(head.filter { $0 == 0x0A }.count == 4)   // 3 junk lines + the header
+}
 
-    @Test func folderOfParquetIsAGlob() throws {
-        #expect(try detectFormat(sharedData.hive) == .globParquet)
-    }
-
-    @Test func folderWithNothingReadableIsRefused() throws {
-        let dir = try freshTempDir()
-        let sub = (dir as NSString).appendingPathComponent("sub")
-        try FileManager.default.createDirectory(atPath: sub, withIntermediateDirectories: true)
-        #expect(throws: UnsupportedSource.self) { try detectFormat(sub) }
-    }
-
-    // MARK: - hive_keys / glob_escape
-
-    @Test func hiveKeysRequireAConsistentLayout() throws {
-        let files = filesWithExtension(".parquet", under: sharedData.hive)
-        #expect(hiveKeys(directory: sharedData.hive, files: files) == ["dt", "region"])
-        // One file at the wrong depth makes the layout inconsistent, and DuckDB errors on
-        // hive_partitioning in that case — so Sift must fall back to a plain glob.
-        let stray = (sharedData.hive as NSString).appendingPathComponent("stray.parquet")
-        #expect(hiveKeys(directory: sharedData.hive, files: files + [stray]) == [])
-    }
-
-    @Test func globEscapeProtectsBracketedDirectoryNames() {
-        #expect(globEscape("/data/x[2026]") == "/data/x[[]2026[]]")
-    }
-
-    // MARK: - estimate_rows / header_byte_offset
-
-    @Test func emptyFileDoesNotExplode() {
-        #expect(estimateRows(path: sharedData.empty).rows == 0)
-    }
-
-    // MARK: - supplementary (new tests for ported functions whose ORIGINAL test needed
-    // build_source/sniff_csv — see the file header)
-
-    @Test func allVarcharRelationDropsTheColumnTypesFromReadExpr() throws {
-        // Stands in for test_all_varchar_relation_drops_the_column_types: build_source is
-        // deferred, so the CSV SourceSpec it would have produced for dirty_csv is constructed
-        // by hand here instead (same shape build_source's CSV branch always produces:
-        // delim/quote/escape/header/skip/ignore_errors/allow_quoted_nulls plus the ordered
-        // columns list).
-        let cols = [
-            Column(name: "order_id", type: "BIGINT"), Column(name: "region", type: "VARCHAR"),
-            Column(name: "amount", type: "DOUBLE"), Column(name: "note", type: "VARCHAR"),
-        ]
-        let spec = SourceSpec(
-            key: SourceKey(path: sharedData.dirtyCSV, mtimeNs: 0, size: 0), fmt: .csv, readFn: "read_csv",
-            readArgs: [
-                "delim": .text(","), "header": .bool(true), "skip": .int(0),
-                "ignore_errors": .bool(true), "allow_quoted_nulls": .bool(false),
-            ],
-            columns: cols
-        )
-        let raw = readExpr(spec: spec, allVarchar: true)
-        #expect(raw.contains("all_varchar=true"))
-        #expect(!raw.contains("columns="))
-
-        let con = try Database.inMemory().connect()
-        let types = try con.query("DESCRIBE SELECT * FROM \(raw)").allRows().map { row -> String in
-            guard case .text(let t) = row[1] else { return "" }
-            return t
-        }
-        #expect(Set(types) == ["VARCHAR"])
-    }
-
-    @Test func supportsAllVarcharOnlyForTextFormats() {
-        // Stands in for test_supports_all_varchar_only_for_text_formats: supports_all_varchar
-        // reads only spec.fmt, so a hand-built spec (any read_fn/columns — irrelevant to this
-        // function) exercises exactly the same branch build_source's real dirty_csv/parquet
-        // specs would.
-        let key = SourceKey(path: "/x", mtimeNs: 0, size: 0)
-        #expect(supportsAllVarchar(SourceSpec(key: key, fmt: .csv, readFn: "read_csv")))
-        // Parquet carries real types, so there is no sniffing to get wrong and no reject count
-        // to compute.
-        #expect(!supportsAllVarchar(SourceSpec(key: key, fmt: .parquet, readFn: "read_parquet")))
-    }
-
-    @Test func headerByteOffsetCountsPreambleAndHeader() throws {
-        // Stands in for test_header_byte_offset_counts_preamble_and_header: sniff_csv is
-        // deferred, so the SniffHints it would have produced for weird_csv (preamble=3 junk
-        // lines, then a real header — see Fixtures.swift's makeCSV) is supplied directly instead
-        // of sniffed.
-        let off = headerByteOffset(path: sharedData.weirdCSV, sniff: SniffHints(skip: 3, header: true))
-        #expect(off > 0)
-        let head = FileHandle(forReadingAtPath: sharedData.weirdCSV)!.readData(ofLength: off)
-        #expect(head.filter { $0 == 0x0A }.count == 4)   // 3 junk lines + the header
-    }
-
-    @Test func deltaVersionReadsTheLatestCommittedVersionFromTheLogFilenames() throws {
-        // Not from Python's suite (no test_delta_version exists there either — it's only
-        // exercised indirectly through build_source, which is deferred); delta_version is pure,
-        // so it's ported here and given its own check per the "leave one runnable check" rule.
-        #expect(deltaVersion(sharedData.delta) == 1)   // makeDelta writes versions 0 and 1
-        #expect(deltaVersion(try freshTempDir()) == nil)   // no _delta_log at all
-    }
+@Test func deltaVersionReadsTheLatestCommittedVersionFromTheLogFilenames() throws {
+    // Not from Python's suite (no test_delta_version exists there either — it's only exercised
+    // indirectly through build_source, which is deferred); delta_version is pure, so it's ported
+    // here and given its own check per the "leave one runnable check" rule.
+    #expect(deltaVersion(sharedData.delta) == 1)   // makeDelta writes versions 0 and 1
+    #expect(deltaVersion(try freshTempDir()) == nil)   // no _delta_log at all
 }

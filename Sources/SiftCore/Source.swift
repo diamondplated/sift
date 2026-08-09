@@ -407,8 +407,12 @@ public func readExpr(spec: SourceSpec, allVarchar: Bool = false) -> String {
     }
     // Only the plain CSV format's read_args carry an implicit columns= clause (glob_csv's
     // read_fn is also "read_csv", but never gets one — see build_source's glob branch, which
-    // stays behind for Plan 3). all_varchar drops all casting, columns included.
-    if spec.fmt == .csv, !allVarchar {
+    // stays behind for Plan 3). all_varchar drops all casting, columns included. An empty
+    // `columns` array renders `columns={}`, which DuckDB rejects at parse time — Python never
+    // emits the argument at all when there's nothing to put in it, gating on `cols` being
+    // non-empty rather than only on format, so this mirrors that gate rather than assuming
+    // build_source never produces an empty column list.
+    if spec.fmt == .csv, !allVarchar, !spec.columns.isEmpty {
         parts.append("columns=\(columnsArgValue(spec.columns))")
     }
     if allVarchar, spec.readFn == "read_csv" || spec.readFn == "read_xlsx" {
