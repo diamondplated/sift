@@ -304,26 +304,38 @@ Append to `Tests/DuckDBKitTests/SmokeTests.swift`:
     }
 }
 
-@Test func hardeningBlocksNetworkFilesystemsButNotLocalReads() throws {
+@Test func hardeningRefusesNetworkReadsAndKeepsLocalOnesWorking() throws {
     let db = try Database.inMemory()
     db.harden()
-    // Connection opened AFTER harden(), deliberately: harden() applies its settings on
-    // a throwaway connection and discards it. That only works because these are
-    // GLOBAL-scope settings which outlive the connection that set them — measured
-    // against libduckdb 1.5.5. If they were session-scoped, harden() would be a silent
-    // no-op, and this test is what catches that.
+    // Connection opened after harden(): the settings are GLOBAL scope, so they outlive
+    // the throwaway connection harden() uses. Measured against libduckdb 1.5.5.
     let con = try db.connect()
 
-    // Local reads must keep working. enable_external_access=false would have blocked
-    // read_csv itself and destroyed the whole premise, which is why harden()
-    // deliberately does not set it.
-    try con.execute("SELECT 1")
+    // Local file reads must keep working — the entire product is local file reading.
+    // enable_external_access=false would have blocked read_csv itself, which is exactly
+    // why harden() deliberately does not set it. `SELECT 1` would NOT test this: it
+    // touches no filesystem at all.
+    let path = FileManager.default.temporaryDirectory
+        .appendingPathComponent("sift-harden-\(UUID().uuidString).csv")
+    try "a,b\n1,2\n".write(to: path, atomically: true, encoding: .utf8)
+    defer { try? FileManager.default.removeItem(at: path) }
+    try con.execute("SELECT * FROM read_csv('\(path.path)', header=true)")
 
-    // But a SELECT must not be able to exfiltrate. disabled_filesystems enforces that,
-    // and it fails at the filesystem layer, so this needs no network to run.
-    #expect(throws: DuckDBError.self) {
+    // A network read must be refused, and we assert WHICH mechanism refuses it.
+    // MEASURED: what actually blocks this path is the extension guard
+    // (autoload_known_extensions=false) — httpfs never loads, so disabled_filesystems
+    // is never consulted. It is a second layer that only engages once something has
+    // loaded httpfs. Asserting only `throws: DuckDBError.self` is worthless here: with
+    // harden() deleted entirely the URL simply 404s, which is also a DuckDBError.
+    var message = ""
+    do {
         try con.execute("SELECT * FROM read_csv_auto('https://example.com/x.csv')")
+        Issue.record("a network read succeeded despite hardening")
+    } catch let error as DuckDBError {
+        message = error.message
     }
+    #expect(message.contains("httpfs") || message.contains("HTTPFileSystem"),
+            "expected hardening to refuse the read; got: \(message)")
 }
 ```
 
