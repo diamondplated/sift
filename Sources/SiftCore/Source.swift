@@ -9,7 +9,7 @@ import Foundation
 
 /// The path is a format Sift cannot open, with a message aimed at the user. Mirrors Python's
 /// `class UnsupportedSource(ValueError)`.
-public struct UnsupportedSource: Error, Equatable, CustomStringConvertible {
+public struct UnsupportedSource: SiftError, Equatable {
     public let message: String
     public init(_ message: String) { self.message = message }
     public var description: String { message }
@@ -19,7 +19,7 @@ public struct UnsupportedSource: Error, Equatable, CustomStringConvertible {
 /// Python's `class LegacyXls(UnsupportedSource)`. Swift errors don't subclass, so this is its
 /// own type rather than a case of `UnsupportedSource` — callers that need to tell "refuse and
 /// suggest re-saving as .xlsx" apart from every other refusal catch this specifically.
-public struct LegacyXls: Error, Equatable, CustomStringConvertible {
+public struct LegacyXls: SiftError, Equatable {
     public let message: String
     public init(_ message: String) { self.message = message }
     public var description: String { message }
@@ -27,7 +27,7 @@ public struct LegacyXls: Error, Equatable, CustomStringConvertible {
 
 /// Time travel was requested against a spec that isn't Delta. Mirrors Python's bare
 /// `raise ValueError("time travel only applies to Delta tables")`.
-public struct TimeTravelUnsupported: Error, Equatable, CustomStringConvertible {
+public struct TimeTravelUnsupported: SiftError, Equatable {
     public var description: String { "time travel only applies to Delta tables" }
     public init() {}
 }
@@ -83,9 +83,13 @@ public func isDeltaDir(_ path: String) -> Bool {
 
 /// Recursively list files under `directory` whose lowercased extension is `ext` (e.g.
 /// ".parquet"), sorted lexicographically. The one thing `detectFormat`'s directory branch and
-/// `hiveKeys`' test setup need from Python's `glob.glob(os.path.join(dir, "**", f"*{ext}"),
-/// recursive=True)`: which files exist, not glob's full pattern language.
-func filesWithExtension(_ ext: String, under directory: String) -> [String] {
+/// `hiveKeys` need from Python's `glob.glob(os.path.join(dir, "**", f"*{ext}"), recursive=True)`:
+/// which files exist, not glob's full pattern language.
+///
+/// `public`: Plan 3's `buildSource` glob branch needs this same recursive list twice — to feed
+/// `hiveKeys(directory:files:)`, which is already public and useless without it, and to pick
+/// `files[0]` for its `_describe`. It was internal by test convenience, not by design.
+public func filesWithExtension(_ ext: String, under directory: String) -> [String] {
     guard let enumerator = FileManager.default.enumerator(
         at: URL(fileURLWithPath: directory),
         includingPropertiesForKeys: [.isRegularFileKey],

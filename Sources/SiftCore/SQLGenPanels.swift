@@ -141,9 +141,13 @@ public func profileExtraSQL(_ rel: String, _ cols: [Column]) -> String {
 /// bound, so whitelisted even though the values are engine-generated. Mirrors Python's
 /// `_TYPE_RE = re.compile(r"^[A-Za-z0-9_ ()\[\],]+$")`: ASCII letters/digits, underscore, space,
 /// parens, brackets, comma — nothing else, and at least one character.
-struct UnsafeTypeName: Error, Equatable, CustomStringConvertible {
-    let type: String
-    var description: String { "refusing to interpolate suspicious type name '\(type)'" }
+///
+/// `public`, unlike `safeType` itself: this is the only error thrown by the public
+/// `uncastableSQL`/`badRowCountSQL`/`badRowsSQL`, so SiftEngine cannot `catch let e as
+/// UnsafeTypeName` — or tell it apart from an UnknownColumn — while it is internal.
+public struct UnsafeTypeName: SiftError, Equatable {
+    public let type: String
+    public var description: String { "refusing to interpolate suspicious type name '\(type)'" }
 }
 
 private func isSafeTypeScalar(_ scalar: Unicode.Scalar) -> Bool {

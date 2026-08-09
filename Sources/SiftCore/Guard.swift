@@ -22,7 +22,7 @@ import Foundation
 
 /// The submitted SQL is not accepted by the pure half of the gate. Mirrors Python's
 /// `class SqlRejected(ValueError)` — a user-facing sentence, never a parser dump.
-public struct SQLRejected: Error, Equatable, CustomStringConvertible {
+public struct SQLRejected: SiftError, Equatable {
     public let message: String
     public init(_ message: String) { self.message = message }
     public var description: String { message }

@@ -115,6 +115,23 @@ public enum SQLValue: Sendable, Equatable {
     case text(String)
 }
 
+// MARK: - Errors
+
+/// Every error SiftCore throws. Exists for one reason: `LocalizedError`.
+///
+/// The whole module is built so a user gets a *sentence* rather than a parser dump (see
+/// Guard.swift's header), and each error already spells that sentence in `description`. But
+/// `"\(error)"` and `error.localizedDescription` are different code paths in Swift: without
+/// `LocalizedError`, Foundation bridges the error to `NSError` and synthesizes
+/// `"The operation couldn't be completed. (SiftCore.SQLRejected error 1.)"` — measured. That is
+/// the first thing a SwiftUI author reaches for, so conforming here makes both paths give the
+/// same sentence. Conform new error types to this, not to `Error` directly.
+public protocol SiftError: LocalizedError, CustomStringConvertible {}
+
+extension SiftError {
+    public var errorDescription: String? { description }
+}
+
 // MARK: - Source identity
 
 /// Identity of a file at a point in time. Deliberately (path, mtime, size), not a content

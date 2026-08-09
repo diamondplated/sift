@@ -62,7 +62,7 @@ public func stripDataExtensions(_ filename: String) -> String {
 
 /// Thrown when every collision suffix `_2`..`_999` is already taken. Mirrors Python's
 /// `raise ValueError(f"cannot find a free table name for {filename!r}")`.
-public struct NoFreeTableName: Error, Equatable, CustomStringConvertible {
+public struct NoFreeTableName: SiftError, Equatable {
     public let filename: String
     public var description: String { "cannot find a free table name for '\(filename)'" }
 }

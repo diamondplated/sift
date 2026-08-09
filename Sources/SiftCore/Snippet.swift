@@ -12,7 +12,7 @@ import Foundation
 /// Raised when `dialect` isn't one of "duckdb"/"pandas"/"polars"/"sql". Mirrors Python's
 /// bare `raise ValueError(f"unknown dialect {dialect!r}")` — the message uses `!r` (repr), so
 /// the port uses `pyRepr` to match it, not a plain quoted string.
-public struct UnknownDialect: Error, Equatable, CustomStringConvertible {
+public struct UnknownDialect: SiftError, Equatable {
     public let dialect: String
     public init(_ dialect: String) { self.dialect = dialect }
     public var description: String { "unknown dialect \(pyRepr(dialect))" }

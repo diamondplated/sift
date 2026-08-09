@@ -13,7 +13,7 @@ import Foundation
 
 /// A filter or sort referenced a column that isn't in the relation — a typo becomes a clean
 /// error here, not a binder dump. Mirrors Python's `class UnknownColumn(KeyError)`.
-public struct UnknownColumn: Error, Equatable, CustomStringConvertible {
+public struct UnknownColumn: SiftError, Equatable {
     public let column: String
     public var description: String { "unknown column '\(column)'" }
 }
