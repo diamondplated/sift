@@ -459,6 +459,16 @@ fired. Hammering the interrupt in a loop cancels reliably (5/5 runs, 0.000–0.0
 the interrupt for as long as the job is meant to be cancelled**, not call it once. The
 Python engine's single `con.interrupt()` does not port across.
 
+**A first-party generated query returns a `LIST`, and the decoder cannot read it — Plan 3.**
+Plan 1 deferred nested-type decoding on the premise that nested columns only arrive in
+*user data*, which SiftEngine would wrap in `CAST(col AS VARCHAR)`. That premise is
+false. `sqlgen.bad_rows_sql` emits `list_filter([...], x -> x IS NOT NULL) AS
+bad_columns` — Sift's own SQL, generating a `LIST` column — so `bad_columns` currently
+decodes as `⟨unsupported type 24⟩` and the per-cell highlighting in the "rows your file
+lost" panel cannot work end to end. Measured 2026-08-09 by running the generated SQL
+through `DuckDBKit`. Plan 3 must either add a `LIST` case to `Chunk.decodeColumn` or
+cast this one column in the query; the generated SQL itself is correct either way.
+
 **Six DuckDB types do not decode — Plan 2.** `ENUM` (23), `BIT` (29), `BIGNUM` (35),
 `TIME_NS` (39), `VARIANT` (41) and `GEOMETRY` (40) render `⟨unsupported type N⟩`. NULLs
 in those columns still decode to `.null` correctly. `TIME_NS` is the notable one — the
