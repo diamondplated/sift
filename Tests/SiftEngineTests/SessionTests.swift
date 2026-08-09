@@ -151,7 +151,7 @@ private func gzip(_ sourcePath: String, to destPath: String) throws {
     let spec = SourceSpec(
         key: key, fmt: .csv, readFn: "read_csv", columns: [Column(name: "id", type: "BIGINT")]
     )
-    var t = Table(name: "x", spec: spec, qspec: QuerySpec(relation: "x"))
+    var t = Table(name: "x", spec: spec, qspec: QuerySpec(relation: "x"), openedAt: 1)
     t.rowCount = 1000
     t.badRows = 10
     #expect(t.gridRows == 990)
@@ -307,9 +307,16 @@ private func gzip(_ sourcePath: String, to destPath: String) throws {
     // duplicated rows and 170,820 missing. At that test's actual scale (1000 rows) the collapse
     // would likely go unnoticed, so if this setting were ever flipped off — a future `harden()`
     // change, say — the product would silently duplicate and drop rows with no test catching it.
-    // Sift never sets this itself; pinning DuckDB's own default here is a fast, direct guard,
-    // independent of Session/Database plumbing (any connection reports the same default).
-    let con = try Database.inMemory().connect()
+    //
+    // MUST call `harden()` first: it's the same one-time configure step `Session.init` runs
+    // before handing out any connection, and its four `SET`s are GLOBAL scope (Database.swift),
+    // so a connection opened before `harden()` runs can silently read the DuckDB factory default
+    // instead of Sift's actual effective setting — which is exactly the regression this test
+    // exists to catch, and exactly what a version without this call fails to catch (caught in
+    // review: a `harden()` mutation that flipped this setting off left this test green).
+    let db = try Database.inMemory()
+    db.harden()
+    let con = try db.connect()
     let value = try con.query("SELECT current_setting('preserve_insertion_order')").allRows()[0][0]
     #expect(value == .bool(true))
 }

@@ -525,6 +525,19 @@ renders `+15:59`. Reachable only with historical LMT-style offsets.
 and `.decimal(1.5, scale: 3)` are **not** equal, while two spellings of the same stored
 value at the same scale are.
 
+**`Session.page` blocks the whole actor while it materializes a sort — Plan 4 (grid) needs
+to plan a spinner around it.** `page`, `sortedRelation` and `closeTable` deliberately
+share one long-lived `Connection` (`SiftEngine/Session.swift` fact 3) rather than one
+per call, because a materialized sort (`TEMP TABLE`) is visible only to the connection
+that created it. That sharing is safe only because those three methods never suspend —
+which also means the first sorted page over a large table (materializing up to
+`sortMaterializeMax`, 5,000,000 rows) blocks every other actor call for however long
+that takes: opening a second source, switching to another open table, and every
+in-flight background scan's result all wait. Python ran this in a threadpool, where only
+the calling request stalled. Documented on `page`'s own doc comment as a deliberate,
+un-fixed cliff (Task 4 review I6) — the grid needs to show a busy state across that
+window rather than assume paging is always instant.
+
 ---
 
 ## 14. Out of scope

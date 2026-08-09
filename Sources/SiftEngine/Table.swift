@@ -53,7 +53,16 @@ public struct Table: Sendable {
     public var profile: [ColumnProfile]?
     public var profiling: Bool = false
 
-    public let openedAt: Date
+    /// This table's open generation — a monotonic counter (`Session.nextOpenGeneration`), NOT a
+    /// wall-clock time, despite the name Python's `opened_at: float = time.time()` suggested it
+    /// keep. Its only job is telling one open of a table apart from a LATER open reusing the same
+    /// name, so `runAfterOpen`'s background callbacks can detect a close-and-reopen and refuse to
+    /// write a stale result onto the new table (review C1). A `Date` did that job too, but only by
+    /// margin, not by construction: MEASURED, `Date()` collided on 152,341 of 200,000 back-to-back
+    /// constructions (~0.95µs clock granularity), safe here only because a real close-and-reopen
+    /// is never that fast (measured minimum 1.116ms, 1,170x the resolution) — a margin a future
+    /// caller could erode without warning. A counter can't collide, full stop.
+    public let openedAt: Int
     public var lastUsed: Date
     public var firstAggregateAt: Date?
     public var notes: [String] = []
@@ -66,13 +75,12 @@ public struct Table: Sendable {
     /// re-run that scan. Consumed starting Task 5.
     var uncastable: [String: Int]?
 
-    public init(name: String, spec: SourceSpec, qspec: QuerySpec) {
+    public init(name: String, spec: SourceSpec, qspec: QuerySpec, openedAt: Int) {
         self.name = name
         self.spec = spec
         self.qspec = qspec
-        let now = Date()
-        self.openedAt = now
-        self.lastUsed = now
+        self.openedAt = openedAt
+        self.lastUsed = Date()
     }
 
     /// This table's columns keyed by name. `uniquingKeysWith` (last wins), not

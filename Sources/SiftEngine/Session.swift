@@ -96,6 +96,9 @@ public actor Session {
     /// dictionary's get-or-create needs actor isolation; the returned `NSLock` itself is meant to
     /// be locked/unlocked from the caller's own (non-actor) context.
     private var tableLocks: [String: NSLock] = [:]
+    /// Source of `Table.openedAt` — see its doc comment. Incremented once per `openPath` call,
+    /// never reused; only `openPath` touches it.
+    private var nextOpenGeneration = 0
 
     public init(home: String? = nil) throws {
         let resolvedHome = Self.resolveHome(home)
@@ -316,7 +319,8 @@ public actor Session {
         }
         let tname = taken.contains(base) ? try sanitizeTableName(base, taken: taken) : base
 
-        var t = Table(name: tname, spec: spec, qspec: QuerySpec(relation: tname))
+        nextOpenGeneration += 1
+        var t = Table(name: tname, spec: spec, qspec: QuerySpec(relation: tname), openedAt: nextOpenGeneration)
         if let rowCount = spec.rowCount { t.rowCount = rowCount }
 
         if spec.fmt == .xlsx, !spec.sheets.isEmpty {
@@ -375,7 +379,7 @@ public actor Session {
     /// stopped it. `openedAt` is that stop: `Table.init` sets it once, fresh, per open, so a stale
     /// callback's `openedAt` can never match a reopened table's.
     nonisolated private func runAfterOpen(
-        name: String, spec: SourceSpec, initialRowCount: Int?, openedAt: Date
+        name: String, spec: SourceSpec, initialRowCount: Int?, openedAt: Int
     ) async {
         guard let connection = try? database.connect() else { return }
 
@@ -400,20 +404,20 @@ public actor Session {
     /// still-in-flight background result meant for the table that used to have that name (a huge
     /// file's row count landing on a freshly-opened tiny one). Not `private`: exercised directly
     /// (with a deliberately stale `openedAt`) by SessionTests' regression test for exactly this.
-    func applyCounting(_ name: String, _ counting: Bool, openedAt: Date) {
+    func applyCounting(_ name: String, _ counting: Bool, openedAt: Int) {
         guard var t = tables[name], t.openedAt == openedAt else { return }
         t.counting = counting
         tables[name] = t
     }
 
-    func applyCount(_ name: String, _ rowCount: Int?, openedAt: Date) {
+    func applyCount(_ name: String, _ rowCount: Int?, openedAt: Int) {
         guard var t = tables[name], t.openedAt == openedAt else { return }
         if let rowCount { t.rowCount = rowCount }
         t.counting = false
         tables[name] = t
     }
 
-    func applyBadRows(_ name: String, _ scan: BadRowScan, openedAt: Date) {
+    func applyBadRows(_ name: String, _ scan: BadRowScan, openedAt: Int) {
         guard var t = tables[name], t.openedAt == openedAt else { return }
         t.uncastable = scan.uncastable
         t.badCells = scan.badCells
@@ -421,7 +425,7 @@ public actor Session {
         tables[name] = t
     }
 
-    func applyStageDecision(_ name: String, _ decision: StageDecision, openedAt: Date) {
+    func applyStageDecision(_ name: String, _ decision: StageDecision, openedAt: Int) {
         guard var t = tables[name], t.openedAt == openedAt else { return }
         t.stageDecision = decision
         tables[name] = t
