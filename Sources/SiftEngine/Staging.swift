@@ -388,8 +388,11 @@ extension Session {
         let sql = "SELECT (SELECT count(DISTINCT block_id) FROM pragma_storage_info(\(qlit(table))) "
             + "WHERE block_id >= 0) * (SELECT block_size FROM pragma_database_size())"
         for attempt in 0..<10 {
-            try? con.execute("CHECKPOINT")
-            if let row = try? con.query(sql).allRows().first, cellInt(row[0]) > 0 {
+            // A successful CHECKPOINT means every segment now has a block, so whatever the count
+            // says is the answer — including 0 for a copy with no rows. Only a FAILED checkpoint
+            // is worth waiting on.
+            let checkpointed = (try? con.execute("CHECKPOINT")) != nil
+            if let row = try? con.query(sql).allRows().first, checkpointed || cellInt(row[0]) > 0 {
                 return cellInt(row[0])
             }
             if attempt < 9 { Thread.sleep(forTimeInterval: 0.1) }
