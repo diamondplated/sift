@@ -198,14 +198,25 @@ public func selectForPurge(
     return (aged, over)
 }
 
-/// DDL for the staged-table catalog. Ported verbatim from `CATALOG_DDL`.
+/// DDL for the staged-table catalog. Ported from `CATALOG_DDL` with one deliberate change: the
+/// PRIMARY KEY is `table_name`, where Python keys on `source_token`.
+///
+/// Python's key is wrong, and the flow that breaks it is first-class — `openPath` explicitly
+/// derives `x_2` so one file can be open in two tabs. Both tabs share a source token, so the
+/// second `INSERT OR REPLACE` REPLACED the first tab's row. REPRODUCED (review I5):
+/// `catalog rows=["small_2"], real tables=["small", "small_2"]`, after which
+/// `purgeStaged(all: true)` dropped only `small_2` — leaving a full copy in the store that no
+/// purge could ever reach while `stagedTotalBytes()` kept counting it. Every other statement that
+/// touches this table already keys on `table_name`, which is also the name the copy actually
+/// occupies in the DuckDB catalog; the key now agrees with them. `SiftEngine.migrateCatalog`
+/// handles a store created by an older build.
 public let catalogDDL = """
     CREATE TABLE IF NOT EXISTS _sift_sources (
-        source_token VARCHAR PRIMARY KEY,
+        source_token VARCHAR,
         path         VARCHAR,
         mtime_ns     BIGINT,
         size         BIGINT,
-        table_name   VARCHAR,
+        table_name   VARCHAR PRIMARY KEY,
         fmt          VARCHAR,
         staged_at    TIMESTAMP,
         last_used    TIMESTAMP,

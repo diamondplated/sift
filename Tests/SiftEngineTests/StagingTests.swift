@@ -523,3 +523,318 @@ private func isNativeTable(_ session: Session, _ probe: String, _ name: String) 
     let page = try await session.page(again.name, offset: 0, limit: 10)
     #expect(page.rows.count == 1, "the new contents, not the stale copy's 200 rows")
 }
+
+// ============================================================================================
+// Round-1 review fixes. Each test below exists because a mechanism could be deleted with the
+// suite still green, or because a copy of the wrong data was being served.
+// ============================================================================================
+
+// MARK: - C1: what a staged copy is a copy OF
+
+@Test(.enabled(if: extensionIsAvailable("excel"), "duckdb excel extension not installed"))
+func aCopyOfOneSheetIsNeverServedAsAnother() async throws {
+    // REPRODUCED before the fix: every sheet of one workbook shares one path, mtime and size, so
+    // `SourceKey.token()` matched across sheets. Staging `Summary` (1 row, metric/value) and then
+    // opening `By Store` (50 rows, store/sales) under the same table name adopted Summary's copy —
+    // `page()` returned Summary's row under By Store's headers, with no error and nothing in
+    // `stagedEntries()` able to tell which sheet the copy was of.
+    let session = try newSession()
+    let book = siftCoreTestsFixture("book.xlsx")
+
+    let summary = try await session.openPath(book, name: "d", sheet: "Summary")
+    _ = try await session.stageNow(summary.name, force: true)
+    try await waitForStaged(session, "d")
+    try await session.closeTable("d")
+
+    let byStore = try await session.openPath(book, name: "d", sheet: "By Store")
+    #expect(byStore.staged == false, "a copy of Summary is not By Store")
+    let page = try await session.page("d", offset: 0, limit: 100)
+    #expect(page.columns.map(\.name) == ["store", "sales"])
+    #expect(page.rows.count == 50, "By Store's own 50 rows, not Summary's 1")
+
+    // And the right sheet's own copy still adopts — the fix must not simply disable adoption.
+    _ = try await session.stageNow("d", force: true)
+    try await waitForStaged(session, "d")
+    try await session.closeTable("d")
+    let again = try await session.openPath(book, name: "d", sheet: "By Store")
+    #expect(again.staged == true)
+    #expect(again.rowCount == 50)
+}
+
+@Test func aCopyOfAFolderIsNotServedAfterAMemberIsRewrittenInPlace() async throws {
+    // REPRODUCED before the fix, and this was the one with no way back: a directory's mtime and
+    // size do not move when a member file is rewritten in place, so the copy was adopted with the
+    // pre-edit values AND reported `sourceChanged: false`. The staleness sweep does the same
+    // directory `stat`, so it never collected it either — only deleting `~/.sift` fixed it.
+    let dir = try newTempDir()
+    let header = "order_id,region,amount,note\n"
+    try (header + "1,West,100.50,a\n").write(
+        toFile: (dir as NSString).appendingPathComponent("a.csv"), atomically: true, encoding: .utf8)
+    try (header + "2,South,200.50,b\n").write(
+        toFile: (dir as NSString).appendingPathComponent("b.csv"), atomically: true, encoding: .utf8)
+
+    let session = try newSession()
+    let t = try await session.openPath(dir)
+    _ = try await session.stageNow(t.name, force: true)
+    try await waitForStaged(session, t.name)
+    try await session.closeTable(t.name)
+
+    // Rewritten in place: same file count, so the directory's own stat is untouched.
+    let before = try statInfo(dir)
+    try (header + "1,West,999.50,EDITED\n").write(
+        toFile: (dir as NSString).appendingPathComponent("a.csv"), atomically: true, encoding: .utf8)
+    let after = try statInfo(dir)
+    #expect(before.mtimeNs == after.mtimeNs && before.size == after.size,
+            "the premise: a folder's own stat cannot see a member being rewritten")
+
+    let again = try await session.openPath(dir)
+    #expect(again.staged == false, "the copy predates the edit and must not be adopted")
+    let page = try await session.page(again.name, offset: 0, limit: 10)
+    let amounts = page.rows.map { $0[2].display }.sorted()
+    #expect(amounts.contains("999.5") || amounts.contains("999.50"),
+            "the edited value must be visible; got \(amounts)")
+}
+
+@Test func theStagingTokenSeparatesSheetsAndFolderContents() throws {
+    // The identity itself, unit-level: the same file, two sheets -> two tokens; a folder whose
+    // member changed -> a different token. This is what `SourceKey.token()` could not do.
+    let key = SourceKey(path: "/tmp/book.xlsx", mtimeNs: 111, size: 222)
+    func spec(_ sheet: String?) -> SourceSpec {
+        SourceSpec(key: key, fmt: .xlsx, readFn: "read_xlsx",
+                   columns: [Column(name: "a", type: "BIGINT")], sheet: sheet)
+    }
+    #expect(stagingToken(spec("Summary")) != stagingToken(spec("By Store")))
+    #expect(stagingToken(spec("Summary")) == stagingToken(spec("Summary")))
+    #expect(stagingToken(spec(nil)).hasPrefix(stagingTokenVersion),
+            "every token carries its format version, so an older build's can never match")
+
+    let dir = try newTempDir()
+    let member = (dir as NSString).appendingPathComponent("a.csv")
+    try "x\n1\n".write(toFile: member, atomically: true, encoding: .utf8)
+    let dirKey = try statInfo(dir)
+    func dirSpec() throws -> SourceSpec {
+        SourceSpec(key: SourceKey(path: dir, mtimeNs: dirKey.mtimeNs, size: dirKey.size),
+                   fmt: .globCsv, readFn: "read_csv", columns: [Column(name: "x", type: "BIGINT")])
+    }
+    let firstToken = stagingToken(try dirSpec())
+    try "x\n1\n2\n".write(toFile: member, atomically: true, encoding: .utf8)
+    #expect(stagingToken(try dirSpec()) != firstToken,
+            "a folder's identity comes from its members, not from its own stat")
+}
+
+// MARK: - I2: the swap retries through a real write-write conflict
+
+@Test func theSwapRetriesThroughAWriteWriteConflict() throws {
+    // The retry, the ROLLBACK and the backoff could all be deleted with the suite green. This
+    // forces the conflict the mechanism exists for, with no timing: a second connection holds an
+    // open transaction that has written the view being swapped away.
+    let path = (try newTempDir() as NSString).appendingPathComponent("swap.duckdb")
+    let db = try Database(path: path)
+    let worker = try db.connect()
+    let blocker = try db.connect()
+
+    try worker.execute("CREATE OR REPLACE VIEW t AS SELECT 1 AS x")
+    try worker.execute("CREATE OR REPLACE TABLE \(q(stagingName("t"))) AS SELECT 42 AS x")
+
+    try blocker.execute("BEGIN TRANSACTION")
+    try blocker.execute("CREATE OR REPLACE VIEW t AS SELECT 2 AS x")
+
+    // Attempt one must genuinely fail — otherwise this test proves nothing about the retry.
+    var firstAttemptFailed = false
+    do {
+        try worker.execute("BEGIN TRANSACTION")
+        try worker.execute("DROP VIEW IF EXISTS t")
+        try worker.execute("ALTER TABLE \(q(stagingName("t"))) RENAME TO t")
+        try worker.execute("COMMIT")
+    } catch let error as DuckDBError {
+        firstAttemptFailed = true
+        #expect(error.message.contains("conflict"), "expected a write-write conflict; got \(error.message)")
+    }
+    try? worker.execute("ROLLBACK")
+    #expect(firstAttemptFailed, "the conflict this test relies on did not happen")
+
+    // Now the real thing, through the same conflict.
+    try worker.execute("CREATE OR REPLACE TABLE \(q(stagingName("t"))) AS SELECT 42 AS x")
+    try swapStaged(worker, name: "t", lock: NSLock())
+    let rows = try worker.query("SELECT x FROM t").allRows()
+    #expect(rows.count == 1)
+    #expect(rows[0][0] == .int(42), "the staged rows must be the ones under the user-facing name")
+}
+
+// MARK: - I3: the two unpinned openedAt guards
+
+@Test func aFailedJobForAClosedAndReopenedTableIsNotReportedOnTheNewOne() async throws {
+    // Without `finishStage`'s guard, a job that dies for table `x` after `x` was closed and a
+    // different file reopened under that name writes "staging failed: …" onto the innocent new
+    // table and clears its own in-flight progress. Same shape as the regression this branch
+    // already shipped once.
+    let session = try newSession()
+    let first = try await session.openPath(try makeSmallCSV(), name: "x")
+    try await session.closeTable("x")
+    let second = try await session.openPath(try makeSmallCSV(rows: 10), name: "x")
+    #expect(first.openedAt != second.openedAt)
+
+    let inFlight = StagingProgress(jobID: "stage-live", state: "running", pct: 0, estSeconds: 1)
+    await session.setStagingForTest("x", inFlight)
+    await session.finishStage("x", jobID: "stage-1", openedAt: first.openedAt, error: "staging failed: boom")
+
+    let after = try await session.table("x")
+    #expect(after.stagingError == nil, "the new table never had a failure")
+    #expect(after.staging == inFlight, "and its own job must not be cleared by a stranger")
+}
+
+@Test func theDwellDropsAStaleGenerationImmediatelyInsteadOfWaiting() async throws {
+    // `maybeStageAfterDwell`'s two guards. With them removed this call sits in the dwell loop for
+    // the full (here: hour-long) deadline instead of returning at once, and then stages a table
+    // its job was never about — so the assertion is that it comes back promptly AND stages nothing.
+    let session = try newSession()
+    await session.setStageDwellForTest(3600)
+    let first = try await session.openPath(bigCSV, name: "x")
+    try await session.closeTable("x")
+    let second = try await session.openPath(bigCSV, name: "x")
+    #expect(first.openedAt != second.openedAt)
+
+    let returned = DoneFlag()
+    Task { await session.maybeStageAfterDwell("x", openedAt: first.openedAt); returned.set() }
+    let deadline = Date().addingTimeInterval(5)
+    while !returned.isSet, Date() < deadline { try await Task.sleep(nanoseconds: 50_000_000) }
+    #expect(returned.isSet, "a stale generation must be dropped, not waited on")
+
+    let after = try await session.table("x")
+    #expect(after.staged == false)
+    #expect(after.staging == nil, "and no copy may be started for a table this job was not about")
+}
+
+// MARK: - I4: two copies in flight must not charge each other
+
+@Test func twoCopiesStagingAtOnceEachGetTheirOwnHonestByteCount() async throws {
+    // A whole-store delta cross-charges: MEASURED in review, two equal files staging together
+    // recorded 524,288 and 900,839 B, and a 3-row CSV recorded 413 B beside a 30 MB copy. Two
+    // byte-identical files must cost exactly the same, whatever else is happening in the store.
+    let dir = try newTempDir()
+    let a = try makeCSV(dir: dir, name: "twin_a.csv", rows: 20_000)
+    let b = try makeCSV(dir: dir, name: "twin_b.csv", rows: 20_000)
+    #expect(try statInfo(a).size == statInfo(b).size, "the premise: identical content")
+
+    let session = try newSession()
+    let ta = try await session.openPath(a)
+    let tb = try await session.openPath(b)
+    _ = try await session.stageNow(ta.name, force: true)
+    _ = try await session.stageNow(tb.name, force: true)
+    try await waitForStaged(session, ta.name)
+    try await waitForStaged(session, tb.name)
+
+    let entries = try await waitForCatalog(session, count: 2)
+    let bytes = Dictionary(uniqueKeysWithValues: entries.map { ($0.table, $0.bytes) })
+    #expect(bytes[ta.name] == bytes[tb.name],
+            "identical copies must cost identically; got \(bytes)")
+    #expect((bytes[ta.name] ?? 0) > 0)
+}
+
+// MARK: - I5: one row per staged table, not per source token
+
+@Test func twoTabsOfOneFileEachKeepTheirOwnCatalogRow() async throws {
+    // The old PRIMARY KEY was `source_token`, which both tabs of one file share, so the second
+    // INSERT OR REPLACE replaced the first tab's row. REPRODUCED: catalog `["small_2"]` against
+    // real tables `["small", "small_2"]`, and `purgeStaged(all: true)` then dropped only
+    // `small_2` — leaving a copy in the store that no purge could reach.
+    let session = try newSession()
+    let path = try makeSmallCSV()
+    let first = try await session.openPath(path)
+    let second = try await session.openPath(path)
+    #expect(second.name == "small_2")
+
+    for name in [first.name, second.name] {
+        _ = try await session.stageNow(name, force: true)
+        try await waitForStaged(session, name)
+    }
+    let entries = try await waitForCatalog(session, count: 2)
+    #expect(Set(entries.map(\.table)) == ["small", "small_2"])
+
+    let probe = try await session.openPath(try makeSmallCSV(rows: 5))
+    for name in [first.name, second.name] {
+        #expect(try await isNativeTable(session, probe.name, name) == 1)
+        try await session.closeTable(name)
+    }
+    let purged = try await session.purgeStaged(all: true)
+    #expect(Set(purged.dropped) == ["small", "small_2"], "both copies, not just the surviving row")
+    for name in [first.name, second.name] {
+        #expect(try await isNativeTable(session, probe.name, name) == 0,
+                "\(name) must not survive the user's reclaim-everything button")
+    }
+}
+
+// MARK: - I6: closing a tab while its copy is being swapped in
+
+@Test func closingATabMidSwapDoesNotThrow() async throws {
+    // Between `swapStaged`'s rename and `applyStaged`'s publish the name is a real TABLE while the
+    // flags still say "not staged" — and `DROP VIEW` on a table is a hard Catalog Error, so
+    // closing the tab in that window failed while the `defer` removed it from the catalog anyway.
+    let session = try newSession()
+    let t = try await session.openPath(try makeSmallCSV())
+    _ = try await session.stageNow(t.name, force: true)
+    try await waitForStaged(session, t.name)
+
+    // Exactly the mid-swap store state: the copy is in place under the name, the flags are not.
+    await session.setMidSwapStateForTest(t.name)
+    try await session.closeTable(t.name)          // threw `Existing object … is of type Table`
+
+    await #expect(throws: SessionError.self) { try await session.table(t.name) }
+}
+
+// MARK: - M1: one bad row must not disable the purge forever
+
+@Test func aCatalogRowWhoseObjectIsAViewIsCollectedInsteadOfAbortingThePurge() throws {
+    // `DROP TABLE` on a view throws, and inside the purge loop that throw aborted every later
+    // target — age and budget enforcement silently dead from then on. The path in is real: a
+    // catalog row outliving its table, then `openPath` creating a view under the same name.
+    let db = try Database.inMemory()
+    let con = try db.connect()
+    try con.execute(catalogDDL)
+    try con.execute("CREATE VIEW ghost AS SELECT 1 AS x")
+    try con.execute("CREATE TABLE later AS SELECT 2 AS x")
+    for name in ["ghost", "later"] {
+        _ = try con.query(
+            "INSERT INTO _sift_sources VALUES (?, '/nonexistent/x.csv', 0, 0, ?, 'csv', now(), "
+                + "now() - INTERVAL 30 DAY, 0, 1)",
+            [.text("token-\(name)"), .text(name)]
+        )
+    }
+
+    let dropped = try Session.purgeStagedTables(con, open: [], tables: nil, all: false)
+    #expect(Set(dropped) == ["ghost", "later"], "the view is collected AND the later target too")
+    #expect(try con.query("SELECT count(*) FROM _sift_sources").allRows()[0][0] == .int(0))
+}
+
+// MARK: - M3 / M4: the cancel job's own edges
+
+@Test func aCancelThatCannotLandReportsFalse() throws {
+    // Once the interruptible query has returned, the job is committed to publishing. Saying "yes,
+    // cancelled" there and then publishing the copy anyway is the lie this closes.
+    let con = try Database.inMemory().connect()
+    let job = StageJob()
+    job.attach(con)
+    #expect(job.requestCancel() == true, "an in-flight job can be cancelled")
+    job.closeInterruptWindow()
+    #expect(job.requestCancel() == false, "a job past the interrupt window cannot")
+}
+
+@Test func aCancelBeforeTheConnectionExistsStillStopsItsThread() throws {
+    // `cancel` can arrive with the job id `stageNow` just returned, before `runStage` has
+    // connected. The hammer starts anyway (so it catches the CTAS the moment it begins), and it
+    // must still stop — otherwise it spins at ~5 kHz on a nil target for the life of the process.
+    let job = StageJob()
+    #expect(job.requestCancel() == true)
+    job.closeInterruptWindow()          // hangs if the thread cannot see the window close
+    #expect(job.isCancelled)
+}
+
+/// Did an `async` call come back? A plain `Bool` cannot cross the task boundary and
+/// `DispatchSemaphore.wait` is unavailable in an async context, so this is the smallest thing
+/// that answers "did it return, or is it still sitting in a loop".
+private final class DoneFlag: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value = false
+    func set() { lock.withLock { value = true } }
+    var isSet: Bool { lock.withLock { value } }
+}

@@ -54,20 +54,28 @@ final class StageJob: @unchecked Sendable {
         lock.withLock { self.connection = connection }
     }
 
-    /// Set the cancel flag and start re-asserting the interrupt until the window closes.
+    /// Set the cancel flag and start re-asserting the interrupt until the window closes. Returns
+    /// `false` when the job is already past the point a cancel can reach it.
+    ///
+    /// That return value is the honest half of review M3: once the interruptible query has
+    /// returned, `runStage` is committed to publishing — the swap is a fast, transactional rename
+    /// that undoing would mean dropping a finished copy and rebuilding a view. Reporting `true`
+    /// there told the user a cancel had been accepted and then published the copy anyway.
     ///
     /// A real `Thread`, not a `Task`: this loop is a spin with a 0.2 ms pause, and parking a
     /// cooperative-pool thread on it would starve the very actor the job has to call back into.
     /// Starting even when no connection is attached yet is deliberate — `cancel` can be called
     /// with the job id `stageNow` just returned, microseconds before the detached task has
     /// connected, and the loop simply hammers nothing until it has.
-    func requestCancel() {
+    @discardableResult
+    func requestCancel() -> Bool {
         lock.lock()
+        guard windowOpen else { lock.unlock(); return false }
         cancelled = true
-        let start = windowOpen && !hammering
+        let start = !hammering
         if start { hammering = true }
         lock.unlock()
-        guard start else { return }
+        guard start else { return true }
 
         Thread.detachNewThread { [self] in
             while true {
@@ -81,6 +89,7 @@ final class StageJob: @unchecked Sendable {
             }
             lock.withLock { hammering = false }
         }
+        return true
     }
 
     /// Stop hammering, and do not return until the hammer thread has actually stopped — an
@@ -175,8 +184,9 @@ extension Session {
     @discardableResult
     public func cancel(_ jobID: String) -> Bool {
         guard let job = stageJobs[jobID] else { return false }
-        job.requestCancel()
-        return true
+        // `false` is also the answer for a job whose copy is already built and being published —
+        // see `StageJob.requestCancel`. A cancel that cannot land must not report that it did.
+        return job.requestCancel()
     }
 
     // MARK: - running one job
@@ -198,14 +208,11 @@ extension Session {
             return
         }
         job.attach(con)
-
-        // CHECKPOINT before measuring as well as after: `bytes` is the growth of the store across
-        // this CTAS, and an unflushed WAL on either side makes the delta meaningless. (Python only
-        // checkpoints at the end.) DuckDB exposes no per-table size — `duckdb_tables.estimated_size`
-        // is estimated *rows*, and produced a literal "3,000,048 B" reading for a 3M-row table
-        // until it was caught; DuckDB155FactsTests' fact9 pins that.
-        try? con.execute("CHECKPOINT")
-        let before = dbBytes()
+        // The cancel hammer must stop even on a path that never reaches the explicit close below
+        // — `database.connect()` failing above returns before `attach`, and a `cancel` racing that
+        // window would otherwise leave a thread spinning at ~5 kHz for the life of the process
+        // (review M4). Idempotent, so the explicit early close still does the real work.
+        defer { job.closeInterruptWindow() }
 
         var failure: String?
         do {
@@ -233,6 +240,15 @@ extension Session {
             return
         }
 
+        // The last cheap check before the rename makes the name mean something new. It does not
+        // close the window — `applyStaged` below is still the authority and still repairs — but it
+        // narrows it from "however long the CTAS took" to "the swap itself" (review M5).
+        guard await isStillOpen(name, openedAt: openedAt) else {
+            try? con.execute(dropStagingSQL(name))
+            await finishStage(name, jobID: jobID, openedAt: openedAt, error: nil)
+            return
+        }
+
         do {
             try swapStaged(con, name: name, lock: await tlock(name))
         } catch {
@@ -244,12 +260,21 @@ extension Session {
 
         let physical = (try? con.query("SELECT count(*) FROM \(q(name))").allRows().first)
             .flatMap { $0.first }.map(cellInt) ?? 0
+        let bytes = stagedBytes(con, table: name)
+
+        // Recorded BEFORE the copy is published, not after (review M2): a process that dies in
+        // between must leave a catalog row with no table — which the next purge collects — rather
+        // than a table with no row, which nothing can ever reach.
+        try? recordStaged(con, spec: spec, table: name, rowCount: physical, bytes: bytes)
 
         switch await applyStaged(name, physicalRows: physical, openedAt: openedAt, jobID: jobID) {
         case .applied(let rowCount):
-            try? con.execute("CHECKPOINT")   // flush the WAL so the size delta is meaningful
-            try? recordStaged(
-                con, spec: spec, table: name, rowCount: rowCount, bytes: dbBytes() - before
+            // `row_count` is corrected here rather than at INSERT time: the authoritative number
+            // is the copy's own count plus the bad rows the parser dropped, and `badRows` lives on
+            // the actor, which the write above deliberately runs ahead of.
+            _ = try? con.query(
+                "UPDATE _sift_sources SET row_count = ? WHERE table_name = ?",
+                [.int(Int64(rowCount)), .text(name)]
             )
             // Re-profile against the native table. `try?`, unlike Python's bare call inside its
             // one big `except`: the copy is already live and recorded, so a profile failure here
@@ -260,38 +285,19 @@ extension Session {
             // `openedAt` check and the rename, so the name now points at a copy of a file the
             // open table is not. Left alone, a reopened table would silently serve the OLD file's
             // rows — the relation-level shape of the bug `openedAt` exists to stop. Put the
-            // catalog back the way the live table expects to find it.
-            try? con.execute("DROP TABLE IF EXISTS \(q(name))")
+            // catalog back the way the live table expects to find it, row included.
+            _ = try? con.query("DELETE FROM _sift_sources WHERE table_name = ?", [.text(name)])
+            Self.dropStagedObject(con, name)
             if let replacement {
                 try? con.execute(createViewSQL(name: name, spec: replacement))
             }
         }
     }
 
-    /// `BEGIN / DROP VIEW / ALTER TABLE RENAME / COMMIT` under the per-table lock, three attempts
-    /// with a `ROLLBACK` between. DuckDB DDL is transactional, so the swap is invisible to
-    /// readers and the user's typed SQL keeps working across it.
-    ///
-    /// Synchronous on purpose: `lock` is an `NSLock`, and unlocking one from a different thread
-    /// than locked it is undefined — which is exactly what an `await` inside this scope could
-    /// arrange. The 0.15 s backoff is therefore `Thread.sleep`, on a task that has just spent
-    /// seconds inside a blocking CTAS on this same thread.
-    private nonisolated func swapStaged(_ con: Connection, name: String, lock: NSLock) throws {
-        lock.lock()
-        defer { lock.unlock() }
-
-        var lastError: Error?
-        for attempt in 0..<3 {
-            do {
-                for statement in swapSQL(table: name) { try con.execute(statement) }
-                return
-            } catch {
-                lastError = error
-                try? con.execute("ROLLBACK")
-                if attempt < 2 { Thread.sleep(forTimeInterval: 0.15) }
-            }
-        }
-        throw lastError ?? DuckDBError("could not swap \(stagingName(name)) into place")
+    /// Is this exact open of `name` still in the catalog? The pre-swap half of the `openedAt`
+    /// guard — see `runStage`.
+    func isStillOpen(_ name: String, openedAt: Int) -> Bool {
+        tables[name]?.openedAt == openedAt
     }
 
     /// Publish a finished copy onto the open table. Actor-isolated and synchronous.
@@ -345,11 +351,60 @@ extension Session {
                 + "(source_token, path, mtime_ns, size, table_name, fmt, staged_at, last_used, "
                 + " row_count, bytes) VALUES (?,?,?,?,?,?,now(),now(),?,?)",
             [
-                .text(spec.key.token()), .text(spec.key.path), .int(Int64(spec.key.mtimeNs)),
+                .text(stagingToken(spec)), .text(spec.key.path), .int(Int64(spec.key.mtimeNs)),
                 .int(Int64(spec.key.size)), .text(table), .text(spec.fmt.rawValue),
-                .int(Int64(rowCount)), .int(Int64(max(0, bytes))),
+                .int(Int64(rowCount)), .int(Int64(bytes)),
             ]
         )
+    }
+
+    /// What one staged copy actually occupies, from DuckDB's own block allocation.
+    ///
+    /// **Not the store's growth across the CTAS**, which is what the brief specified and what the
+    /// first version of this did. That number is not per-copy: `dbBytes()` is the whole store, so
+    /// two jobs in flight interleave their checkpoints and charge each other. MEASURED (review
+    /// I4): the same 3-row CSV recorded 262,144 B alone and 413 B beside a 30 MB copy, and two
+    /// equal files staging together recorded 524,288 and 900,839. `selectForPurge` sums these
+    /// against a 20 GB budget and subtracts them while evicting, so under-charging lets the store
+    /// grow past the budget with the purge convinced it holds nothing.
+    ///
+    /// `pragma_storage_info` reports the blocks this table's segments actually live in, so a
+    /// concurrent job cannot move the number — MEASURED: a table read 32 blocks before and after
+    /// an unrelated 21-block table was written beside it, and 32 + 21 matched the store's own
+    /// `used_blocks` of 54 and its growth on disk. This is emphatically NOT
+    /// `duckdb_tables.estimated_size`, which is estimated ROWS (DuckDB155FactsTests' fact9) and
+    /// still banned.
+    ///
+    /// ponytail: block granularity (256 KiB), so a small copy rounds up to one block. That is the
+    /// allocation unit — it over-states rather than under-states, which is the safe direction for
+    /// a disk budget. Per-segment byte counts would need summing `count`×type width by hand.
+    nonisolated func stagedBytes(_ con: Connection, table: String) -> Int {
+        // A segment that has not been written to a block yet reports `block_id = -1`, so the
+        // CHECKPOINT comes first — and it is RETRIED, because a checkpoint fails outright while
+        // another connection has a write transaction open ("Cannot CHECKPOINT: there are other
+        // write transactions active"), which is exactly the concurrent-staging case this number
+        // has to be honest about. MEASURED: without the retry a copy staged beside another
+        // recorded 0 B.
+        let sql = "SELECT (SELECT count(DISTINCT block_id) FROM pragma_storage_info(\(qlit(table))) "
+            + "WHERE block_id >= 0) * (SELECT block_size FROM pragma_database_size())"
+        for attempt in 0..<10 {
+            try? con.execute("CHECKPOINT")
+            if let row = try? con.query(sql).allRows().first, cellInt(row[0]) > 0 {
+                return cellInt(row[0])
+            }
+            if attempt < 9 { Thread.sleep(forTimeInterval: 0.1) }
+        }
+        return 0
+    }
+
+    /// Drop whatever object holds this name. A staged copy is a TABLE, but a leftover VIEW can
+    /// hold the same name, and `DROP TABLE` on a view is a hard `Catalog Error` — which, inside
+    /// `purgeStagedTables`' loop, used to abort the whole purge and leave every later target
+    /// uncollected (review M1). Returns `false` only if the name survived both attempts.
+    @discardableResult
+    static func dropStagedObject(_ con: Connection, _ name: String) -> Bool {
+        if (try? con.execute("DROP TABLE IF EXISTS \(q(name))")) != nil { return true }
+        return (try? con.execute("DROP VIEW IF EXISTS \(q(name))")) != nil
     }
 
     // MARK: - reopening a file that already has a copy
@@ -368,25 +423,33 @@ extension Session {
     /// covers it, which is presumably why it shipped. Task 6 is what makes that state reachable in
     /// this port, so Task 6 closes it.
     ///
-    /// Adoption is gated on `source_token` (path + mtime + size), so a copy of a file that has
-    /// since changed is never served as if it were the file: it is dropped, with its catalog row,
-    /// and the caller falls back to reading the source in place.
+    /// Adoption is gated on `stagingToken` — the source's real identity, sheet and folder members
+    /// included, NOT `SourceKey.token()`; see `stagingToken` for the two ways that served the
+    /// wrong file's data. A copy that does not match is dropped along with its catalog row, and
+    /// the caller falls back to reading the source in place.
     nonisolated func adoptStagedCopy(_ con: Connection, name: String, spec: SourceSpec) -> Int? {
         // `duckdb_tables()` lists tables only — a leftover VIEW of the same name is this port's
         // own doing and `CREATE OR REPLACE VIEW` handles it, which is why only tables land here.
         let tableExists = (try? con.query(
             "SELECT count(*) FROM duckdb_tables() WHERE table_name = ?", [.text(name)]
         ).allRows().first).map { cellInt($0[0]) } ?? 0
-        guard tableExists > 0 else { return nil }
+        guard tableExists > 0 else {
+            // No table, but possibly a catalog row still pointing at one. Left behind, that row
+            // makes every later purge throw on `DROP TABLE` once anything creates a VIEW under the
+            // name — which `openPath` is about to do (review M1).
+            _ = try? con.query("DELETE FROM _sift_sources WHERE table_name = ?", [.text(name)])
+            return nil
+        }
 
         let matched = try? con.query(
             "SELECT row_count FROM _sift_sources WHERE table_name = ? AND source_token = ?",
-            [.text(name), .text(spec.key.token())]
+            [.text(name), .text(stagingToken(spec))]
         ).allRows().first
-        guard let row = matched ?? nil else {
-            // A copy of a different file, or of an older version of this one. Either way it is
-            // wrong AND it is holding the name; `purgeStaged` would have collected it eventually.
-            try? con.execute("DROP TABLE IF EXISTS \(q(name))")
+        guard let row = matched ?? nil, columnsMatch(con, table: name, spec: spec) else {
+            // A copy of a different file, an older version of this one, or one written by a build
+            // whose token format we can no longer interpret. Either way it is wrong AND it is
+            // holding the name.
+            Self.dropStagedObject(con, name)
             _ = try? con.query("DELETE FROM _sift_sources WHERE table_name = ?", [.text(name)])
             return nil
         }
@@ -394,6 +457,15 @@ extension Session {
             "UPDATE _sift_sources SET last_used = now() WHERE table_name = ?", [.text(name)]
         )
         return cellInt(row[0])
+    }
+
+    /// Backstop for the one hole the token cannot close: a file replaced by a different file of
+    /// the same size with the same mtime (a restore that preserves timestamps). Cheap — the
+    /// `LIMIT 0` reads no rows — and it catches the case where that different file also has a
+    /// different shape. It is a backstop, not the fix; the fix is `stagingToken`.
+    private nonisolated func columnsMatch(_ con: Connection, table: String, spec: SourceSpec) -> Bool {
+        guard let result = try? con.query("SELECT * FROM \(q(table)) LIMIT 0") else { return false }
+        return result.columns.map(\.name) == spec.columns.map(\.name)
     }
 
     // MARK: - the staged-data lifecycle
@@ -489,11 +561,43 @@ extension Session {
 
         var dropped: [String] = []
         for name in targets where !open.contains(name) {
-            try con.execute("DROP TABLE IF EXISTS \(q(name))")
-            _ = try con.query("DELETE FROM _sift_sources WHERE table_name = ?", [.text(name)])
+            // `dropStagedObject` rather than a bare `DROP TABLE`, and one target's failure never
+            // aborts the rest: a single row whose name belongs to a VIEW used to throw here and
+            // leave every later target uncollected — age and budget enforcement silently dead
+            // (review M1).
+            guard Self.dropStagedObject(con, name) else { continue }
+            _ = try? con.query("DELETE FROM _sift_sources WHERE table_name = ?", [.text(name)])
             dropped.append(name)
         }
         return dropped
+    }
+
+    /// Bring an existing store's catalog to the shape this build expects, before anything reads it.
+    ///
+    /// Two things changed under it: the PRIMARY KEY moved from `source_token` to `table_name`
+    /// (review I5 — the old key made two tabs of one file collapse into one row, stranding a full
+    /// copy that no purge could reach), and `stagingToken`'s format changed (C1). Neither can be
+    /// patched in place: DuckDB cannot re-key a table, and a v1 token cannot be re-derived from
+    /// what the row stores.
+    ///
+    /// So a legacy store is **reset**: every copy the old catalog lists is dropped and the catalog
+    /// is recreated empty. That is the "collected, not stranded" half — those copies could never be
+    /// adopted again (their tokens can no longer match), so leaving them would be pure disk that
+    /// nothing reaches. A staged copy is a cache; the next open rebuilds it.
+    ///
+    /// Fail-safe on its own detection: if the constraint query itself fails, nothing is touched.
+    static func migrateCatalog(_ con: Connection) {
+        guard let row = try? con.query(
+            "SELECT count(*) FROM duckdb_constraints() WHERE table_name = '_sift_sources' "
+                + "AND constraint_type = 'PRIMARY KEY' "
+                + "AND list_contains(constraint_column_names, 'table_name')"
+        ).allRows().first else { return }
+        guard cellInt(row[0]) == 0 else { return }
+
+        let stale = (try? con.query("SELECT table_name FROM _sift_sources").allRows()) ?? []
+        for row in stale { dropStagedObject(con, cellText(row[0])) }
+        try? con.execute("DROP TABLE IF EXISTS _sift_sources")
+        try? con.execute(catalogDDL)
     }
 
     /// Drop a staged table and go back to reading the source in place. Ported from `unstage`.
@@ -520,6 +624,112 @@ extension Session {
         _ = try await computeProfile(name)
         return tables[name] ?? t
     }
+}
+
+// MARK: - the swap
+
+/// `BEGIN / DROP VIEW / ALTER TABLE RENAME / COMMIT` under the per-table lock, three attempts with
+/// a `ROLLBACK` between. DuckDB DDL is transactional, so the swap is invisible to readers and the
+/// user's typed SQL keeps working across it.
+///
+/// The retry is not decoration. MEASURED: with a second connection holding an open
+/// `BEGIN; CREATE OR REPLACE VIEW t AS …`, an attempt fails immediately with
+/// `TransactionContext Error: Catalog write-write conflict on alter with "…View…"`; the `ROLLBACK`
+/// clears the failed transaction and the next attempt, once that transaction is gone, puts the
+/// copy in place.
+///
+/// A free function rather than a `Session` method because it touches no session state — which also
+/// makes the conflict above reproducible in a test without a live session, the thing review I2
+/// showed was missing.
+///
+/// Synchronous on purpose: `lock` is an `NSLock`, and unlocking one from a different thread than
+/// locked it is undefined — exactly what an `await` inside this scope could arrange. The 0.15 s
+/// backoff is therefore `Thread.sleep`, on a task that has just spent seconds inside a blocking
+/// CTAS on this same thread.
+func swapStaged(_ con: Connection, name: String, lock: NSLock) throws {
+    lock.lock()
+    defer { lock.unlock() }
+
+    var lastError: Error?
+    for attempt in 0..<3 {
+        do {
+            for statement in swapSQL(table: name) { try con.execute(statement) }
+            return
+        } catch {
+            lastError = error
+            try? con.execute("ROLLBACK")
+            if attempt < 2 { Thread.sleep(forTimeInterval: 0.15) }
+        }
+    }
+    throw lastError ?? DuckDBError("could not swap \(stagingName(name)) into place")
+}
+
+// MARK: - what a staged copy is a copy OF
+
+/// Bumped whenever `stagingToken`'s format changes, and the first field of every token, so a token
+/// written by an older build can never compare equal to one written by this build. A copy whose
+/// identity we can no longer interpret must never be adopted.
+let stagingTokenVersion = "v2"
+
+/// The identity a staged copy is matched on: the exact bytes it was made from.
+///
+/// **`SourceKey.token()` is not enough, and that was a Critical.** It is `path:mtimeNs:size` from a
+/// single `stat()` of the path, which identifies neither of the two source shapes Sift supports:
+///
+/// - **A workbook sheet.** Every sheet of one `.xlsx` shares one path, mtime and size. REPRODUCED:
+///   stage `Summary` (1 row, `metric`/`value`) as table `d`, close it, open `By Store` (50 rows,
+///   `store`/`sales`) — the copy of Summary was adopted, and `page()` returned Summary's row under
+///   By Store's headers. No explicit name is needed for the collision: `sanitizeTableName`
+///   lowercases and collapses non-alphanumeric runs, so `Q1 2024` and `Q1-2024` derive the same
+///   name on their own, and `openPath` tells the user to "use the sheet picker to open others".
+/// - **A folder.** A directory's mtime and size change when an entry is added or removed and
+///   **never** when a member file is rewritten in place. MEASURED: identical `stat` before and
+///   after rewriting a member. REPRODUCED: the copy was adopted with the pre-edit values, and
+///   `stagedEntries()` reported `sourceChanged: false` — the staleness sweep does the same
+///   directory `stat`, so nothing collected it either. There was no path back to correct data
+///   short of deleting `~/.sift`.
+///
+/// So the sheet joins the identity, and a directory's identity comes from its members' stats
+/// rather than its own. What remains open is a file rewritten with an identical mtime AND size
+/// (a restore that preserves timestamps): `adoptStagedCopy`'s column check is the backstop there,
+/// and closing it completely would mean hashing the contents of a file that may be 30 GB.
+///
+/// ponytail: stats every member on every open of a folder source. The open itself reads those
+/// files, so it is noise next to the parse — if a folder ever gets big enough for the walk to show
+/// up, cache it against the directory's own mtime.
+func stagingToken(_ spec: SourceSpec) -> String {
+    var parts = [stagingTokenVersion, spec.key.path, String(spec.key.mtimeNs), String(spec.key.size)]
+    if let sheet = spec.sheet, !sheet.isEmpty { parts.append("sheet=\(sheet)") }
+    if let members = directoryDigest(spec.key.path) { parts.append("members=\(members)") }
+    return parts.joined(separator: "|")
+}
+
+/// A digest of every file under `path`, or `nil` when `path` is not a directory.
+private func directoryDigest(_ path: String) -> String? {
+    var info = stat()
+    guard stat(path, &info) == 0, (info.st_mode & S_IFMT) == S_IFDIR else { return nil }
+    guard let walker = FileManager.default.enumerator(atPath: path) else { return "unreadable" }
+
+    var lines: [String] = []
+    for case let entry as String in walker {
+        guard let member = try? statInfo((path as NSString).appendingPathComponent(entry)) else {
+            continue
+        }
+        lines.append("\(entry):\(member.mtimeNs):\(member.size)")
+    }
+    return fnv1a(lines.sorted().joined(separator: "\n"))
+}
+
+/// FNV-1a, 64-bit. Not `Hasher`: this value is written to disk and compared on a later launch, and
+/// `Hasher` is seeded per process, so it would never match itself twice. Not a cryptographic digest
+/// either — nothing here is adversarial, the question is only "did these files change".
+/// `String(_:radix:)` is locale-independent, unlike anything from `NumberFormatter`.
+private func fnv1a(_ text: String) -> String {
+    var hash: UInt64 = 0xcbf2_9ce4_8422_2325
+    for byte in text.utf8 {
+        hash = (hash ^ UInt64(byte)) &* 0x100_0000_01b3
+    }
+    return String(hash, radix: 16)
 }
 
 // MARK: - results

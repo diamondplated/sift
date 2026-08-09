@@ -152,6 +152,9 @@ public actor Session {
 
         let con = try db.connect()
         try con.execute(catalogDDL)
+        // Before anything reads the catalog: a store written by an older build has a differently
+        // keyed catalog holding tokens this build cannot interpret. See `migrateCatalog`.
+        Self.migrateCatalog(con)
         // Python's `self.purge_staged(reason="startup")`. Nothing is open yet, so the "never yank
         // a table out from under an open tab" rule is trivially satisfied — this is where a copy
         // that aged out, blew the budget, or no longer matches its source gets collected.
@@ -317,6 +320,26 @@ public actor Session {
     /// flake the moment the machine is busy. Both directions matter — one test shortens it to
     /// watch the dwell fire, another lengthens it to prove an aggregate short-circuits it.
     func setStageDwellForTest(_ seconds: Double) { stageDwellSeconds = seconds }
+
+    /// Test support: put a table into the state that exists for a few seconds inside every real
+    /// staging job — the copy has been renamed over the name, so the store holds a TABLE, but the
+    /// job has not published it yet, so the flags still say "not staged, job in flight". That
+    /// window is only reachable by racing a live CTAS, which is not reproducible at unit speed;
+    /// this reconstructs it exactly, which is how `closeTable` proves it no longer throws in it.
+    func setMidSwapStateForTest(_ name: String) {
+        guard var t = tables[name] else { return }
+        t.staged = false
+        t.staging = StagingProgress(jobID: "stage-test", state: "running", pct: 0, estSeconds: 0)
+        tables[name] = t
+    }
+
+    /// Test support: plant an in-flight staging progress so a stale-generation callback has
+    /// something to (wrongly) clear. See `finishStage`'s guard.
+    func setStagingForTest(_ name: String, _ progress: StagingProgress?) {
+        guard var t = tables[name] else { return }
+        t.staging = progress
+        tables[name] = t
+    }
 
     /// Safe relation SQL for this table — a quoted name, or the user's wrapped query.
     public nonisolated func relation(_ t: Table) -> String {
@@ -631,9 +654,15 @@ public actor Session {
         }
         if t.staged {
             _ = try con.query("UPDATE _sift_sources SET last_used = now() WHERE table_name = ?", [.text(name)])
-        } else {
+        } else if t.staging == nil {
             try con.execute("DROP VIEW IF EXISTS \(q(name))")
         }
+        // `t.staging != nil` falls through both branches on purpose. A staging job turns this name
+        // into a real TABLE at the swap, seconds before `applyStaged` sets `staged = true`, and
+        // `DROP VIEW` on a table is a hard `Catalog Error` — closing a tab in that window failed
+        // with a catalog dump while the `defer` above removed it from `tables` anyway, so the user
+        // got an error for an operation that half-happened (review I6). Nothing is leaked by
+        // waiting: the job's own `.stale` repair drops whatever it finds under the name.
     }
 
     public func shutdown() {
