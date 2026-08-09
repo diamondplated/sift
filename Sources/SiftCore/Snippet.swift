@@ -117,16 +117,17 @@ private let polarsReader: [Fmt: String] = [
     .delta: "scan_delta", .xlsx: "read_excel",
 ]
 
-/// Python builds this from `cols.values()`, ordinarily already in file-column order because
-/// callers construct `cols` from `spec.columns` (see SourceTests.swift's `_ctx` equivalent).
-/// `cols: [String: Column]` here is an unordered Swift Dictionary, so — same call as Source.swift
-/// made for `readArgs.keys.sorted()` — this sorts by name for a reproducible (if
-/// differently-ordered) result. Cosmetic only: dict/`{}` key order carries no meaning to `pandas
-/// .read_csv(dtype=...)`.
+/// Python calls this with `list(cols.values())`, and `cols` is always built as `{c.name: c for c
+/// in self.spec.columns}` at its one real call site (session.py:154-156) — so iteration order is
+/// file-column order, not incidental. `[String: Column]` here is an unordered Swift Dictionary
+/// and can't carry that, so the call site passes `source.columns.compactMap { cols[$0.name] }`
+/// instead of `Array(cols.values)` — `source.columns` is the ordered `[Column]` that order came
+/// from in the first place. Same resolution as the `columns=` landmine in Source.swift: derive
+/// from the ordered array, never from the dictionary's own iteration order.
 private func pandasDtypes(_ cols: [Column]) -> (dtypes: [(String, String)], dates: [String]) {
     var dtypes: [(String, String)] = []
     var dates: [String] = []
-    for c in cols.sorted(by: { $0.name < $1.name }) {
+    for c in cols {
         let t = c.type.uppercased()
         if c.kind == .temporal {
             dates.append(c.name)
@@ -309,7 +310,7 @@ public func snippet(
             : ""
 
         if source.fmt == .csv || source.fmt == .globCsv {
-            let (dtypes, dates) = pandasDtypes(Array(cols.values))
+            let (dtypes, dates) = pandasDtypes(source.columns.compactMap { cols[$0.name] })
             var a = [pyRepr(source.target)]
             if let delim = readArgText(source.readArgs, "delim"), delim != "," {
                 a.append("sep=\(pyRepr(delim))")

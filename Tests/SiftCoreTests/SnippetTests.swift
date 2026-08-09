@@ -72,6 +72,49 @@ private struct Ctx {
     let qs: QuerySpec
 }
 
+// MARK: - pyRepr regression table
+
+// Every pair below is CPython-verified (task-10-report.md's differential section has the full
+// 47-string sweep this is drawn from) — before this test, `pyRepr` had zero direct coverage
+// anywhere in Tests/, only the indirect apostrophe-only and no-quote paths exercised by the
+// dialect tests above. `both ' and "` is the load-bearing case: drop the backslash escape on the
+// chosen quote character and this emits an UNTERMINATED string literal, not merely a
+// wrong-but-valid one — and nothing else in this suite would have caught that.
+@Test(arguments: [
+    ("hello", "'hello'"),
+    ("O'Brien", "\"O'Brien\""),
+    ("say \"hi\"", "'say \"hi\"'"),
+    ("both ' and \"", "'both \\' and \"'"),
+    ("", "''"),
+    ("tab\ttab", "'tab\\ttab'"),
+    ("back\\slash", "'back\\\\slash'"),
+    ("new\nline", "'new\\nline'"),
+    ("carriage\rreturn", "'carriage\\rreturn'"),
+    ("R&D", "'R&D'"),
+    ("it's data.csv", "\"it's data.csv\""),
+    ("nul:\u{0}:end", "'nul:\\x00:end'"),
+    ("del:\u{7F}:end", "'del:\\x7f:end'"),
+    ("nbsp:\u{A0}:end", "'nbsp:\\xa0:end'"),
+    ("line-sep:\u{2028}:end", "'line-sep:\\u2028:end'"),
+    ("para-sep:\u{2029}:end", "'para-sep:\\u2029:end'"),
+    ("emoji: \u{1F600}", "'emoji: \u{1F600}'"),
+    ("cjk: \u{6587}\u{5B57}\u{5217}", "'cjk: \u{6587}\u{5B57}\u{5217}'"),
+    ("euro: \u{20AC}100", "'euro: \u{20AC}100'"),
+] as [(String, String)])
+private func pyReprMatchesCPython(input: String, expected: String) {
+    #expect(pyRepr(input) == expected)
+}
+
+@Test func pyReprOnSQLValuePrimitives() {
+    #expect(pyRepr(SQLValue.null) == "None")
+    #expect(pyRepr(SQLValue.bool(true)) == "True")
+    #expect(pyRepr(SQLValue.bool(false)) == "False")
+    #expect(pyRepr(SQLValue.int(42)) == "42")
+    #expect(pyRepr(SQLValue.double(1.5)) == "1.5")
+    #expect(pyRepr(SQLValue.double(1.0)) == "1.0")
+    #expect(pyRepr(SQLValue.text("O'Brien")) == "\"O'Brien\"")
+}
+
 /// Stands in for `_ctx(con, path)` on a CSV fixture: the args dict mirrors exactly what
 /// `build_source`'s CSV branch always sets (delim/quote/escape/header/skip/ignore_errors/
 /// allow_quoted_nulls), and the columns come from a live DESCRIBE of an auto-detecting
@@ -138,9 +181,33 @@ private func csvCtx(_ con: Connection, path: String, delim: String = ",", size: 
     )
     let out = try snippet(dialect: "pandas", source: ctx.spec, spec: qs, cols: ctx.cols)
     #expect(out.contains("import pandas as pd"))
-    #expect(out.contains("dtype="))
+    // Full string, not just "dtype=" presence — file-column order (order_id, region, amount,
+    // note, matching clean.csv's real header), CPython-verified via task-10-report.md's
+    // differential. A `.sorted(by:)` creeping back into pandasDtypes would still pass a
+    // substring-only check; this is the regression guard for that.
+    #expect(out.contains("dtype={'order_id': 'Int64', 'region': 'string', 'amount': 'float64', 'note': 'string'}"))
     #expect(out.contains(".isin(['West', 'South'])"))
     #expect(out.contains("sort_values('order_id', ascending=False)"))
+}
+
+@Test func pandasSnippetOrdersDtypesAndParseDatesByFileColumnOrderNotAlphabetically() throws {
+    // No committed fixture has two+ temporal columns, so parse_dates ordering was untested on
+    // both sides of the port (see task-10-report.md's review-fix section) — built by hand here.
+    // Deliberately out-of-alphabetical-order names (zulu_when < mike_when < alpha_when would sort
+    // the other way) so a `.sorted(by:)` regression in pandasDtypes fails this immediately.
+    let fileCols = [
+        Column(name: "zulu_when", type: "TIMESTAMP"),
+        Column(name: "id", type: "BIGINT"),
+        Column(name: "mike_when", type: "TIMESTAMP"),
+        Column(name: "region", type: "VARCHAR"),
+        Column(name: "alpha_when", type: "TIMESTAMP"),
+    ]
+    let spec = SourceSpec(
+        key: SourceKey(path: "/tmp/three-temporal.csv", mtimeNs: 0, size: 0), fmt: .csv, readFn: "read_csv",
+        columns: fileCols)
+    let out = try snippet(dialect: "pandas", source: spec, spec: QuerySpec(relation: "t"), cols: colsDict(fileCols))
+    #expect(out.contains("dtype={'id': 'Int64', 'region': 'string'}"))
+    #expect(out.contains("parse_dates=['zulu_when', 'mike_when', 'alpha_when']"))
 }
 
 @Test func pandasWarnsAboutRAMOnABigTextSource() throws {
