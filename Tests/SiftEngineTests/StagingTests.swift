@@ -1,0 +1,447 @@
+import Testing
+import Foundation
+import DuckDBKit
+@testable import SiftCore
+@testable import SiftEngine
+
+// Staging and the staged-data lifecycle. session.py has no `engine/tests/test_staging.py` to port
+// assertion-for-assertion — none of this was ever covered in Python — so these are the Task 6
+// brief's own required scenarios: the cancel hammer (and the single-shot interrupt it replaces),
+// staging as the SECOND step (dwell and aggregate), the row-count-plus-bad-rows rule, byte
+// accounting measured as store growth, the purge policy including the open-tab rule, and unstage.
+//
+// Each test gets its own `~/.sift`-equivalent temp directory, never the real one, for the reason
+// SessionTests.swift states: Swift Testing runs in parallel and DuckDB takes an exclusive lock on
+// the store file. Nothing here is `.serialized`.
+
+private func newSession() throws -> Session {
+    try Session(
+        home: FileManager.default.temporaryDirectory
+            .appendingPathComponent("sift-staging-tests-\(UUID().uuidString)").path
+    )
+}
+
+private func newTempDir() throws -> String {
+    let dir = FileManager.default.temporaryDirectory
+        .appendingPathComponent("sift-staging-\(UUID().uuidString)").path
+    try FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+    return dir
+}
+
+// MARK: - fixtures
+
+/// A CSV comfortably over `stageMinBytes` (25 MB), so the real policy — not `force:` — is what
+/// decides to stage it. Built once for the whole suite: ~30 MB written per test would dominate
+/// the run, and every test that reads it only reads.
+private let bigCSVRows = 300_000
+private let bigCSV: String = {
+    // swiftlint:disable:next force_try — a fixture that cannot be written is not a test failure
+    // this suite can meaningfully report per-test; SessionTests' `try! corpus()` sets the shape.
+    try! makeBigCSV()
+}()
+
+private func makeBigCSV() throws -> String {
+    let path = (try newTempDir() as NSString).appendingPathComponent("big.csv")
+    let regions = ["West", "Midwest", "South", "Northeast"]
+    let padding = String(repeating: "x", count: 64)   // ~100 B/row: 300k rows ≈ 30 MB
+    var text = "order_id,region,amount,note\n"
+    text.reserveCapacity(32 * 1024 * 1024)
+    for i in 0..<bigCSVRows {
+        text += "\(i),\(regions[i % 4]),\(i).50,note \(i) \(padding)\n"
+    }
+    try text.write(toFile: path, atomically: true, encoding: .utf8)
+    return path
+}
+
+/// A small CSV in its own directory, so a test can modify or delete it without disturbing others.
+private func makeSmallCSV(rows: Int = 200) throws -> String {
+    try makeCSV(dir: try newTempDir(), name: "small.csv", rows: rows)
+}
+
+// MARK: - waiting
+
+/// Polls the catalog for a condition instead of sleeping a fixed interval — the background work
+/// here is a real CTAS whose duration depends on the machine.
+@discardableResult
+private func waitFor(
+    _ session: Session, _ name: String, timeout: TimeInterval = 120,
+    _ label: String, until done: @Sendable (Table) -> Bool
+) async throws -> Table {
+    let deadline = Date().addingTimeInterval(timeout)
+    while true {
+        let t = try await session.table(name)
+        if done(t) { return t }
+        if Date() > deadline {
+            let state = "staged=\(t.staged) staging=\(String(describing: t.staging)) "
+                + "error=\(String(describing: t.stagingError))"
+            Issue.record("timed out after \(timeout)s waiting for \(label) on \(name): \(state)")
+            return t
+        }
+        try await Task.sleep(nanoseconds: 20_000_000)
+    }
+}
+
+@discardableResult
+private func waitForStaged(_ session: Session, _ name: String) async throws -> Table {
+    try await waitFor(session, name, "the copy to be published") { $0.staged && $0.staging == nil }
+}
+
+@discardableResult
+private func waitForCatalog(_ session: Session, count: Int) async throws -> [StagedSource] {
+    let deadline = Date().addingTimeInterval(120)
+    while true {
+        let entries = try await session.stagedEntries()
+        if entries.count == count { return entries }
+        if Date() > deadline {
+            Issue.record("timed out waiting for \(count) catalog row(s); saw \(entries.count)")
+            return entries
+        }
+        try await Task.sleep(nanoseconds: 20_000_000)
+    }
+}
+
+/// Ask the session's own store a question through the public SQL path — the only way to see the
+/// DuckDB catalog from outside the actor, since the store file is exclusively locked by it.
+/// `exitSQLMode` afterwards leaves the table exactly as it was found.
+private func introspect(_ session: Session, table: String, _ sql: String) async throws -> [[Cell]] {
+    let page = try await session.runSQL(table, sql: sql, offset: 0, limit: 1000)
+    _ = try await session.exitSQLMode(table)
+    return page.rows
+}
+
+/// 1 if `name` is a real table in the store, 0 if it is a view (or absent) — the difference
+/// staging exists to make.
+private func isNativeTable(_ session: Session, _ probe: String, _ name: String) async throws -> Int {
+    let rows = try await introspect(
+        session, table: probe,
+        "SELECT count(*) FROM duckdb_tables() WHERE table_name = '\(name)'"
+    )
+    guard case .int(let n) = rows[0][0] else { Issue.record("expected an integer"); return -1 }
+    return Int(n)
+}
+
+// MARK: - 🔴 the cancel hammer
+
+@Test func aSingleInterruptIsSwallowedButAStageJobsHammeringIsNot() throws {
+    // The landmine, both halves, against the real library. MEASURED (Plan 1, re-confirmed here):
+    // `duckdb_interrupt` issued BEFORE execution begins is swallowed — the flag is cleared as
+    // execution starts — so Python's single `con.interrupt()` in `cancel` does not port. This is
+    // the test that fails if `StageJob.requestCancel` is ever simplified back to one shot.
+    let con = try Database.inMemory().connect()
+    // ~1 s unimpeded (MEASURED: 0.19 s per 1e8 rows), three orders of magnitude wider than the
+    // 0.000-0.002 s the hammer needs, and short enough not to dominate the suite.
+    let slow = "SELECT count(*) FROM range(500000000) t(i) WHERE i % 7 = 3"
+
+    con.interrupt()                          // single shot, fired before the query starts
+    let survived = try con.query(slow).allRows()
+    #expect(survived.count == 1, "a single pre-execution interrupt must be shown insufficient")
+
+    // Same connection, same query, cancelled the way a staging job is cancelled.
+    let job = StageJob()
+    job.attach(con)
+    job.requestCancel()
+    #expect(job.isCancelled)
+
+    var message = ""
+    do {
+        _ = try con.query(slow).allRows()
+        Issue.record("the query ran to completion despite the hammered interrupt")
+    } catch let error as DuckDBError {
+        message = error.message
+    }
+    #expect(message.contains("INTERRUPT"), "expected an interrupt error; got: \(message)")
+
+    // The window closes, and after it does the connection is usable again — which is what stops
+    // a hammer in flight from killing the swap/count/CHECKPOINT that follow a real CTAS.
+    job.closeInterruptWindow()
+    _ = try con.query("SELECT 1").allRows()
+}
+
+@Test func cancellingAStagingJobLeavesNoCopyAndNoCatalogRow() async throws {
+    let session = try newSession()
+    await session.setStageDwellForTest(3600)     // only the explicit job below may run
+    let t = try await session.openPath(bigCSV)
+
+    let jobID = try await session.stageNow(t.name)
+    #expect(jobID != nil, "a 30 MB CSV is over the threshold, so no force should be needed")
+    #expect(await session.cancel(jobID!) == true)
+
+    let after = try await waitFor(session, t.name, "the job to clear") { $0.staging == nil }
+    #expect(after.staged == false)
+    #expect(after.stagingError == nil, "a cancel is not a failure — the user asked for it")
+    #expect(try await session.stagedEntries().isEmpty)
+    #expect(try await isNativeTable(session, t.name, t.name) == 0, "the view must still be a view")
+    #expect(try await isNativeTable(session, t.name, stagingName(t.name)) == 0,
+            "the half-built copy must be dropped, not left behind")
+}
+
+@Test func cancelIsFalseForAJobThatIsNotRunning() async throws {
+    let session = try newSession()
+    #expect(await session.cancel("stage-999") == false)
+}
+
+// MARK: - staging is the SECOND step, never the first
+
+@Test func theDwellAloneStagesAndRecordsWhatTheCopyCost() async throws {
+    let session = try newSession()
+    await session.setStageDwellForTest(0.05)
+    let t = try await session.openPath(bigCSV)
+
+    let staged = try await waitForStaged(session, t.name)
+    #expect(staged.stageDecision?.stage == true)
+    #expect(staged.rowCount == bigCSVRows)
+    #expect(staged.stagingError == nil)
+    #expect(try await isNativeTable(session, t.name, t.name) == 1, "the view must now be a table")
+    #expect(try await isNativeTable(session, t.name, stagingName(t.name)) == 0,
+            "the staging name must not survive the swap")
+
+    let entries = try await waitForCatalog(session, count: 1)
+    #expect(entries[0].table == t.name)
+    // `realPath`, because `openPath` resolves symlinks before it builds the key — on macOS the
+    // temp directory is one (/var -> /private/var), so the catalog records the resolved form.
+    #expect(entries[0].path == realPath(bigCSV))
+    #expect(entries[0].fmt == "csv")
+    #expect(entries[0].rows == bigCSVRows)
+    #expect(entries[0].sourceMissing == false)
+    #expect(entries[0].sourceChanged == false)
+    // Bytes are the store's growth across the CTAS, not `duckdb_tables.estimated_size` — which is
+    // estimated ROWS (DuckDB155FactsTests' fact9) and would report a number close to 300,000 here.
+    // A real native copy of a 30 MB CSV is megabytes.
+    #expect(entries[0].bytes > 2_000_000, "measured \(entries[0].bytes) B — that is a row count, not bytes")
+    #expect(session.stagedTotalBytes() >= entries[0].bytes)
+    // Paging still works, off the copy this time.
+    let page = try await session.page(t.name, offset: 0, limit: 10)
+    #expect(page.rows.count == 10)
+}
+
+@Test func aDriveByPeekDoesNotPayForTheCopyUntilAnAggregate() async throws {
+    let session = try newSession()
+    await session.setStageDwellForTest(3600)   // the dwell will not fire during this test
+    let t = try await session.openPath(bigCSV)
+
+    // The staging DECISION lands almost immediately; the copy must not.
+    let decided = try await waitFor(session, t.name, "the staging decision") { $0.stageDecision != nil }
+    #expect(decided.stageDecision?.stage == true)
+    try await Task.sleep(nanoseconds: 400_000_000)
+    let peeked = try await session.table(t.name)
+    #expect(peeked.staged == false)
+    #expect(peeked.staging == nil, "a header peek must not start a 20 s copy")
+
+    // An aggregate is the signal that the user is actually working with this table, and it
+    // short-circuits the (here: hour-long) dwell.
+    _ = try await session.setSpec(t.name, filters: [], sort: [])
+    let staged = try await waitForStaged(session, t.name)
+    #expect(staged.rowCount == bigCSVRows)
+}
+
+@Test func stageNowRefusesASmallSourceUnlessForced() async throws {
+    let session = try newSession()
+    let t = try await session.openPath(try makeSmallCSV())
+
+    #expect(try await session.stageNow(t.name) == nil, "well under 25 MB — re-reading beats copying")
+    let refused = try await session.table(t.name)
+    #expect(refused.stageDecision?.stage == false)
+    #expect(refused.staging == nil)
+
+    #expect(try await session.stageNow(t.name, force: true) != nil)
+    let staged = try await waitForStaged(session, t.name)
+    #expect(staged.rowCount == 200)
+    #expect(try await isNativeTable(session, t.name, t.name) == 1)
+}
+
+// MARK: - row counts after the swap
+
+@Test func stagedRowCountAddsBackTheRowsTheParserDropped() async throws {
+    // A compressed CSV always samples only the first 20,480 rows, so a bad value past that window
+    // is invisible to the sniffer and `ignore_errors` silently drops the row — the same fixture
+    // shape SessionTests uses for `gridRowsExcludesBadRowsOnACompressedDirtyCSV`. The materialized
+    // copy therefore holds ONE FEWER row than the file, which is exactly why the staged row count
+    // is the table's own count plus `bad_rows`.
+    let dir = try newTempDir()
+    let plain = try makeCSV(dir: dir, name: "dirty.csv", rows: 25_000, badIntRow: 21_000)
+    let gz = (dir as NSString).appendingPathComponent("dirty.csv.gz")
+    FileManager.default.createFile(atPath: gz, contents: nil)
+    let gzip = Process()
+    gzip.executableURL = URL(fileURLWithPath: "/usr/bin/gzip")
+    gzip.arguments = ["-c"]
+    gzip.standardInput = FileHandle(forReadingAtPath: plain)
+    gzip.standardOutput = FileHandle(forWritingAtPath: gz)
+    try gzip.run()
+    gzip.waitUntilExit()
+
+    let session = try newSession()
+    let t = try await session.openPath(gz)
+    let scanned = try await waitFor(session, t.name, "the bad-row scan") { $0.badRows > 0 }
+    #expect(scanned.badRows == 1)
+    #expect(scanned.rowCount == 25_000)
+
+    _ = try await session.stageNow(t.name, force: true)
+    let staged = try await waitForStaged(session, t.name)
+
+    let physical = try await introspect(session, table: t.name, "SELECT count(*) FROM \(q(t.name))")
+    #expect(physical[0][0] == .int(24_999), "the copy really is a row short")
+    #expect(staged.rowCount == 25_000, "and the reported count adds the dropped row back")
+    #expect(staged.gridRows == 24_999)
+}
+
+// MARK: - failure reporting
+
+@Test func aStagingFailureIsReportedOnTheTable() async throws {
+    let session = try newSession()
+    let path = try makeSmallCSV()
+    let t = try await session.openPath(path)
+    _ = try await waitFor(session, t.name, "the staging decision") { $0.stageDecision != nil }
+
+    // The file disappears out from under the copy — the CTAS cannot read it.
+    try FileManager.default.removeItem(atPath: path)
+    _ = try await session.stageNow(t.name, force: true)
+
+    let failed = try await waitFor(session, t.name, "the failure") { $0.staging == nil && $0.staged == false }
+    #expect(failed.stagingError?.hasPrefix("staging failed:") == true,
+            "a background copy that dies must say so; got \(String(describing: failed.stagingError))")
+    #expect(try await session.stagedEntries().isEmpty, "a failed copy must not be recorded")
+}
+
+// MARK: - the catalog
+
+@Test func lastUsedRoundTripsThroughTheCatalogInTheSameClockFrame() async throws {
+    // `now()` is a TIMESTAMPTZ stored into a naive TIMESTAMP column, so it lands in the session's
+    // LOCAL time; reading it back with a bare `epoch_ms` yields an instant off by the machine's
+    // UTC offset (MEASURED: 5 h on this machine, America/Chicago). Everything downstream compares
+    // it against Swift's `Date()` — the purge cutoff, and any "last used" the UI shows — so the
+    // `::TIMESTAMPTZ` cast in `stagedEntries`/`purgeStagedTables` is load-bearing, not decoration.
+    // (On a machine whose zone IS UTC this test cannot distinguish the two; it is written for the
+    // developer machine and CI, one of which has an offset.)
+    let session = try newSession()
+    let t = try await session.openPath(try makeSmallCSV())
+    _ = try await session.stageNow(t.name, force: true)
+    try await waitForStaged(session, t.name)
+
+    let entries = try await waitForCatalog(session, count: 1)
+    #expect(abs(entries[0].lastUsed.timeIntervalSinceNow) < 300,
+            "last_used came back as \(entries[0].lastUsed), which is not 'a moment ago'")
+    #expect(abs(entries[0].stagedAt.timeIntervalSinceNow) < 300)
+}
+
+@Test func stagedEntriesFlagsAChangedOrMissingSource() async throws {
+    let session = try newSession()
+    let path = try makeSmallCSV()
+    let t = try await session.openPath(path)
+    _ = try await session.stageNow(t.name, force: true)
+    try await waitForStaged(session, t.name)
+    let fresh = try await waitForCatalog(session, count: 1)
+    #expect(fresh[0].sourceChanged == false)
+    #expect(fresh[0].sourceMissing == false)
+
+    try "order_id,region,amount,note\n1,West,1.50,note 1\n".write(
+        toFile: path, atomically: true, encoding: .utf8)
+    let changed = try await session.stagedEntries()
+    #expect(changed[0].sourceChanged == true, "a copy of a file that has since changed is wrong")
+    #expect(changed[0].sourceMissing == false)
+
+    try FileManager.default.removeItem(atPath: path)
+    let missing = try await session.stagedEntries()
+    #expect(missing[0].sourceMissing == true)
+    #expect(missing[0].sourceChanged == false, "a vanished file has no mtime to disagree with")
+}
+
+// MARK: - purge
+
+@Test func purgeNeverYanksATableOutFromUnderAnOpenTab() async throws {
+    let session = try newSession()
+    let t = try await session.openPath(try makeSmallCSV())
+    _ = try await session.stageNow(t.name, force: true)
+    try await waitForStaged(session, t.name)
+    try await waitForCatalog(session, count: 1)
+
+    // `all: true` selects everything there is — and still must not touch an open tab.
+    let held = try await session.purgeStaged(all: true)
+    #expect(held.dropped.isEmpty, "the live catalog wins over the on-disk one")
+    #expect(try await session.stagedEntries().count == 1)
+    #expect(try await isNativeTable(session, t.name, t.name) == 1, "the copy must still be there")
+
+    try await session.closeTable(t.name)
+    let purged = try await session.purgeStaged(all: true)
+    #expect(purged.dropped == [t.name])
+    #expect(try await session.stagedEntries().isEmpty)
+}
+
+@Test func purgeDropsACopyWhoseSourceChangedOnDisk() async throws {
+    let session = try newSession()
+    let path = try makeSmallCSV()
+    let t = try await session.openPath(path)
+    _ = try await session.stageNow(t.name, force: true)
+    try await waitForStaged(session, t.name)
+    try await waitForCatalog(session, count: 1)
+    try await session.closeTable(t.name)
+
+    // Fresh and tiny: neither the age cutoff nor the size budget can select this row. Only the
+    // staleness sweep can — a copy of a file that has since changed is simply wrong.
+    let untouched = try await session.purgeStaged()
+    #expect(untouched.dropped.isEmpty)
+
+    try "order_id,region,amount,note\n1,West,1.50,note 1\n".write(
+        toFile: path, atomically: true, encoding: .utf8)
+    let purged = try await session.purgeStaged()
+    #expect(purged.dropped == [t.name])
+    #expect(try await session.stagedEntries().isEmpty)
+}
+
+@Test func purgeSelectsAgedOutThenOverBudgetAndSkipsWhatIsOpen() throws {
+    // The policy itself, against a bare store: `Session.purgeStagedTables` is `static` precisely
+    // so this needs no live session, no 20 GB of real disk, and no clock manipulation.
+    let db = try Database.inMemory()
+    let con = try db.connect()
+    try con.execute(catalogDDL)
+
+    func insert(_ name: String, bytes: Int, ageDays: Int) throws {
+        _ = try con.query(
+            "INSERT INTO _sift_sources VALUES (?, ?, 0, 0, ?, 'csv', now(), "
+                + "now() - INTERVAL (?) DAY, 0, ?)",
+            [.text("token-\(name)"), .text("/nonexistent/\(name).csv"), .text(name),
+             .int(Int64(ageDays)), .int(Int64(bytes))]
+        )
+    }
+    // `defaultMaxAgeDays` is 14 and `defaultBudgetBytes` is 20 GB.
+    try insert("aged", bytes: 1, ageDays: 30)
+    try insert("older_big", bytes: 15 * 1024 * 1024 * 1024, ageDays: 2)
+    try insert("newer_big", bytes: 15 * 1024 * 1024 * 1024, ageDays: 1)
+
+    // Nothing open: the aged row goes on the clock, and the surviving 30 GB is over the 20 GB
+    // budget, so the least-recently-used of the two survivors is evicted until it fits.
+    let dropped = try Session.purgeStagedTables(con, open: ["newer_big"], tables: nil, all: false)
+    #expect(Set(dropped) == ["aged", "older_big"])
+    #expect(dropped.first == "aged", "age-out is decided before the size check")
+
+    let left = try con.query("SELECT table_name FROM _sift_sources").allRows()
+    #expect(left.count == 1)
+    #expect(left[0][0] == .text("newer_big"))
+
+    // An explicit list is taken as given — no policy, but the open-tab rule still applies.
+    #expect(try Session.purgeStagedTables(
+        con, open: ["newer_big"], tables: ["newer_big"], all: false).isEmpty)
+    #expect(try Session.purgeStagedTables(
+        con, open: [], tables: ["newer_big"], all: false) == ["newer_big"])
+}
+
+// MARK: - unstage
+
+@Test func unstageGoesBackToReadingTheFileInPlace() async throws {
+    let session = try newSession()
+    let t = try await session.openPath(try makeSmallCSV())
+    _ = try await session.stageNow(t.name, force: true)
+    try await waitForStaged(session, t.name)
+    try await waitForCatalog(session, count: 1)
+
+    let back = try await session.unstage(t.name)
+    #expect(back.staged == false)
+    #expect(try await session.stagedEntries().isEmpty, "the catalog row goes with the copy")
+    #expect(try await isNativeTable(session, t.name, t.name) == 0, "a view again, not a table")
+
+    let page = try await session.page(t.name, offset: 0, limit: 10)
+    #expect(page.rows.count == 10, "and the file still reads")
+
+    // Unstaging something that was never staged is a no-op, not an error.
+    let again = try await session.unstage(t.name)
+    #expect(again.staged == false)
+}

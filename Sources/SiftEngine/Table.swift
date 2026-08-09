@@ -13,9 +13,8 @@ import SiftCore
 // `_after_open` port) passes a snapshot of one across an isolation boundary to compute results
 // off the actor.
 
-/// Progress of an in-flight staging job. Not populated by anything in this file — `stage_now`/
-/// `_do_stage` are a later task — but the field exists on `Table` now so that task only adds a
-/// setter, not a type.
+/// Progress of an in-flight staging job. Written by `Session.stageNow` and cleared by whichever
+/// of `applyStaged`/`finishStage` ends the job (Staging.swift).
 public struct StagingProgress: Sendable, Equatable {
     public let jobID: String
     public let state: String
@@ -49,6 +48,12 @@ public struct Table: Sendable {
     public var staged: Bool = false
     public var staging: StagingProgress?
     public var stageDecision: StageDecision?
+    /// Why the last staging job failed, or `nil` if it did not. This is Python's
+    /// `emit({"type": "error", "table": name, "msg": "staging failed: ..."})`: SSE is gone, and
+    /// per Session.swift's header the state change IS the notification — but a background copy
+    /// that dies must still say so somewhere, or the table just silently stays unstaged forever.
+    /// A cancelled job leaves this `nil`; the user asked for that one.
+    public var stagingError: String?
 
     public var profile: [ColumnProfile]?
     public var profiling: Bool = false

@@ -146,9 +146,11 @@ public func dropStagingSQL(_ table: String) -> String {
 
 // ------------------------------------------------------- staged-data lifecycle
 
-/// `@usableFromInline` for the same reason as `stageMinBytes`: `DEFAULT_BUDGET_BYTES` was never
-/// referenced outside stage.py either.
-@usableFromInline let defaultBudgetBytes = 20 * GB
+/// Public, like `defaultMaxAgeDays` below and unlike `stageMinBytes` above: session.py:978 spells
+/// this budget out a second time as a bare `20` (the default of its `SIFT_STAGE_BUDGET_GB`
+/// override), so it IS cross-module in Python — just duplicated rather than imported. SiftEngine
+/// reads this one instead of restating the number.
+public let defaultBudgetBytes = 20 * GB
 /// Public, unlike its two siblings above: `DEFAULT_MAX_AGE_DAYS` IS cross-module in Python
 /// (session.py:980), so SiftEngine will need this one too.
 public let defaultMaxAgeDays = 14

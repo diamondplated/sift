@@ -38,7 +38,14 @@ public struct CSVSniff: Sendable, Equatable {
     public let prompt: String?
 }
 
-private func cellText(_ cell: Cell) -> String {
+/// Not `private`: Staging.swift decodes the `_sift_sources` catalog's VARCHAR columns (a table
+/// name, a path it is about to `stat`) with the same rule and shares this copy. This is the
+/// strict decoder — anything that is not `.text` reads as `""`, which for a path means "no such
+/// file" rather than a plausible-looking `Cell.display` rendering of whatever else came back.
+/// SessionQueries.swift keeps its own, deliberately different `cellText` (falls back to
+/// `display`, for values headed to a panel label rather than to a decision); Task 5's review
+/// looked at the pair and ruled them genuinely different, unlike `cellInt`'s four copies.
+func cellText(_ cell: Cell) -> String {
     if case .text(let s) = cell { return s }
     return ""
 }
@@ -147,7 +154,11 @@ func realPath(_ path: String) -> String {
 /// changing when children are added is the exact invalidation signal glob/Delta sources need
 /// (see `isDeltaDir`'s doc comment on why a raw glob over a Delta table is wrong in the first
 /// place; SourceKey identity is the same idea one level up).
-private func statInfo(_ path: String) throws -> (mtimeNs: Int, size: Int) {
+///
+/// Not `private`: Staging.swift re-stats a staged copy's source to answer "has this file changed
+/// since we copied it" — the same two fields, compared against the same `SourceKey` they were
+/// read into. A throw there means the file is gone, which is a different answer, not an error.
+func statInfo(_ path: String) throws -> (mtimeNs: Int, size: Int) {
     var st = stat()
     guard stat(path, &st) == 0 else {
         throw UnsupportedSource("Cannot read \(path): file not found or not readable")

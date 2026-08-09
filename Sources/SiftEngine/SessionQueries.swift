@@ -193,7 +193,7 @@ extension Session {
             let values: [DistinctPanel.Value] = rows.map { row in
                 let value = row[1]
                 return DistinctPanel.Value(
-                    label: cellText(row[0]), value: value, n: cellInt(row[2]), frac: cellDouble(row[3]),
+                    label: panelLabel(row[0]), value: value, n: cellInt(row[2]), frac: cellDouble(row[3]),
                     selected: selectedValues.contains { cellEquals(value, $0) }
                 )
             }
@@ -455,7 +455,14 @@ public struct BadRowsPanel: Sendable {
 // yet — same "swallow instead of throw" contract as SiftCore.Profile's looseInt/looseFloat: a
 // shape a query should never actually produce degrades rather than throws.
 
-private func cellText(_ cell: Cell) -> String {
+/// The distinct panel's row label. Named `panelLabel`, not `cellText`, only because SourceProbe's
+/// deliberately different `cellText` (strict: anything not `.text` reads as `""`) had to widen to
+/// internal for Staging.swift, and two same-named top-level functions in one module collide even
+/// when one is `private`. The pair stays two functions — Task 5's review looked at them and ruled
+/// them genuinely different, unlike `cellInt`'s four copies: this one falls back to `display`
+/// because a top-N label is a glyph, while the other one's result decides whether a file is
+/// purged.
+private func panelLabel(_ cell: Cell) -> String {
     if case .text(let s) = cell { return s }
     return cell.display
 }

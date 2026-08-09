@@ -100,6 +100,21 @@ public actor Session {
     /// never reused; only `openPath` touches it.
     private var nextOpenGeneration = 0
 
+    // Staging job state (Staging.swift owns every method that touches these; they live here
+    // because Swift extensions cannot add stored properties).
+    //
+    /// Live staging jobs by id, Python's `self.jobs`. A job is registered by `stageNow` and
+    /// removed by whichever of `applyStaged`/`finishStage` ends it, so "not in this dictionary"
+    /// means "not running" — which is exactly what `cancel` reports as `false`.
+    var stageJobs: [String: StageJob] = [:]
+    /// Python's `_job_seq`. Monotonic, never reused.
+    var stageJobSeq = 0
+    /// Python's `STAGE_DWELL_SECONDS`: how long `maybeStageAfterDwell` waits for a sign the user
+    /// is actually working with a table before paying for the copy. A `var` rather than a
+    /// constant purely so tests can shorten or lengthen it (`setStageDwellForTest`) — three real
+    /// seconds of `sleep` in a parallel suite is a flake generator, not a test.
+    var stageDwellSeconds: Double = 3.0
+
     public init(home: String? = nil) throws {
         let resolvedHome = Self.resolveHome(home)
         try Self.ensureHomeDirectory(resolvedHome)
@@ -137,6 +152,11 @@ public actor Session {
 
         let con = try db.connect()
         try con.execute(catalogDDL)
+        // Python's `self.purge_staged(reason="startup")`. Nothing is open yet, so the "never yank
+        // a table out from under an open tab" rule is trivially satisfied — this is where a copy
+        // that aged out, blew the budget, or no longer matches its source gets collected.
+        // `try?`: a store that cannot be purged must not stop the engine from starting.
+        _ = try? Self.purgeStagedTables(con, open: [], tables: nil, all: false)
         self.pagingConnection = con
     }
 
@@ -221,7 +241,11 @@ public actor Session {
 
     /// Real bytes on disk (the store file plus its WAL), not a sum of per-table estimates — the
     /// number that answers "what is this tool holding on to", i.e. the file the user could delete.
-    private nonisolated func dbBytes() -> Int {
+    ///
+    /// Not `private`: Staging.swift measures a staged copy's cost as this number's growth across
+    /// the CTAS, and reads `dbPath` — the store this session actually opened, which is the
+    /// per-PID fallback whenever the shared one was locked — rather than re-deriving the path.
+    nonisolated func dbBytes() -> Int {
         fileSize(dbPath) + fileSize(dbPath + ".wal")
     }
 
@@ -285,6 +309,14 @@ public actor Session {
         t.profile = profile
         tables[name] = t
     }
+
+    /// Test support: shorten (or lengthen) the staging dwell. The same internal-seam trick as
+    /// `setFilteredCountForTest`/`setProfileForTest` above, applied to a clock: a test that
+    /// really slept `stageDwellSeconds` would add three seconds to a parallel suite to prove a
+    /// timer it could prove in 200 ms, and a test that waited on the real deadline would be a
+    /// flake the moment the machine is busy. Both directions matter — one test shortens it to
+    /// watch the dwell fire, another lengthens it to prove an aggregate short-circuits it.
+    func setStageDwellForTest(_ seconds: Double) { stageDwellSeconds = seconds }
 
     /// Safe relation SQL for this table — a quoted name, or the user's wrapped query.
     public nonisolated func relation(_ t: Table) -> String {
@@ -386,9 +418,10 @@ public actor Session {
     /// small, fast, actor-isolated "apply" method rather than mutating shared state directly.
     ///
     /// `compute_profile`'s eager-profile trigger (gated on the size threshold, staged-ness, or a
-    /// columnar format) and `_maybe_stage_after_dwell`'s background staging both slot in right
-    /// after the staging decision below — neither is ported yet (compute_profile and stage_now are
-    /// later tasks), so this pipeline stops at the staging decision.
+    /// columnar format) is the one step of Python's `_after_open` still missing here: Task 5
+    /// ported `compute_profile` itself, but wiring it in would have it race Task 5's own
+    /// `setProfileForTest` seam, so it is left for the plan's own accounting. Background staging
+    /// (`_maybe_stage_after_dwell`) IS wired, below the staging decision, where Python has it.
     ///
     /// `openedAt` is the opened table's identity, carried through to every `apply*` call below so
     /// each one can confirm it is still writing to the SAME open table it was launched for. Python
@@ -419,6 +452,11 @@ public actor Session {
         let free = freeDiskBytes(at: siftHome)
         let decision = shouldStage(fmt: spec.fmt, sizeBytes: spec.key.size, freeBytes: free)
         await applyStageDecision(name, decision, openedAt: openedAt)
+
+        // `needsConfirm` (a source over 20 GB) is the user's call, not a background job's.
+        if decision.stage, !decision.needsConfirm {
+            await maybeStageAfterDwell(name, openedAt: openedAt)
+        }
     }
 
     /// `guard ... t.openedAt == openedAt` below is the fix for a real bug caught in review: a
@@ -705,7 +743,11 @@ func cellInt(_ cell: Cell) -> Int {
 /// directly (matching SourceProbe.swift's preference for the raw syscall over a Foundation
 /// abstraction). Returns 0 on failure rather than throwing: this feeds a staging decision, not a
 /// user-facing operation, and "call it zero free space" fails safe (never stages).
-private func freeDiskBytes(at path: String) -> Int {
+///
+/// Not `private`: `stageNow` re-runs the same decision against the free space at the moment the
+/// copy would actually start, which is Python's ordering too (`_after_open` and `stage_now` both
+/// call `shutil.disk_usage` themselves).
+func freeDiskBytes(at path: String) -> Int {
     var s = statfs()
     guard statfs(path, &s) == 0 else { return 0 }
     return Int(s.f_bavail) * Int(s.f_bsize)
