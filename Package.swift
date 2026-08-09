@@ -30,8 +30,7 @@ let package = Package(
         ),
         .testTarget(
             name: "DuckDBKitTests",
-            dependencies: ["DuckDBKit"],
-            linkerSettings: duckdbLink
+            dependencies: ["DuckDBKit"]
         ),
     ]
 )
