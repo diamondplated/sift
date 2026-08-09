@@ -4,7 +4,8 @@ import Testing
 // SQL generation for the panels: top-N, distinct stats, histogram, the extra profiling scan,
 // and the uncastable/bad-row queries. Ported from the ten tests in engine/tests/test_sqlgen.py
 // that Task 3 did not take (grepped: none of the ten carry @pytest.mark.parametrize, so each
-// becomes exactly one @Test func here — no cases hiding behind a function count).
+// becomes exactly one @Test func here — no cases hiding behind a function count), plus two new
+// tests for badRowsSQL, which has zero Python coverage (review finding I2) — see that section.
 //
 // The invariant under test throughout: identifiers are quoted, values are bound as parameters,
 // except safeType's DuckDB type name — the one deliberate interpolation site, whitelisted.
@@ -109,4 +110,33 @@ private let cols: [String: Column] = Dictionary(uniqueKeysWithValues: colsList.m
     }
     #expect(try safeType("DECIMAL(12,2)") == "DECIMAL(12,2)")
     #expect(try safeType("TIMESTAMP WITH TIME ZONE") == "TIMESTAMP WITH TIME ZONE")
+}
+
+// MARK: - bad_rows_sql
+//
+// Not in engine/tests/test_sqlgen.py — bad_rows_sql has zero Python test coverage (only a call
+// site at engine/session.py:743). These two pin down the behavior verified correct in review
+// (live-executed against a synthetic messy table, output matched the Python original including
+// exact per-row bad_columns values) so a future edit can't silently break it.
+
+@Test func badRowsSQLMixOfCastableAndUncastableColumns() throws {
+    // colsList: region is VARCHAR (text, not castable — excluded); amount/id/ts/ok are checked.
+    let (sql, params) = try badRowsSQL(q("t"), colsList, limit: 50)
+    #expect(sql.contains("SELECT list_filter(["))
+    #expect(sql.contains("x -> x IS NOT NULL) AS bad_columns, *"))
+    // One exact CASE WHEN label, to pin the list_filter shape precisely, not just its presence.
+    #expect(sql.contains(
+        "CASE WHEN (\"amount\" IS NOT NULL AND trim(\"amount\") <> ''"
+            + " AND TRY_CAST(\"amount\" AS DECIMAL(12,2)) IS NULL) THEN 'amount' END"
+    ))
+    #expect(!sql.contains("THEN 'region'"))  // text column: never a bad-cell candidate
+    #expect(sql.contains("\nWHERE ") && sql.contains(" OR "))
+    #expect(params == [.int(50)])
+}
+
+@Test func badRowsSQLWithOnlyUncastableColumnsReturnsEmptyShape() throws {
+    let onlyText = [Column(name: "region", type: "VARCHAR")]
+    let (sql, params) = try badRowsSQL(q("t"), onlyText)
+    #expect(sql == "SELECT * FROM \(q("t")) LIMIT 0")
+    #expect(params.isEmpty)
 }

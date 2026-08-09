@@ -18,14 +18,16 @@ public struct UnknownColumn: Error, Equatable, CustomStringConvertible {
     public var description: String { "unknown column '\(column)'" }
 }
 
-/// Quote a column after checking it exists.
-private func col(_ name: String, _ cols: [String: Column]) throws -> String {
+/// Quote a column after checking it exists. Internal (not private) — SQLGenPanels.swift's
+/// topNSQL/distinctStatsSQL/histogramSQL share this exact existence check rather than keeping a
+/// second copy that could silently drift from it.
+func col(_ name: String, _ cols: [String: Column]) throws -> String {
     guard cols[name] != nil else { throw UnknownColumn(column: name) }
     return q(name)
 }
 
 /// A column coerced to VARCHAR — for ILIKE, emptiness and length checks on any type.
-private func asText(_ name: String, _ cols: [String: Column]) throws -> String {
+func asText(_ name: String, _ cols: [String: Column]) throws -> String {
     "CAST(\(try col(name, cols)) AS VARCHAR)"
 }
 

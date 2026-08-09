@@ -17,23 +17,17 @@ private let nullish: [String] = [
     "nan", "not available", "unknown", ".",
 ]
 
-// MARK: - Column lookup (duplicated in miniature from SQLGen.swift's private `_col`/`_as_text`
-// mirrors: those are file-private and SQLGen.swift is not to be touched beyond one documented
-// carry-over comment, so this file carries its own copies of the same two-line helpers.)
+// MARK: - Column lookup
+//
+// `col`/`asText` (the quoted-identifier and CAST-to-VARCHAR helpers) live in SQLGen.swift and
+// are reused from there — no local copy. `lookupColumn` below is NOT a duplicate of those: it
+// returns the whole `Column`, which histogramSQL needs for `.kind` (temporal vs. not), where
+// `col` only ever returns the quoted name string. One adjacent existence check, not two copies
+// of the same one.
 
 private func lookupColumn(_ name: String, _ cols: [String: Column]) throws -> Column {
     guard let c = cols[name] else { throw UnknownColumn(column: name) }
     return c
-}
-
-/// Quote a column after checking it exists — a typo becomes a clean error, not a binder error.
-private func col(_ name: String, _ cols: [String: Column]) throws -> String {
-    q(try lookupColumn(name, cols).name)
-}
-
-/// A column coerced to VARCHAR — for ILIKE, emptiness and length checks on any type.
-private func asText(_ name: String, _ cols: [String: Column]) throws -> String {
-    "CAST(\(try col(name, cols)) AS VARCHAR)"
 }
 
 // MARK: - Top-N
