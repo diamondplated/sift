@@ -123,8 +123,8 @@ private func detectFormatMatchesExpectation(file: FixtureFile, want: Fmt) throws
 
 // MARK: - estimate_rows / header_byte_offset
 
-@Test func emptyFileDoesNotExplode() {
-    #expect(estimateRows(path: sharedData.empty).rows == 0)
+@Test func emptyFileDoesNotExplode() throws {
+    #expect(try estimateRows(path: sharedData.empty).rows == 0)
 }
 
 // MARK: - supplementary (new tests for ported functions whose ORIGINAL test needed
@@ -174,7 +174,7 @@ private func detectFormatMatchesExpectation(file: FixtureFile, want: Fmt) throws
     // Stands in for test_header_byte_offset_counts_preamble_and_header: sniff_csv is deferred,
     // so the SniffHints it would have produced for weird_csv (preamble=3 junk lines, then a real
     // header — see Fixtures.swift's makeCSV) is supplied directly instead of sniffed.
-    let off = headerByteOffset(path: sharedData.weirdCSV, sniff: SniffHints(skip: 3, header: true))
+    let off = try headerByteOffset(path: sharedData.weirdCSV, sniff: SniffHints(skip: 3, header: true))
     #expect(off > 0)
     let head = FileHandle(forReadingAtPath: sharedData.weirdCSV)!.readData(ofLength: off)
     #expect(head.filter { $0 == 0x0A }.count == 4)   // 3 junk lines + the header

@@ -66,7 +66,7 @@ private func toDBValue(_ v: SQLValue) -> DBValue {
         _ = try whereClause([Filter(col: "nope", op: .eq, values: [.int(1)])], cols)
     }
     #expect(throws: UnknownColumn.self) {
-        _ = try orderBy([("nope", "asc")], cols)
+        _ = try orderBy([QuerySpec.SortTerm(column: "nope", direction: .asc)], cols)
     }
 }
 
@@ -117,7 +117,7 @@ func operatorRendering(f: Filter, wantSQL: String, wantParams: [SQLValue]) throw
 // MARK: - order_by
 
 @Test func orderByIsExplicitAboutNulls() throws {
-    #expect(try orderBy([("amount", "desc")], cols) == "\nORDER BY \"amount\" DESC NULLS LAST")
+    #expect(try orderBy([QuerySpec.SortTerm(column: "amount", direction: .desc)], cols) == "\nORDER BY \"amount\" DESC NULLS LAST")
     #expect(try orderBy([], cols) == "")
 }
 

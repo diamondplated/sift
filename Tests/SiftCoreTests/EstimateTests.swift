@@ -28,7 +28,7 @@ private func firstLineByteCount(_ path: String) -> Int {
 @Test func smallFileIsCountedExactly() throws {
     let dir = try freshTempDir()
     let p = try makeCSV(dir: dir, name: "small.csv", rows: 500)
-    let est = estimateRows(path: p, headerBytes: firstLineByteCount(p))
+    let est = try estimateRows(path: p, headerBytes: firstLineByteCount(p))
     #expect(est.rows == 500)
     #expect(est.confidence == .exact)
 }
@@ -43,7 +43,7 @@ private func firstLineByteCount(_ path: String) -> Int {
     let dir = try freshTempDir()
     let p = try makeCSV(dir: dir, name: "big.csv", rows: 60_000)
     let header = firstLineByteCount(p)
-    let est = estimateRows(path: p, headerBytes: header)   // production chunks/chunkBytes
+    let est = try estimateRows(path: p, headerBytes: header)   // production chunks/chunkBytes
     #expect(est.confidence == .high)
     let err = abs(Double(est.rows) - 60_000) / 60_000
     #expect(err < 0.05, "got \(est.rows) (\(err) off)")
@@ -57,7 +57,7 @@ private func firstLineByteCount(_ path: String) -> Int {
     let dir = try freshTempDir()
     let p = try makeCSV(dir: dir, name: "q.csv", rows: 60_000, quoteNotes: true)
     let header = firstLineByteCount(p)
-    let est = estimateRows(path: p, headerBytes: header)
+    let est = try estimateRows(path: p, headerBytes: header)
     #expect(est.confidence == .low)
     #expect(est.basis.contains("quote characters"))
 }
@@ -71,7 +71,7 @@ private func firstLineByteCount(_ path: String) -> Int {
     let dir = try freshTempDir()
     let p = try makeCSV(dir: dir, name: "one.csv", rows: 60_000, quotedNewlineRow: 30_000)
     let header = firstLineByteCount(p)
-    let est = estimateRows(path: p, headerBytes: header, chunks: 3, chunkBytes: 8192)
+    let est = try estimateRows(path: p, headerBytes: header, chunks: 3, chunkBytes: 8192)
     #expect(est.confidence == .high)     // honest about being unable to know
     #expect(est.rows != 60_000)          // and it is indeed off
 }
@@ -79,7 +79,7 @@ private func firstLineByteCount(_ path: String) -> Int {
 @Test func smallQuotedFileIsNotClaimedExact() throws {
     let dir = try freshTempDir()
     let p = try makeCSV(dir: dir, name: "sq.csv", rows: 300, quotedNewlineRow: 100)
-    let est = estimateRows(path: p, headerBytes: firstLineByteCount(p))
+    let est = try estimateRows(path: p, headerBytes: firstLineByteCount(p))
     #expect(est.confidence == .low)
 }
 
@@ -87,11 +87,11 @@ private func firstLineByteCount(_ path: String) -> Int {
     let dir = try freshTempDir()
     let empty = (dir as NSString).appendingPathComponent("e.csv")
     FileManager.default.createFile(atPath: empty, contents: Data())
-    #expect(estimateRows(path: empty).rows == 0)
+    #expect(try estimateRows(path: empty).rows == 0)
 
     let hdr = (dir as NSString).appendingPathComponent("h.csv")
     try "a,b\n".write(toFile: hdr, atomically: true, encoding: .utf8)
-    let est = estimateRows(path: hdr, headerBytes: 4)
+    let est = try estimateRows(path: hdr, headerBytes: 4)
     #expect(est.rows == 0)
 }
 
@@ -103,7 +103,7 @@ private func firstLineByteCount(_ path: String) -> Int {
     let dir = try freshTempDir()
     let p = (dir as NSString).appendingPathComponent("grouped.csv")
     try String(repeating: "abcdefghi\n", count: 200).write(toFile: p, atomically: true, encoding: .utf8)
-    let est = estimateRows(path: p)
+    let est = try estimateRows(path: p)
     #expect(est.rows == 200)
     #expect(est.confidence == .exact)
     #expect(est.basis == "counted every byte (2,000 B)")
@@ -113,6 +113,20 @@ private func firstLineByteCount(_ path: String) -> Int {
     let dir = try freshTempDir()
     let p = (dir as NSString).appendingPathComponent("nt.csv")
     try "a,b\n1,2\n3,4".write(toFile: p, atomically: true, encoding: .utf8)   // final row has no \n
-    let est = estimateRows(path: p, headerBytes: 4)
+    let est = try estimateRows(path: p, headerBytes: 4)
     #expect(est.rows == 2)
+}
+
+// A path that cannot be read must not produce a number. Before this, a missing file reported
+// `rows: 0` at `.exact` confidence with the basis "file has no data past the header" — which is
+// the correct answer for a real empty file and a fabricated one here — and an unreadable file
+// claimed "sampling found no line breaks" without ever having sampled. Python raises on both.
+@Test func anUnreadablePathThrowsRatherThanReportingAPlausibleZero() throws {
+    let missing = (try freshTempDir() as NSString).appendingPathComponent("nope.csv")
+    #expect(throws: UnsupportedSource.self) { try estimateRows(path: missing) }
+    #expect(throws: UnsupportedSource.self) {
+        try headerByteOffset(path: missing, sniff: SniffHints(skip: 0, header: true))
+    }
+    // But skip <= 0 never opens the file at all, in either language.
+    #expect(try headerByteOffset(path: missing, sniff: SniffHints(skip: 0, header: false)) == 0)
 }

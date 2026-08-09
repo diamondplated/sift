@@ -61,14 +61,14 @@ private let cols: [String: Column] = Dictionary(uniqueKeysWithValues: colsList.m
 // MARK: - histogram_sql
 
 @Test func histogramReusesProfileBoundsSoItIsOnePass() throws {
-    let (sql, params) = try histogramSQL(q("t"), "amount", cols: cols, 0.0, 10.0, 5)
+    let (sql, params) = try histogramSQL(q("t"), "amount", cols: cols, lo: 0.0, step: 10.0, bins: 5)
     #expect(Array(params.prefix(3)) == [.int(5), .double(0.0), .double(10.0)])
     #expect(sql.contains("min(") && sql.contains("max("))  // true per-bucket range for the tooltip
     #expect(!sql.contains("width_bucket"))                 // avoided deliberately for version stability
 }
 
 @Test func histogramUsesEpochMsForTemporal() throws {
-    let (sql, _) = try histogramSQL(q("t"), "ts", cols: cols, 0.0, 10.0, 5)
+    let (sql, _) = try histogramSQL(q("t"), "ts", cols: cols, lo: 0.0, step: 10.0, bins: 5)
     #expect(sql.contains("epoch_ms(\"ts\")"))
 }
 

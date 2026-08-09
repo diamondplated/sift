@@ -88,9 +88,14 @@ public func distinctStatsSQL(
 /// Fixed-width histogram in one pass, reusing lo/step from the cached profile. Per-bucket true
 /// min/max feed the tooltip. Deliberately avoids width_bucket() (cross-version signature drift).
 /// Empty buckets are simply absent; the client fills them.
+///
+/// `lo`/`step`/`bins` are labelled rather than positional: two adjacent unlabelled `Double`s are
+/// transposable at a call site with no compiler complaint, and swapping the histogram's origin
+/// with its bucket width yields a plausible, entirely wrong distribution. They come straight out
+/// of `histogramParams`, which returns them in this order under these names.
 public func histogramSQL(
     _ rel: String, _ colName: String, cols: [String: Column],
-    _ lo: Double, _ step: Double, _ bins: Int, filters: [Filter] = []
+    lo: Double, step: Double, bins: Int, filters: [Filter] = []
 ) throws -> (String, [SQLValue]) {
     let c = try col(colName, cols)
     let column = try lookupColumn(colName, cols)

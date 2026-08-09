@@ -152,10 +152,16 @@ import Testing
     #expect(Op.nullary == expected)
 }
 
-// MARK: - Wire-format fidelity (raw values are read by web/index.html; a case without an
-// explicit raw value silently breaks that contract, e.g. .globCsv would encode as "globCsv").
+// MARK: - Raw-value fidelity
+//
+// Not because web/index.html reads them — that file is deleted in Plan 5, and Types.swift's own
+// comment was corrected to say so while this one was missed. The two live reasons: sqlgen
+// interpolates `f.op` straight into SQL text, so `Op.rawValue` IS the SQL operator; and
+// stage.py's CATALOG_DDL persists `fmt VARCHAR` into ~/.sift/stage.duckdb, which both engines
+// open during the Plan 5 transition, so a changed string breaks an on-disk contract. A case
+// without an explicit raw value silently breaks both — `.globCsv` would encode as "globCsv".
 
-@Test func fmtRawValuesMatchWhatWebIndexHtmlCompares() {
+@Test func fmtRawValuesRoundTripThroughTheStagingCatalog() {
     #expect(Fmt.globParquet.rawValue == "glob_parquet")
     #expect(Fmt.globCsv.rawValue == "glob_csv")
 }

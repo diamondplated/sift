@@ -250,19 +250,27 @@ public struct SniffHints: Sendable, Equatable {
 /// field containing a newline makes line-counting overshoot, and there is no cheap way to tell
 /// how often that happens. The UI shows low-confidence estimates with visible uncertainty
 /// rather than pretending.
+///
+/// `throws` on a path that cannot be opened or stat'd, matching Python, where `os.path.getsize`
+/// and `open()` both raise. It used to swallow both: a missing file reported `rows: 0` with
+/// `.exact` confidence and the basis "file has no data past the header", and an unreadable one
+/// reported "sampling found no line breaks" without ever having sampled. Both are plausible
+/// answers to a question that was never asked, which is the exact failure mode this tool exists
+/// to expose in other people's data.
 public func estimateRows(
     path: String, headerBytes: Int = 0, chunks: Int = 3, chunkBytes: Int = 262_144
-) -> RowEstimate {
-    let size = (try? FileManager.default.attributesOfItem(atPath: path))?[.size] as? Int ?? 0
+) throws -> RowEstimate {
+    guard let handle = FileHandle(forReadingAtPath: path),
+        let size = (try? FileManager.default.attributesOfItem(atPath: path))?[.size] as? Int
+    else {
+        throw UnsupportedSource("Cannot read \(path): file not found or not readable")
+    }
+    defer { try? handle.close() }
+
     let dataBytes = max(0, size - headerBytes)
     if dataBytes <= 0 {
         return RowEstimate(rows: 0, confidence: .exact, basis: "file has no data past the header")
     }
-
-    guard let handle = FileHandle(forReadingAtPath: path) else {
-        return RowEstimate(rows: 0, confidence: .low, basis: "sampling found no line breaks")
-    }
-    defer { try? handle.close() }
 
     // Small enough to read entirely. Even then the answer is only exact if nothing is quoted: a
     // quoted field containing a newline makes physical lines exceed logical rows. Callers should
@@ -327,10 +335,16 @@ private func countBytes(_ byte: UInt8, in data: Data) -> Int {
 }
 
 /// Bytes occupied by skipped rows plus the header, so estimation starts at real data.
-public func headerByteOffset(path: String, sniff: SniffHints) -> Int {
+///
+/// `throws` for the same reason as `estimateRows`: Python's `open()` raises here, and returning
+/// 0 for an unreadable file is indistinguishable from the legitimate "nothing to skip" answer —
+/// which silently makes the header count as a data row in every estimate downstream.
+public func headerByteOffset(path: String, sniff: SniffHints) throws -> Int {
     let skip = sniff.skip + (sniff.header ? 1 : 0)
     if skip <= 0 { return 0 }
-    guard let handle = FileHandle(forReadingAtPath: path) else { return 0 }
+    guard let handle = FileHandle(forReadingAtPath: path) else {
+        throw UnsupportedSource("Cannot read \(path): file not found or not readable")
+    }
     defer { try? handle.close() }
     var seen = 0
     for _ in 0..<skip {
@@ -385,6 +399,26 @@ private func columnsArgValue(_ columns: [Column]) -> String {
 /// With `allVarchar: true`, no casting happens at all — which is how Sift gets the *physical*
 /// row count and finds uncastable cells. It's also the one-click escape hatch when the sniffer
 /// guesses a type wrong.
+///
+/// DELIBERATE DIVERGENCE: `readArgs` render in alphabetical key order, where Python renders them
+/// in `build_source`'s insertion order (delim, quote, escape, header, skip, columns,
+/// ignore_errors, allow_quoted_nulls). This is visible — the copy-as-code duckdb snippet shows
+/// it — so it is a choice, not an oversight:
+///
+///  - It is *only* visible. DuckDB's named table-function arguments are order-free, so every
+///    rendering of the same `readArgs` is the same query. Contrast the `columns=` value below,
+///    where order genuinely decides which type lands on which column.
+///  - Alphabetical is the cheapest *deterministic* order available. `readArgs` is a
+///    `[String: ReadArg]`, and a Swift `Dictionary` has no iteration order at all — rendering it
+///    unsorted would make the snippet differ between two runs of the same session, which is worse
+///    than differing from Python.
+///
+/// The alternative — carrying `[(String, ReadArg)]` to reproduce Python's order exactly — was
+/// rejected: tuples are not `Equatable`, so it needs a new pair type to keep `SourceSpec:
+/// Equatable`, plus every construction site and all three of Snippet.swift's `readArg*` lookups,
+/// for zero semantic gain. This is NOT the ruling Task 10 made for `pandasDtypes`: there an
+/// ordered `[Column]` carrying the file order already existed and was simply not being used, so
+/// using it cost nothing. Here no ordered source exists — one would have to be invented.
 public func readExpr(spec: SourceSpec, allVarchar: Bool = false) -> String {
     var parts: [String] = [qlit(spec.target)]
     for key in spec.readArgs.keys.sorted() {

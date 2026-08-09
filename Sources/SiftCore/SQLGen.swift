@@ -108,11 +108,17 @@ private func whereFragment(
 
 /// ORDER BY with explicit NULLS LAST, so ordering survives a change in engine defaults. Ties on
 /// a non-unique column are still unordered across pages — SiftEngine materializes for that.
-public func orderBy(_ sort: [(String, String)], _ cols: [String: Column]) throws -> String {
+///
+/// Takes `[QuerySpec.SortTerm]`, not Python's `(name, "asc"/"desc")` string pairs. Python has no
+/// choice; Swift does, and this was the only public function here still deciding a direction by
+/// `hasPrefix("d")` while `QuerySpec.sort` was already typed and `renderSQL` already compared
+/// `== .desc`. A stringly direction accepts "descending", "DESC", "d" and "dromedary" alike and
+/// silently sorts ascending for anything else.
+public func orderBy(_ sort: [QuerySpec.SortTerm], _ cols: [String: Column]) throws -> String {
     var terms: [String] = []
-    for (name, direction) in sort {
-        let d = direction.lowercased().hasPrefix("d") ? "DESC" : "ASC"
-        terms.append("\(try col(name, cols)) \(d) NULLS LAST")
+    for term in sort {
+        let d = term.direction == .desc ? "DESC" : "ASC"
+        terms.append("\(try col(term.column, cols)) \(d) NULLS LAST")
     }
     return terms.isEmpty ? "" : "\nORDER BY " + terms.joined(separator: ", ")
 }
@@ -121,8 +127,7 @@ public func pageSQL(
     _ spec: QuerySpec, cols: [String: Column], rel: String, limit: Int, offset: Int
 ) throws -> (String, [SQLValue]) {
     let (w, params) = try whereFragment(spec.filters, cols)
-    let sortTuples = spec.sort.map { ($0.column, $0.direction.rawValue) }
-    let sql = "SELECT *\nFROM \(rel)\(w)\(try orderBy(sortTuples, cols))\nLIMIT ? OFFSET ?"
+    let sql = "SELECT *\nFROM \(rel)\(w)\(try orderBy(spec.sort, cols))\nLIMIT ? OFFSET ?"
     return (sql, params + [.int(Int64(limit)), .int(Int64(offset))])
 }
 
