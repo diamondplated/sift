@@ -43,13 +43,9 @@ private func runUnzip(path: String, entry: String) throws -> Data {
 
     guard process.terminationStatus == 0 else {
         let msg = String(data: errData, encoding: .utf8) ?? "unzip exited \(process.terminationStatus)"
-        throw UnsupportedSource("could not read \(entry) from \(basenameForXLSX(path)): \(msg)")
+        throw UnsupportedSource("could not read \(entry) from \(pathName(path)): \(msg)")
     }
     return outData
-}
-
-private func basenameForXLSX(_ path: String) -> String {
-    (path as NSString).lastPathComponent
 }
 
 // MARK: - XML parsing (never regex — see the file header)

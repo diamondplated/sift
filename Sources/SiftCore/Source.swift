@@ -32,38 +32,19 @@ public struct TimeTravelUnsupported: SiftError, Equatable {
     public init() {}
 }
 
-// MARK: - path helpers (local, deliberate duplicates of Ident.swift's private ones — see
-// Source.swift's header note in the task report for why: Ident.swift is not to be modified,
-// and its `pathName`/`pathSuffix`/`pathStem` are `private` to that file.)
-
-/// Mirrors `os.path.basename`: the final path component, trailing slashes stripped first
-/// (a folder picker hands directory names with a trailing "/").
-private func basename(_ path: String) -> String {
-    var trimmed = path
-    while trimmed.hasSuffix("/") { trimmed.removeLast() }
-    guard let idx = trimmed.lastIndex(of: "/") else { return trimmed }
-    return String(trimmed[trimmed.index(after: idx)...])
-}
-
-/// Mirrors `pathlib.Path(...).suffix`: the final ".ext" of the last path component, or "" if
-/// there is none (a leading dot with nothing before it, or a trailing dot with nothing after,
-/// does not count as an extension).
-private func suffix(_ path: String) -> String {
-    let name = basename(path)
-    guard let dotIdx = name.lastIndex(of: "."), dotIdx != name.startIndex,
-        name.index(after: dotIdx) != name.endIndex
-    else { return "" }
-    return String(name[dotIdx...])
-}
+// MARK: - path helpers
+//
+// `pathName`/`pathSuffix`/`pathStem` come from Ident.swift — this file used to carry its own
+// line-for-line copy of the first two. See the note above them there, including the lone-"."
+// component gap that had quietly been duplicated into both copies.
 
 /// Return (data extension, is_compressed), seeing through a compression suffix. Mirrors
 /// source.py's `_ext_chain`.
 private func extChain(_ path: String) -> (ext: String, compressed: Bool) {
-    let suf = suffix(path).lowercased()
+    let name = pathName(path)
+    let suf = pathSuffix(name).lowercased()
     guard compressionExt.contains(suf) else { return (suf, false) }
-    let name = basename(path)
-    let stem = String(name.dropLast(suf.count))
-    return (suffix(stem).lowercased(), true)
+    return (pathSuffix(pathStem(name)).lowercased(), true)
 }
 
 // MARK: - format detection
@@ -124,7 +105,7 @@ public func detectFormat(_ path: String) throws -> Fmt {
         if hasAnyFile(under: path, extensions: parquetExt) { return .globParquet }
         if hasAnyFile(under: path, extensions: csvExt) { return .globCsv }
         throw UnsupportedSource(
-            "\(basename(path)) is a folder with no .parquet or .csv files in it."
+            "\(pathName(path)) is a folder with no .parquet or .csv files in it."
         )
     }
 
@@ -141,7 +122,7 @@ public func detectFormat(_ path: String) throws -> Fmt {
         // OLE2 container: legacy .xls (or .doc/.ppt). read_xlsx cannot touch it, and there is
         // no Swift equivalent of openpyxl or xlrd for a format on its way out.
         throw LegacyXls(
-            "\(basename(path)) is a legacy .xls file. Open it and re-save as .xlsx — "
+            "\(pathName(path)) is a legacy .xls file. Open it and re-save as .xlsx — "
                 + "Sift reads the modern format only."
         )
     }
@@ -149,7 +130,7 @@ public func detectFormat(_ path: String) throws -> Fmt {
         // A zip container. .xlsx is the case we care about; anything else is not tabular.
         let (ext, _) = extChain(path)
         if xlsxExt.contains(ext) { return .xlsx }
-        throw UnsupportedSource("\(basename(path)) looks like a zip archive, not a data file.")
+        throw UnsupportedSource("\(pathName(path)) looks like a zip archive, not a data file.")
     }
 
     let (ext, _) = extChain(path)
@@ -158,7 +139,7 @@ public func detectFormat(_ path: String) throws -> Fmt {
     if jsonExt.contains(ext) { return .json }
     if xlsxExt.contains(ext) { return .xlsx }
     if xlsExt.contains(ext) {
-        throw LegacyXls("\(basename(path)) is a legacy .xls file. Re-save it as .xlsx.")
+        throw LegacyXls("\(pathName(path)) is a legacy .xls file. Re-save it as .xlsx.")
     }
     if csvExt.contains(ext) { return .csv }
 

@@ -21,9 +21,24 @@ public func qlit(_ value: String) -> String {
     "'" + value.replacingOccurrences(of: "'", with: "''") + "'"
 }
 
+// MARK: - path helpers
+//
+// Module-internal, not private: Source.swift needs exactly these three and used to carry a
+// line-for-line copy of them. The copy was justified by "Ident.swift is not to be modified" — a
+// task-brief constraint that was later withdrawn for `col`/`asText` and pre-decided against for
+// `grouped`, and it had already cost the gap noted on `pathName` below existing twice and being
+// documented in neither. One copy, one place to fix it.
+//
+// KNOWN GAP, shared by all callers: `pathlib` *drops* "." path components before taking `.name`,
+// and these do not — `Path("a/.").name` is "a" in Python and "." here (Python's own
+// `os.path.basename` agrees with the Swift). Reachable only if a caller skips the
+// `os.path.realpath` that `build_source` does first, which collapses "/data/." to "/data" before
+// any of this runs; the visible symptom would be a refusal message naming "." instead of the
+// folder. Left as-is deliberately rather than special-cased on a path that cannot occur.
+
 /// The last path component, mirroring pathlib.Path(...).name: trailing and repeated slashes
 /// are normalized away first (a folder picker hands directory names with a trailing "/").
-private func pathName(_ path: String) -> String {
+func pathName(_ path: String) -> String {
     var trimmed = path
     while trimmed.hasSuffix("/") { trimmed.removeLast() }
     guard let idx = trimmed.lastIndex(of: "/") else { return trimmed }
@@ -33,7 +48,7 @@ private func pathName(_ path: String) -> String {
 /// Mirrors pathlib.Path(...).suffix: the final ".ext", or "" if the name has no extension
 /// (a leading dot with nothing before it, e.g. ".csv", or a trailing dot with nothing after
 /// it, e.g. "file.", does not count as an extension).
-private func pathSuffix(_ name: String) -> String {
+func pathSuffix(_ name: String) -> String {
     guard let dotIdx = name.lastIndex(of: "."), dotIdx != name.startIndex,
         name.index(after: dotIdx) != name.endIndex
     else { return "" }
@@ -41,7 +56,7 @@ private func pathSuffix(_ name: String) -> String {
 }
 
 /// Mirrors pathlib.Path(...).stem: the name with its final suffix (if any) removed.
-private func pathStem(_ name: String) -> String {
+func pathStem(_ name: String) -> String {
     let suffix = pathSuffix(name)
     return suffix.isEmpty ? name : String(name.dropLast(suffix.count))
 }
