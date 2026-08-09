@@ -67,8 +67,121 @@ import Foundation
     } catch let error as DuckDBError {
         message = error.message
     }
-    #expect(message.contains("httpfs") || message.contains("HTTPFileSystem"),
-            "expected hardening to refuse the read; got: \(message)")
+    // Pinned to the extension guard's exact message, not to "httpfs OR HTTPFileSystem":
+    // the loose form passes in three of the four states, including extension-guard-only,
+    // which would let the disabled_filesystems layer rot away unnoticed.
+    #expect(message.contains("requires the extension httpfs"),
+            "expected the extension guard to refuse the read; got: \(message)")
+}
+
+@Test func disabledFilesystemsReachesConnectionsOpenedAfterIt() throws {
+    // Layer 2 of the pair, and the property the whole design rests on: the setting is
+    // GLOBAL, so it binds connections opened later — including every per-unit-of-work
+    // connection the engine will make. Needs no network and no extension, so it tests the
+    // half the httpfs test above can never reach (httpfs never loads, so
+    // disabled_filesystems is never consulted on that path). Design spec §11: the two are
+    // complementary layers, not belt and braces.
+    //
+    // A throwaway Database, because disabling the local filesystem is not something the
+    // real harden() does — LocalFileSystem is the entire product.
+    let db = try Database.inMemory()
+    try db.connect().execute("SET disabled_filesystems='LocalFileSystem'")
+
+    var message = ""
+    do {
+        _ = try db.connect().query("SELECT * FROM read_csv_auto('/etc/hosts')").allRows()
+        Issue.record("a local read succeeded on a connection opened after the setting")
+    } catch let error as DuckDBError {
+        message = error.message
+    }
+    // MEASURED: current_setting('disabled_filesystems') reads back EMPTY even on the
+    // connection that set it, so behavior is the only honest assertion here.
+    #expect(message.contains("has been disabled by configuration"),
+            "expected the filesystem guard to refuse the read; got: \(message)")
+}
+
+@Test func hardenRecordsWhatItActuallyApplied() throws {
+    // harden() is non-fatal by design, which used to mean it was also unobservable: four
+    // `try?` calls and no caller could tell whether any of them landed. A DuckDB rename
+    // would have silently removed a security layer. MEASURED: a typo'd setting throws
+    // `Catalog Error: unrecognized configuration parameter`, so the signal was there to
+    // be kept.
+    let db = try Database.inMemory()
+    db.harden()
+    #expect(db.hardened == ["disabled_filesystems": true,
+                            "autoinstall_known_extensions": true,
+                            "autoload_known_extensions": true,
+                            "allow_community_extensions": true])
+}
+
+@Test func loadExtensionsRejectsANameThatCarriesSQL() throws {
+    // LOAD takes no bound parameters, so the name is interpolated. MEASURED before the
+    // guard: this exact call created evil.db, attached it, and recorded the whole string
+    // as successfully loaded.
+    let dir = FileManager.default.temporaryDirectory
+        .appendingPathComponent("sift-load-\(UUID().uuidString)")
+    try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: dir) }
+    let evil = dir.appendingPathComponent("evil.db")
+
+    let db = try Database.inMemory()
+    let injected = "httpfs; ATTACH '\(evil.path)'"
+    db.loadExtensions([injected])
+
+    #expect(db.loadedExtensions[injected] == false)
+    #expect(!FileManager.default.fileExists(atPath: evil.path),
+            "loadExtensions executed the injected ATTACH")
+    #expect(Database.isExtensionName("httpfs"))
+    #expect(Database.isExtensionName("_x9"))
+    #expect(!Database.isExtensionName(""))
+    #expect(!Database.isExtensionName("HTTPFS"))
+    #expect(!Database.isExtensionName("9lives"))
+    #expect(!Database.isExtensionName("http fs"))
+    #expect(!Database.isExtensionName("httpfs\n"))
+}
+
+@Test func loadExtensionsRecordsAMissingExtensionAsFailed() throws {
+    // The dictionary this writes is what spec §11 turns into a policy decision: a missing
+    // `delta` extension must refuse the open rather than degrade to a parquet glob. It was
+    // entirely untested, LOAD→INSTALL→LOAD fallback included.
+    let db = try Database.inMemory()
+    db.harden()
+    db.loadExtensions(["not_a_real_extension"])
+    #expect(db.loadedExtensions["not_a_real_extension"] == false)
+}
+
+/// `Connection` is deliberately not Sendable — one unit of work, one connection. `interrupt()`
+/// is the documented exception: it is the cancel path, and it exists to be called from
+/// somewhere other than the task running the query. This box says that out loud rather than
+/// papering over it at the call site.
+private struct Interrupter: @unchecked Sendable {
+    let con: Connection
+    func fire() { con.interrupt() }
+}
+
+@Test func interruptCancelsAQueryAlreadyInFlight() throws {
+    // Spec §6 keeps both halves of today's cancel mechanism, and this is the half that
+    // reaches a query already running. It could have been a no-op, or bound to the wrong
+    // handle, and all 41 tests stayed green.
+    let con = try Database.inMemory().connect()
+    let box = Interrupter(con: con)
+    let done = DispatchSemaphore(value: 0)
+    // Fires in a loop rather than once: the interrupt flag is cleared when a query begins,
+    // so a single call racing ahead of execution is swallowed. No sleeps — the semaphore is
+    // the stop signal, and the count below runs ~4 s unimpeded (MEASURED: 0.19 s per 1e8
+    // rows), a window four orders of magnitude wider than the interrupt needs.
+    let spinner = Thread { while done.wait(timeout: .now()) == .timedOut { box.fire() } }
+    spinner.start()
+    defer { done.signal() }
+
+    var message = ""
+    do {
+        _ = try con.query("SELECT count(*) FROM range(2000000000) t(i) WHERE i % 7 = 3").allRows()
+        Issue.record("the query ran to completion despite interrupt()")
+    } catch let error as DuckDBError {
+        message = error.message
+    }
+    #expect(message.contains("INTERRUPT"), "expected an interrupt error; got: \(message)")
 }
 
 @Test func blobDisplayMatchesThePythonEngineFormat() {
