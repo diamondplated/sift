@@ -5,6 +5,8 @@ import Foundation
 /// which is why this is `@unchecked Sendable` while `Connection` is not.
 public final class Database: @unchecked Sendable {
     private var handle: duckdb_database?
+    // loadedExtensions is written only during configure-time (harden/loadExtensions)
+    // and read afterwards, making the unsynchronized dictionary safe on @unchecked Sendable.
     public private(set) var loadedExtensions: [String: Bool] = [:]
 
     public init(path: String) throws {
@@ -13,6 +15,8 @@ public final class Database: @unchecked Sendable {
         // Tested against DuckDBSuccess, never against the failure enum: that member
         // imports into Swift as `DuckDBError`, which collides with our own error type.
         let state = duckdb_open_ext(path, &db, nil, &errPtr)
+        // duckdb_open_ext leaves *out_database untouched on failure, so not calling
+        // duckdb_close before throwing is correct—measured against the vendored dylib.
         if state != DuckDBSuccess {
             let msg = errPtr.map { String(cString: $0) } ?? "could not open \(path)"
             if let errPtr { duckdb_free(errPtr) }
