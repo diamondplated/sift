@@ -89,6 +89,18 @@ each, and it is the single most valuable property to carry across.
 
 `SiftEngine` inherits the other half: it is the **only** module holding mutable state.
 
+**Every module above is a library target except `SiftApp` and `sift`.** This is a hard
+SwiftPM constraint, not a preference: **a test target cannot import an
+`executableTarget`.** Anything that lands in `SiftApp` is permanently untestable, so
+`SiftApp` holds `@main`, menu wiring, and LaunchServices plumbing — nothing else. Every
+decision, every transformation, every piece of state goes in a library beneath it.
+
+This is precisely how latent ended up with `pv-pipeline`: its `PhotoViewerApp` is an
+executable target carrying a 678-line `AppState.swift`, which its test targets cannot
+reach. The `sift` CLI plays the same role here — but the CLI is a *supplement* to
+library-target tests, never a substitute for them. If a behavior can only be verified
+through the CLI, it is in the wrong module.
+
 ### Module dependency graph
 
 ```
