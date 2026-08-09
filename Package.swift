@@ -21,6 +21,7 @@ let package = Package(
     products: [
         .library(name: "DuckDBKit", targets: ["DuckDBKit"]),
         .library(name: "SiftCore", targets: ["SiftCore"]),
+        .library(name: "SiftEngine", targets: ["SiftEngine"]),
     ],
     targets: [
         .systemLibrary(name: "CDuckDB", path: "Sources/CDuckDB"),
@@ -39,6 +40,18 @@ let package = Package(
             name: "SiftCoreTests",
             dependencies: ["SiftCore", "DuckDBKit"],
             resources: [.copy("Fixtures")]
+        ),
+        // The connection-needing half of core/source.py (and, later in this plan, session.py).
+        // No linkerSettings here: DuckDBKit's rpath flags already propagate transitively through
+        // this target's dependency on it, and a duplicate `-Xlinker -rpath` emits
+        // `ld: warning: duplicate -rpath`.
+        .target(
+            name: "SiftEngine",
+            dependencies: ["SiftCore", "DuckDBKit"]
+        ),
+        .testTarget(
+            name: "SiftEngineTests",
+            dependencies: ["SiftEngine", "SiftCore", "DuckDBKit"]
         ),
     ]
 )
