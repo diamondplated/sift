@@ -177,11 +177,16 @@ private func gzip(_ sourcePath: String, to destPath: String) throws {
     #expect(page1.total.value == 250)
     #expect(page1.total.unfiltered == 1000)
 
-    // Past the filtered count: zero rows, but the SAME cached total — proving the count query ran
-    // once for this spec, not once per page.
-    let page2 = try await session.page(t.name, offset: 500, limit: 500)
-    #expect(page2.rows.isEmpty)
-    #expect(page2.total.value == 250)
+    // Overwrite the cache with an impossible sentinel. This is the part that actually proves
+    // caching: without it, deleting the `t.filteredCount == nil` guard in page() still passes
+    // both assertions above (the data never changes, so a recount also returns 250). If page()
+    // recomputed the count, the real value (250) would come back and clobber the sentinel; if it
+    // truly reads the cache, the sentinel survives untouched.
+    await session.setFilteredCountForTest(t.name, 999_999)
+    let page2 = try await session.page(t.name, offset: 0, limit: 500)
+    #expect(page2.total.value == 999_999)
+    let after = try await session.table(t.name)
+    #expect(after.filteredCount == 999_999)
 }
 
 // MARK: - ~/.sift permissions (§11 frozen contract)
@@ -269,17 +274,17 @@ private func gzip(_ sourcePath: String, to destPath: String) throws {
     #expect(FileManager.default.fileExists(atPath: unrelated), "a non-matching filename is never touched")
 }
 
-// MARK: - sortedRelation survives across page()'s per-call Connection
+// MARK: - sortedRelation's TEMP TABLE survives across separate page() calls
 //
-// A regression test for the MEASURED discovery in Session.swift's header: a `TEMP TABLE` created
-// on one `Connection` is invisible to a different `Connection` on the same database file, so a
-// naive port of `_sorted_relation` (which materializes via `TEMP TABLE`) would work on the FIRST
-// sorted page and throw "Catalog Error: ... does not exist" on the second, since `page()` opens a
-// fresh `Connection` every call. `sortedPagesNeverDuplicateOrDropARowAcrossOffsets` above already
-// pages a sorted table more than once and would fail exactly that way if this regressed; this
-// test isolates the mechanism (three page() calls, the smallest number that proves "more than
-// once") rather than relying on that test's stability assertion to catch it as a side effect.
-@Test func sortedRelationSurvivesMultiplePageCallsEachWithItsOwnConnection() async throws {
+// A regression test for the fact `page`/`sortedRelation`/`closeTable` sharing one long-lived
+// `pagingConnection` (Session.swift's header, fact 3) exists to guarantee: a `TEMP TABLE` is
+// visible only to the connection that created it, so if `page()` ever went back to opening a
+// fresh `Connection` per call, this would throw "Catalog Error: ... does not exist" on the
+// SECOND sorted page. `sortedPagesNeverDuplicateOrDropARowAcrossOffsets` above already pages a
+// sorted table more than once and would fail the same way if this regressed; this test isolates
+// the mechanism (three page() calls, the smallest number that proves "more than once") rather
+// than relying on that test's stability assertion to catch it as a side effect.
+@Test func sortedRelationSurvivesAcrossMultiplePageCalls() async throws {
     let session = try newSession()
     let t = try await session.openPath(sharedData.cleanCSV)
     await session.replaceQuerySpec(
@@ -290,4 +295,44 @@ private func gzip(_ sourcePath: String, to destPath: String) throws {
     _ = try await session.page(t.name, offset: 10, limit: 10)   // would throw if the sort didn't survive
     let third = try await session.page(t.name, offset: 20, limit: 10)
     #expect(third.rows.count == 10)
+}
+
+// MARK: - preserve_insertion_order (Minor 1): sortedRelation's correctness rests on this default
+
+@Test func preserveInsertionOrderDefaultsOn() throws {
+    // sortedRelation's whole correctness rests on a materialized table's physical scan order
+    // matching its `CREATE TABLE AS SELECT ... ORDER BY` order. MEASURED with the setting
+    // explicitly forced off, at a scale where ties are common enough to matter (500k rows,
+    // the same page() sequence sortedPagesNeverDuplicateOrDropARowAcrossOffsets runs): 123,608
+    // duplicated rows and 170,820 missing. At that test's actual scale (1000 rows) the collapse
+    // would likely go unnoticed, so if this setting were ever flipped off — a future `harden()`
+    // change, say — the product would silently duplicate and drop rows with no test catching it.
+    // Sift never sets this itself; pinning DuckDB's own default here is a fast, direct guard,
+    // independent of Session/Database plumbing (any connection reports the same default).
+    let con = try Database.inMemory().connect()
+    let value = try con.query("SELECT current_setting('preserve_insertion_order')").allRows()[0][0]
+    #expect(value == .bool(true))
+}
+
+// MARK: - a closed-and-reopened table must not inherit a stale background result (review C1)
+
+@Test func closeAndReopenRejectsAStaleBackgroundResult() async throws {
+    // Reproduces the scenario from review: open a table, close it, reopen a DIFFERENT table
+    // under the SAME name, then simulate the closed table's background scan finishing late and
+    // trying to write its result. `runAfterOpen`'s `apply*` calls are keyed by name only, so
+    // without the `openedAt` guard this silently overwrites the reopened table's real values —
+    // MEASURED against the pre-fix build with a real 3,000,000-row/10-row pair: the 10-row table
+    // reported `rowCount: 3000000`. This test exercises the guard directly rather than racing a
+    // real background scan, which is not reliably reproducible at unit-test speed.
+    let session = try newSession()
+    let first = try await session.openPath(sharedData.cleanCSV, name: "clean")
+    try await session.closeTable("clean")
+    let second = try await session.openPath(sharedData.cleanCSV, name: "clean")
+    #expect(first.openedAt != second.openedAt)
+
+    await session.applyCount("clean", 3_000_000, openedAt: first.openedAt)
+
+    let after = try await session.table("clean")
+    #expect(after.rowCount == second.rowCount)
+    #expect(after.rowCount != 3_000_000)
 }

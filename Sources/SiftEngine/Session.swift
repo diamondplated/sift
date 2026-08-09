@@ -15,40 +15,46 @@ import SiftCore
 // Concurrency, in three facts (replacing Python's own docstring, which described a single
 // DuckDBPyConnection guarded by cursors and a thread pool):
 //   1. One `DuckDBKit.Database` is opened at launch, against `~/.sift/stage.duckdb`.
-//   2. Every unit of work takes its own `Connection` — the direct analogue of Python's
-//      `con.cursor()`. `Connection` is deliberately not `Sendable` and never crosses a task
-//      boundary.
-//   3. `Session` is an `actor`. It owns the catalog. `openPath`'s initial work (build the spec,
-//      register the table, create the view) and `page` run directly on the actor with their own
-//      throwaway `Connection` — both are meant to be interactive-latency, matching Python running
-//      them in the request-handling thread rather than the background pool. Only `_after_open`'s
-//      background work (exact count, bad-row detection, staging decision) is genuinely slow, so
-//      it alone becomes a detached `Task` that creates its own `Connection` off the actor and
-//      calls back with small, fast, actor-isolated "apply" methods.
+//   2. `openPath`'s initial work (build the spec, create the view) and `_after_open`'s background
+//      pipeline each take their own throwaway `Connection` — the direct analogue of Python's
+//      `con.cursor()` for one-shot work. `Connection` is deliberately not `Sendable` and never
+//      crosses a task boundary.
+//   3. `page`, `sortedRelation` and `closeTable` share ONE long-lived `Connection`
+//      (`pagingConnection`), for as long as the `Session` exists, instead of opening a fresh one
+//      per call. This is not a stylistic choice — MEASURED (see `sortedRelation`'s doc comment):
+//      a `CREATE TEMP TABLE` created on one `duckdb_connect()` connection is invisible to a
+//      `SELECT` on a different one, even against the same file, so a materialized sort must be
+//      read back through the SAME connection that created it across however many `page()` calls
+//      follow. Safe to share despite `Connection` not being `Sendable`: none of `page`,
+//      `sortedRelation` or `closeTable` ever awaits anything (verified by reading them — every
+//      DuckDB call inside is synchronous), so the actor's serial executor guarantees exactly one
+//      of them runs at a time and `pagingConnection` never sees two callers at once. `openPath`'s
+//      initial half and `_after_open`'s background pipeline still open a fresh `Connection` each
+//      time (fact 2) — they never touch a materialized sort, so they have no reason to share one.
+//
+// `Session` is an `actor`; it owns the catalog. `openPath`'s initial work and `page` run directly
+// on the actor — both are meant to be interactive-latency, matching Python running them in the
+// request-handling thread rather than the background pool. Only `_after_open`'s background work
+// (exact count, bad-row detection, staging decision) is genuinely slow, so it alone becomes a
+// detached `Task` that creates its own `Connection` off the actor and calls back with small, fast,
+// actor-isolated "apply" methods — each one checked against the `Table.openedAt` it was launched
+// for (see `runAfterOpen`'s doc comment), so a result from a closed-and-reopened table's stale
+// background scan can never land on the new table sharing its name.
 //
 // SSE (`attach_loop`/`subscribe`/`unsubscribe`/`emit`) is deleted, per the design spec: in-process,
 // a property change on an actor a SwiftUI-facing observer wraps IS the notification. Every call
 // site below that would have been `self.emit(...)` in Python is simply the state mutation itself,
 // with a comment where useful.
-//
-// MEASURED, and the one place "every unit of work gets its own Connection" does NOT map onto
-// Python's `con.cursor()` the way the rest of this file assumes: a `CREATE TEMP TABLE` on one
-// `duckdb_connect()` connection is invisible to a `SELECT` on a different one, even against the
-// same file — confirmed directly (`Database(path:).connect()` twice, TEMP created on the first,
-// queried on the second: `Catalog Error: Table with name ... does not exist`; a plain
-// `CREATE TABLE` in the same setup IS visible on the second connection). Python's `cursor()`
-// shares its parent connection's session, so `_sorted_relation`'s materialized copy survives
-// across the many separate cursors `page()` opens across calls — the C API's `duckdb_connect`
-// does not share that session, so a literal port using `TEMP TABLE` breaks the instant a second
-// `page()` call (its own fresh `Connection`, per this file's whole design) tries to read the
-// first call's materialized sort. `sortedRelation` below uses a plain table instead — see its own
-// comment for the follow-on consequence (a startup sweep) that choice requires.
 
 /// Default page size for `Session.page`.
 public let pageRows = 500
 
-/// Above this many rows, `sortedRelation` does not materialize a sorted copy — see its own
-/// comment for why a copy is wanted at all below the threshold.
+/// The materialized copy `sortedRelation` builds is capped at this many rows — ported verbatim
+/// from Python's identical `LIMIT` in `_sorted_relation`, which has the same cap and the same
+/// consequence: a sort over more rows than this silently truncates the materialized copy, so
+/// pages past row `sortMaterializeMax` come back empty and `visibleRows` still reports the full
+/// (untruncated) count. Not fixed here — inherited as-is; see task-4-report.md's Minor-review
+/// notes for the call on whether it needs its own fix.
 let sortMaterializeMax = 5_000_000
 
 /// Extensions Sift loads at startup. Mirrors Python's module-level `_EXTENSIONS`.
@@ -77,6 +83,12 @@ public actor Session {
     /// the detached background pipeline in `runAfterOpen` reach it without an actor hop — the
     /// whole point of that path being detached in the first place.
     nonisolated let database: Database
+    /// The one `Connection` shared by `page`, `sortedRelation` and `closeTable` — see this file's
+    /// header (fact 3) for why it must be a single long-lived connection rather than one per call,
+    /// and why sharing it is safe despite `Connection` not being `Sendable`. Actor-isolated, not
+    /// `nonisolated`: unlike `database`, `Connection` isn't `Sendable`, so it must never be reached
+    /// from outside the actor (in particular, never from `runAfterOpen`'s detached pipeline).
+    let pagingConnection: Connection
 
     var tables: [String: Table] = [:]
     /// Per-table mutex a later task's staging swap-retry loop will lock from its own background
@@ -122,7 +134,7 @@ public actor Session {
 
         let con = try db.connect()
         try con.execute(catalogDDL)
-        Self.sweepOrphanedSortTables(con)
+        self.pagingConnection = con
     }
 
     // MARK: - setup helpers
@@ -159,21 +171,6 @@ public actor Session {
                 try? FileManager.default.removeItem(atPath: (home as NSString).appendingPathComponent(name))
             }
             // EPERM: alive but owned by someone else — leave it alone, same as Python.
-        }
-    }
-
-    /// Drops any `_sift_rs_*` table left behind by `sortedRelation` (below) from a run that did
-    /// not exit cleanly. Nothing ever references one of these by name across a process
-    /// restart — the name is a same-run cache key (see `sortRelationName`'s doc comment) — so any
-    /// found at launch is safe to drop unconditionally. Needed only because that table is a plain
-    /// one, not `TEMP`; see this file's header for why `TEMP` cannot be used for it.
-    private static func sweepOrphanedSortTables(_ con: Connection) {
-        let sql = "SELECT table_name FROM information_schema.tables "
-            + "WHERE table_name LIKE '\\_sift\\_rs\\_%' ESCAPE '\\'"
-        guard let rows = try? con.query(sql).allRows() else { return }
-        for row in rows {
-            guard case .text(let name) = row[0] else { continue }
-            try? con.execute("DROP TABLE IF EXISTS \(q(name))")
         }
     }
 
@@ -252,6 +249,15 @@ public actor Session {
         guard var t = tables[name] else { return }
         t.qspec = qspec
         t.filteredCount = nil
+        tables[name] = t
+    }
+
+    /// Test support: overwrite an open table's cached filtered count directly, without touching
+    /// its query spec — lets a test prove `page()` reads the cache instead of recomputing it, by
+    /// planting a value `page()` could not possibly have computed itself.
+    func setFilteredCountForTest(_ name: String, _ value: Int?) {
+        guard var t = tables[name] else { return }
+        t.filteredCount = value
         tables[name] = t
     }
 
@@ -337,7 +343,10 @@ public actor Session {
 
         let snapshot = t
         Task.detached { [self] in
-            await runAfterOpen(name: tname, spec: snapshot.spec, initialRowCount: snapshot.rowCount)
+            await runAfterOpen(
+                name: tname, spec: snapshot.spec, initialRowCount: snapshot.rowCount,
+                openedAt: snapshot.openedAt
+            )
         }
 
         return t
@@ -354,54 +363,87 @@ public actor Session {
     /// columnar format) and `_maybe_stage_after_dwell`'s background staging both slot in right
     /// after the staging decision below — neither is ported yet (compute_profile and stage_now are
     /// later tasks), so this pipeline stops at the staging decision.
-    nonisolated private func runAfterOpen(name: String, spec: SourceSpec, initialRowCount: Int?) async {
+    ///
+    /// `openedAt` is the opened table's identity, carried through to every `apply*` call below so
+    /// each one can confirm it is still writing to the SAME open table it was launched for. Python
+    /// is immune to this by construction — `_after_open` binds `t = self.tables.get(name)` once
+    /// and mutates that live object directly, so once `close_table` pops it from the dict the
+    /// object is simply garbage, and any Python-cursor callback still touching it lands nowhere.
+    /// This port instead re-looks-up `tables[name]` on every `apply*` call (`Table` is a struct
+    /// there is no live reference to hold onto) — which means a background scan for a CLOSED table
+    /// would silently write onto a DIFFERENT, later-opened table of the same name, if nothing
+    /// stopped it. `openedAt` is that stop: `Table.init` sets it once, fresh, per open, so a stale
+    /// callback's `openedAt` can never match a reopened table's.
+    nonisolated private func runAfterOpen(
+        name: String, spec: SourceSpec, initialRowCount: Int?, openedAt: Date
+    ) async {
         guard let connection = try? database.connect() else { return }
 
         var rowCount = initialRowCount
         if rowCount == nil {
-            await applyCounting(name, true)
+            await applyCounting(name, true, openedAt: openedAt)
             rowCount = try? exactCount(connection, spec: spec)
-            await applyCount(name, rowCount)
+            await applyCount(name, rowCount, openedAt: openedAt)
         }
 
         if let raw = rawRelationExpr(spec), let scan = try? detectBadRows(connection, spec: spec, raw: raw) {
-            await applyBadRows(name, scan)
+            await applyBadRows(name, scan, openedAt: openedAt)
         }
 
         let free = freeDiskBytes(at: siftHome)
         let decision = shouldStage(fmt: spec.fmt, sizeBytes: spec.key.size, freeBytes: free)
-        await applyStageDecision(name, decision)
+        await applyStageDecision(name, decision, openedAt: openedAt)
     }
 
-    private func applyCounting(_ name: String, _ counting: Bool) {
-        guard var t = tables[name] else { return }
+    /// `guard ... t.openedAt == openedAt` below is the fix for a real bug caught in review: a
+    /// closed-and-reopened table sharing the OLD table's name would otherwise silently inherit a
+    /// still-in-flight background result meant for the table that used to have that name (a huge
+    /// file's row count landing on a freshly-opened tiny one). Not `private`: exercised directly
+    /// (with a deliberately stale `openedAt`) by SessionTests' regression test for exactly this.
+    func applyCounting(_ name: String, _ counting: Bool, openedAt: Date) {
+        guard var t = tables[name], t.openedAt == openedAt else { return }
         t.counting = counting
         tables[name] = t
     }
 
-    private func applyCount(_ name: String, _ rowCount: Int?) {
-        guard var t = tables[name] else { return }
+    func applyCount(_ name: String, _ rowCount: Int?, openedAt: Date) {
+        guard var t = tables[name], t.openedAt == openedAt else { return }
         if let rowCount { t.rowCount = rowCount }
         t.counting = false
         tables[name] = t
     }
 
-    private func applyBadRows(_ name: String, _ scan: BadRowScan) {
-        guard var t = tables[name] else { return }
+    func applyBadRows(_ name: String, _ scan: BadRowScan, openedAt: Date) {
+        guard var t = tables[name], t.openedAt == openedAt else { return }
         t.uncastable = scan.uncastable
         t.badCells = scan.badCells
         t.badRows = scan.badRows
         tables[name] = t
     }
 
-    private func applyStageDecision(_ name: String, _ decision: StageDecision) {
-        guard var t = tables[name] else { return }
+    func applyStageDecision(_ name: String, _ decision: StageDecision, openedAt: Date) {
+        guard var t = tables[name], t.openedAt == openedAt else { return }
         t.stageDecision = decision
         tables[name] = t
     }
 
     // MARK: - paging
 
+    /// **Known responsiveness cliff (review I6), left as-is on purpose.** This entire method runs
+    /// synchronously on the actor — it never suspends — so a first sorted page over a large table
+    /// (the `sortedRelation` materialization, up to `sortMaterializeMax` rows) blocks every other
+    /// actor call for however long that takes: `table`, `state`, a second `openPath`, and every
+    /// `apply*` callback from an in-flight `runAfterOpen`. Python ran `page` in a threadpool, where
+    /// only the calling request stalled.
+    ///
+    /// Not fixed here because fact 3 (this file's header) forecloses the obvious fix: detaching
+    /// this work would mean using `pagingConnection` from a detached `Task`, and `pagingConnection`
+    /// is safe to hold as a single, long-lived, non-`Sendable` `Connection` ONLY because every
+    /// caller — `page`, `sortedRelation`, `closeTable` — is guaranteed by the actor's serial
+    /// executor to run to completion before the next one starts. A detached caller would break
+    /// that guarantee, which is the one thing standing between "shared Connection" and a data race.
+    /// Given the choice between reintroducing that risk and leaving this cliff documented, this
+    /// keeps the simpler, provably-safe design and accepts the cliff.
     public func page(_ name: String, offset: Int, limit: Int = pageRows) async throws -> TablePage {
         var t = try table(name)
         // Persists whatever `t` ends up mutated to (filteredCount, sortKey) on every exit path —
@@ -410,7 +452,7 @@ public actor Session {
         defer { tables[name] = t }
 
         let cols = t.cols
-        let con = try database.connect()
+        let con = pagingConnection
         do {
             let sql: String
             let params: [SQLValue]
@@ -427,16 +469,18 @@ public actor Session {
                 let rel = try sortedRelation(con, &t)
                 // `rel` already carries the sort — either it's the plain table (t.qspec.sort was
                 // empty, nothing to order) or `sortedRelation` just materialized it in that exact
-                // order. Re-appending `ORDER BY` here would re-sort it, and MEASURED against
-                // DuckDB 1.5.5: re-sorting the same static, tie-bearing table at different
-                // LIMIT/OFFSET pairs does NOT reliably reproduce the same tie order every time —
-                // 4 rows out of 1000 landed on two pages and 4 others on none, in a direct,
-                // Session-independent repro (see task-4-report.md). Reading the materialized
-                // copy's own physical order via a bare LIMIT/OFFSET (no ORDER BY) does not have
-                // that problem — DuckDB's default `preserve_insertion_order` is exactly what
-                // `sortedRelation`'s materializing CREATE TABLE relies on. Filters stay: they were
-                // already baked into the materialized copy, so re-applying the same predicate is
-                // redundant but harmless, unlike sort.
+                // order. Re-appending `ORDER BY` here would re-sort it, and MEASURED (DuckDB
+                // 1.5.5, the vendored dylib this target actually links — an earlier CLI-based
+                // repro used 1.5.2, re-confirmed here against what ships): re-sorting the same
+                // static, tie-bearing table at different LIMIT/OFFSET pairs does NOT reliably
+                // reproduce the same tie order every time — 4 rows out of 1000 landed on two pages
+                // and 4 others on none. Reading the materialized copy's own physical order via a
+                // bare LIMIT/OFFSET (no ORDER BY) does not have that problem — DuckDB's default
+                // `preserve_insertion_order` is exactly what `sortedRelation`'s materializing
+                // CREATE TABLE relies on (SessionTests pins this at scale, and directly asserts
+                // the setting itself, in case it is ever flipped off in `harden()`). Filters stay:
+                // they were already baked into the materialized copy, so re-applying the same
+                // predicate is redundant but harmless, unlike sort.
                 let readSpec = QuerySpec(relation: t.qspec.relation, filters: t.qspec.filters)
                 (sql, params) = try pageSQL(readSpec, cols: cols, rel: rel, limit: limit, offset: offset)
             }
@@ -467,14 +511,21 @@ public actor Session {
     /// ties on a non-unique sort column are ordered arbitrarily, so the same row could appear on
     /// two pages or none.
     ///
-    /// A plain table, not `TEMP` — see this file's header for the MEASURED reason `TEMP` cannot
-    /// work here (it would not survive past the `page()` call that created it, since every call
-    /// opens its own `Connection`). The cost of that swap: a plain table lives in the persistent
-    /// catalog, so it must be dropped explicitly, not just abandoned when its connection closes.
-    /// The two paths that already drop it by name (below, and `closeTable`) cover every orderly
-    /// exit; `sweepOrphanedSortTables` in `init` covers the one that isn't — a crash or force-quit
-    /// while a sort was materialized, which would otherwise leave a `_sift_rs_*` table sitting in
-    /// `stage.duckdb` forever.
+    /// `TEMP TABLE`, matching Python — but not for the reason an earlier version of this comment
+    /// claimed. That version said Python's `con.cursor()` shares its parent connection's session,
+    /// so the materialized copy survives across the cursors `page()` opens. MEASURED, and false:
+    /// a `TEMP TABLE` created on one Python cursor is NOT visible on a second cursor OR the parent
+    /// connection (`Catalog Error: Table with name ... does not exist` on both) — and end to end,
+    /// paging a sorted table a second time against the real `engine/session.py` throws the
+    /// identical error today. Python was never a faithful reference for this call to diverge
+    /// from; it is currently broken here too, just untested (no `test_session.py` pages a sorted
+    /// table more than once). What actually makes `TEMP TABLE` work in THIS file is `page`,
+    /// `sortedRelation` and `closeTable` sharing one `pagingConnection` (this file's header, fact
+    /// 3) — a `TEMP TABLE` is visible for as long as the connection that created it stays open,
+    /// and that connection is now the `Session`'s, not a fresh one per call. Dropped explicitly
+    /// below and in `closeTable` on every orderly exit; needs no startup sweep for the unclean
+    /// case, unlike a plain table — DuckDB drops a connection's temp tables itself when it closes,
+    /// which happens automatically at process exit regardless of how the process ended.
     private func sortedRelation(_ con: Connection, _ t: inout Table) throws -> String {
         guard !t.qspec.sort.isEmpty else {
             if let key = t.sortKey {
@@ -490,7 +541,7 @@ public actor Session {
             try con.execute("DROP TABLE IF EXISTS \(q(old))")
         }
         let (inner, params) = try pageSQL(t.qspec, cols: t.cols, rel: q(t.name), limit: sortMaterializeMax, offset: 0)
-        _ = try con.query("CREATE OR REPLACE TABLE \(q(key)) AS \(inner)", params.map(toDBValue))
+        _ = try con.query("CREATE OR REPLACE TEMP TABLE \(q(key)) AS \(inner)", params.map(toDBValue))
         t.sortKey = key
         return q(key)
     }
@@ -501,7 +552,7 @@ public actor Session {
         let t = try table(name)
         defer { tables.removeValue(forKey: name) }
 
-        let con = try database.connect()
+        let con = pagingConnection
         if let key = t.sortKey {
             try con.execute("DROP TABLE IF EXISTS \(q(key))")
         }
