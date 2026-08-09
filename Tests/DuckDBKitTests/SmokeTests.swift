@@ -99,9 +99,48 @@ import Foundation
 @Test func reportsDecimalScaleAndWidth() throws {
     let con = try Database.inMemory().connect()
     let rs = try con.query("SELECT 1.23::DECIMAL(9,3) AS d")
-    #expect(rs.columns[0].typeName == "DECIMAL")
+    #expect(rs.columns[0].typeName == "DECIMAL(9,3)")
     #expect(rs.columns[0].decimalScale == 3)
     #expect(rs.columns[0].decimalWidth == 9)
+}
+
+@Test func scalarTypeNamesMatchDuckDBsOwnTypeof() throws {
+    // typeName is not cosmetic: downstream classification branches on its PREFIX to pick
+    // column alignment, histogram-vs-top-N and cell rendering. Every type below reported
+    // the single string "OTHER" until the switch caught up with the decoder, which would
+    // have classified every temporal type as `other`. DuckDB's own typeof() is the oracle.
+    let con = try Database.inMemory().connect()
+    for expr in ["TIMESTAMP_S '2026-01-01'", "TIMESTAMP_MS '2026-01-01'",
+                 "TIMESTAMP_NS '2026-01-01'", "TIMETZ '12:00:00+02'",
+                 "TIMESTAMPTZ '2026-01-01'", "INTERVAL '1 day'", "'1010'::BIT",
+                 "1.23::DECIMAL(9,3)", "1.23::DECIMAL(38,10)", "42::HUGEINT",
+                 "'x'::VARCHAR", "'abc'::BLOB", "DATE '2026-01-01'", "TIME '12:00:00'"] {
+        let ours = try con.query("SELECT \(expr) AS v").columns[0].typeName
+        let theirs = try con.query("SELECT typeof(\(expr)) AS t").allRows()[0][0].display
+        #expect(ours == theirs, "typeName disagrees with typeof for \(expr)")
+    }
+}
+
+@Test func nestedTypeNamesReportTheirShapeRatherThanOTHER() throws {
+    // DuckDB's typeof() fully parameterizes these (`INTEGER[]`, `STRUCT(a INTEGER)`,
+    // `MAP(INTEGER, INTEGER)`, `INTEGER[3]`, `UNION(a INTEGER)` — all MEASURED), which
+    // needs a recursive walk of the logical type. The bare shape is enough: classification
+    // reads the prefix, and "OTHER" was the thing that was wrong.
+    let con = try Database.inMemory().connect()
+    let expected = [
+        "[1,2,3]": "LIST",
+        "{'a': 1}": "STRUCT",
+        "MAP([1],[2])": "MAP",
+        "[1,2,3]::INTEGER[3]": "ARRAY",
+        "union_value(a := 1)": "UNION",
+    ]
+    for (expr, name) in expected {
+        #expect(try con.query("SELECT \(expr) AS v").columns[0].typeName == name)
+    }
+    // ENUM reports its own declared type name through typeof(), so it cannot be compared
+    // for equality — but "ENUM" is the prefix that classifies it as text.
+    try con.execute("CREATE TYPE mood AS ENUM ('ok', 'sad')")
+    #expect(try con.query("SELECT 'ok'::mood AS v").columns[0].typeName == "ENUM")
 }
 
 @Test func aPrepareFailureThrows() throws {
