@@ -19,6 +19,7 @@
   <a href="#what-it-opens">Formats</a> ·
   <a href="#what-you-get">Features</a> ·
   <a href="#things-that-are-the-way-they-are-for-a-reason">Design notes</a> ·
+  <a href="SECURITY.md">Security</a> ·
   <a href="CONTRIBUTING.md">Contributing</a>
 </p>
 
