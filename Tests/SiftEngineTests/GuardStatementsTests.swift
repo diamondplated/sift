@@ -95,6 +95,22 @@ func allowedByTheCombinedGate(sql: String) throws {
     }
 }
 
+// MARK: - Genuine extract failure (a syntax error, not a rejection reason above)
+
+@Test func aSyntaxErrorIsReportedAsNotValidSQLRatherThanNothingToRun() {
+    // "SELEC 1" (typo) makes duckdb_extract_statements itself fail — count 0 with a non-empty
+    // duckdb_extract_statements_error — which is a different DENY reason than an empty/
+    // comment-only query. Regression guard for GuardStatements.swift:106-108.
+    do {
+        try assertSingleSelectStatement("SELEC 1")
+        Issue.record("expected SQLRejected")
+    } catch let e as SQLRejected {
+        #expect(e.message.hasPrefix("That is not valid SQL:"))
+    } catch {
+        Issue.record("wrong error type: \(error)")
+    }
+}
+
 // MARK: - The landmine this task exists to close
 
 @Test func validSelectAgainstATableTheGuardHasNeverOpenedIsNotRejected() throws {

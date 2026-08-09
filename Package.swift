@@ -46,11 +46,14 @@ let package = Package(
         // this target's dependency on it, and a duplicate `-Xlinker -rpath` emits
         // `ld: warning: duplicate -rpath`.
         //
-        // CDuckDB is listed explicitly (not just pulled in via DuckDBKit) because
-        // GuardStatements.swift calls duckdb_extract_statements directly: it needs a raw
-        // duckdb_connection, and DuckDBKit.Connection.handle is internal to that module by
-        // design (Task 3 must not touch Sources/DuckDBKit/**). SwiftPM does not make a
-        // dependency's own dependencies importable transitively, so this needs its own edge.
+        // CDuckDB is listed explicitly because GuardStatements.swift calls
+        // duckdb_extract_statements directly: it needs a raw duckdb_connection, and
+        // DuckDBKit.Connection.handle is internal to that module by design (Task 3 must not touch
+        // Sources/DuckDBKit/**). MEASURED: this edge is not strictly required today — SwiftPM
+        // puts a `.systemLibrary` target's module map on the whole graph's Clang-importer search
+        // path, so `import CDuckDB` here compiles even with this line removed, because DuckDBKit
+        // already imports it. That is undocumented SwiftPM behavior, not a contract; declared
+        // explicitly so this target's build does not depend on it staying true.
         .target(
             name: "SiftEngine",
             dependencies: ["SiftCore", "DuckDBKit", "CDuckDB"]

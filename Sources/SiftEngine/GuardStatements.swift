@@ -134,6 +134,20 @@ public func assertSingleSelectStatement(_ sql: String) throws {
 /// The full SELECT-only gate, in the same order as Python's `assert_select_only`: pure checks
 /// first (cheap, and name PRAGMA/CALL correctly even though DuckDB reports PRAGMA as
 /// `StatementType.SELECT`), then statement counting and type via a connection.
+///
+/// **The type check inside `assertSingleSelectStatement` is not currently load-bearing in this
+/// composed gate — say so plainly, because it reads as if it independently catches most of the
+/// DENY list, and in the shipped composition it does not.** Walking `test_guard.py`'s DENY list
+/// against the scratch connection: every case that references a catalog object not present there
+/// (`DROP TABLE x`, `INSERT INTO x ...`, `PRAGMA database_list`, etc. — most of the list) fails
+/// to *prepare* and falls through unrejected by design (the landmine this file exists to close).
+/// Of the handful whose type *does* resolve (no missing catalog reference — `CREATE TABLE z AS
+/// SELECT 1`, `CHECKPOINT`, `BEGIN TRANSACTION`, ...), every one already starts with a denied
+/// leading keyword, so `assertNoDeniedLeadingKeyword` above rejects it first and the type check
+/// never runs. This is not a porting regression — `guard.py`'s own type check has the identical
+/// property for the identical reason, since it never touches a real connection either. The type
+/// check earns its place as defense-in-depth against a future gap in `deniedLeadingKeywords`
+/// (a keyword someone forgets to add), not as something currently deciding any case in this gate.
 public func assertSelectOnly(_ sql: String) throws {
     try assertNoDeniedLeadingKeyword(sql)
     try assertSingleSelectStatement(sql)
