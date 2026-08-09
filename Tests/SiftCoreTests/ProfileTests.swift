@@ -19,35 +19,21 @@ import Foundation
 
 // MARK: - Shared "nulls.csv" fixture (engine/tests/fixtures.py's make_csv, same knobs)
 
-/// Reproduces fixtures.py's `make_csv(directory, "nulls.csv", rows=600, nulls_every=7,
-/// empties_every=11, nullish_every=13)` verbatim: an unquoted empty `region` reads as NULL, a
-/// quoted `""` `note` is an explicit empty string (distinct from NULL), and `note` is sometimes
-/// the literal sentinel "N/A" (neither null nor empty).
-private func writeNullsCSV() -> String {
-    let regions = ["West", "Midwest", "South", "Northeast"]
-    var lines = ["order_id,region,amount,note"]
-    for i in 0..<600 {
-        var region = regions[i % regions.count]
-        if i % 7 == 0 { region = "" }
-        let amount = "\(i).50"
-        var note = "note \(i)"
-        if i % 11 == 0 { note = "\"\"" }
-        if i % 13 == 0 { note = "N/A" }
-        lines.append("\(i),\(region),\(amount),\(note)")
-    }
-    let path = FileManager.default.temporaryDirectory
-        .appendingPathComponent("sift-profile-nulls-\(UUID().uuidString).csv").path
-    try! (lines.joined(separator: "\n") + "\n").write(
-        toFile: path, atomically: true, encoding: .utf8)
-    return path
-}
-
 /// A fresh in-memory connection with `viewName` pointed at a freshly-written nulls.csv, plus the
 /// [Column] list (name-order matches the view's column order, which is what profileExtraSQL's
 /// index-based `c{i}__*` aliases rely on).
+///
+/// The CSV itself is Fixtures.swift's `makeCSV(rows: 600, nullsEvery: 7, emptiesEvery: 11,
+/// nullishEvery: 13)` — verified byte-identical to this file's original hand-rolled writer
+/// before the two were merged (see task-8-report.md), and to fixtures.py's own `make_csv`: an
+/// unquoted empty `region` reads as NULL, a quoted `""` `note` is an explicit empty string
+/// (distinct from NULL), and `note` is sometimes the literal sentinel "N/A" (neither null nor
+/// empty).
 private func openNullsView(_ viewName: String) throws -> (con: Connection, cols: [Column]) {
     let con = try Database.inMemory().connect()
-    let path = writeNullsCSV()
+    let path = try makeCSV(dir: FileManager.default.temporaryDirectory.path,
+                            name: "sift-profile-nulls-\(UUID().uuidString).csv",
+                            rows: 600, nullsEvery: 7, emptiesEvery: 11, nullishEvery: 13)
     try con.execute(
         "CREATE OR REPLACE VIEW \(viewName) AS SELECT * FROM "
             + "read_csv(\(qlit(path)), header=true, allow_quoted_nulls=false)"
