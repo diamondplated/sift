@@ -264,6 +264,17 @@ public actor Session {
         tables[name] = t
     }
 
+    /// Test support: overwrite an open table's cached uncastable-scan result directly, bypassing
+    /// `detectBadRows`'s real all-varchar scan — lets SessionQueriesTests prove `computeProfile`
+    /// reads this cache instead of re-running that scan, by planting a value the real scan could
+    /// not possibly have produced (the same sentinel trick as `setFilteredCountForTest` above,
+    /// applied to Task 5's read side).
+    func setUncastableForTest(_ name: String, _ value: [String: Int]) {
+        guard var t = tables[name] else { return }
+        t.uncastable = value
+        tables[name] = t
+    }
+
     /// Safe relation SQL for this table — a quoted name, or the user's wrapped query.
     public nonisolated func relation(_ t: Table) -> String {
         if t.sqlMode, let text = t.sqlText {
@@ -687,7 +698,10 @@ private func freeDiskBytes(at path: String) -> Int {
 /// SiftCore declares `SQLValue`, DuckDBKit declares `DBValue` — deliberately not the same type
 /// (see `SQLValue`'s doc comment: SiftCore cannot import DuckDBKit). This is the five-line
 /// mapping between them, the real (non-test-scoped) copy of SQLGenTests.swift's `toDBValue`.
-private func toDBValue(_ v: SQLValue) -> DBValue {
+///
+/// Not `private`: SessionQueries.swift binds `[SQLValue]` into every query it runs and shares
+/// this exact mapping rather than a second copy.
+func toDBValue(_ v: SQLValue) -> DBValue {
     switch v {
     case .null: return .null
     case .bool(let b): return .bool(b)
