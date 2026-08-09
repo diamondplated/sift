@@ -20,6 +20,7 @@ let package = Package(
     platforms: [.macOS(.v14)],
     products: [
         .library(name: "DuckDBKit", targets: ["DuckDBKit"]),
+        .library(name: "SiftCore", targets: ["SiftCore"]),
     ],
     targets: [
         .systemLibrary(name: "CDuckDB", path: "Sources/CDuckDB"),
@@ -31,6 +32,13 @@ let package = Package(
         .testTarget(
             name: "DuckDBKitTests",
             dependencies: ["DuckDBKit"]
+        ),
+        // Pure value types only — no dependencies, imports Foundation and nothing else.
+        .target(name: "SiftCore"),
+        .testTarget(
+            name: "SiftCoreTests",
+            dependencies: ["SiftCore", "DuckDBKit"],
+            resources: [.copy("Fixtures")]
         ),
     ]
 )
