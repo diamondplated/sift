@@ -255,9 +255,9 @@ reference to the dev server.
 | Python | Swift | Notes |
 |---|---|---|
 | `core/types.py` | `SiftCore/Types.swift` | `Literal` unions become real enums; `needs_string_transport` **deleted** |
-| `core/ident.py` | `SiftCore/Ident.swift` | NFKD normalization via `String.decomposedStringWithCanonicalMapping` |
+| `core/ident.py` | `SiftCore/Ident.swift` | NFKD normalization via `String.decomposedStringWithCompatibilityMapping` — **compatibility**, not canonical; `…CanonicalMapping` is NFD and would have shipped a bug |
 | `core/guard.py` | `SiftCore/Guard.swift` | Unchanged in behavior — still only a message improver |
-| `core/sqlgen.py` | `SiftCore/SQLGen.swift` | Returns `(String, [DBValue])`. The newline subquery wrap is preserved byte-for-byte |
+| `core/sqlgen.py` | `SiftCore/SQLGen.swift` + `SQLGenPanels.swift` | Returns `(String, [SQLValue])` — `SQLValue` is SiftCore's own type; `DBValue` lives in `DuckDBKit`, which SiftCore cannot import. The newline subquery wrap is preserved byte-for-byte |
 | `core/profile.py` | `SiftCore/Profile.swift` | Takes already-fetched rows, returns structs — unchanged shape |
 | `core/stage.py` | `SiftCore/Stage.swift` | Pure decisions; `select_for_purge` ports directly |
 | `core/snippet.py` | `SiftCore/Snippet.swift` | Copy-as-code output must stay character-identical |
@@ -469,17 +469,33 @@ lost" panel cannot work end to end. Measured 2026-08-09 by running the generated
 through `DuckDBKit`. Plan 3 must either add a `LIST` case to `Chunk.decodeColumn` or
 cast this one column in the query; the generated SQL itself is correct either way.
 
-**Six DuckDB types do not decode — Plan 2.** `ENUM` (23), `BIT` (29), `BIGNUM` (35),
+**Six DuckDB types do not decode — Plan 3.** `ENUM` (23), `BIT` (29), `BIGNUM` (35),
 `TIME_NS` (39), `VARIANT` (41) and `GEOMETRY` (40) render `⟨unsupported type N⟩`. NULLs
 in those columns still decode to `.null` correctly. `TIME_NS` is the notable one — the
 direct sibling of the `TIMESTAMP_NS` that Plan 1 does decode. Note that
 `DUCKDB_TYPE_VARINT` does not exist on 1.5.5; the type is `BIGNUM`.
 
-**JSON classifies as text, not nested — Plan 2.** `duckdb_column_logical_type` reports
-JSON as type id 17 (`VARCHAR`), so `kind_of` buckets a JSON column as `text` where the
-Python engine gives `nested`. `duckdb_logical_type_get_alias` (`duckdb.h:3070`) returns
-`"JSON"` for such a column and `nil` for a plain VARCHAR — reading the alias in
-`ResultSet.init` and preferring it when non-nil closes this in about three lines.
+*Reassigned from Plan 2 (2026-08-09).* Plan 2 shipped `SiftCore`, which imports
+Foundation only and so cannot touch the decoder at all — the fix lives in
+`Chunk.decodeColumn`, and the first module that both imports `DuckDBKit` and owns a
+result path is `SiftEngine`. Plan 2's own "Deliberately not in this plan" had already
+pushed it to "Plan 2's successor work" without naming it; this names it.
+
+**JSON classifies as text, not nested — Plan 3.** `duckdb_column_logical_type` reports
+JSON as type id 17 (`VARCHAR`), so a JSON column arrives from `DuckDBKit` typed
+`"VARCHAR"`. `duckdb_logical_type_get_alias` (`duckdb.h:3070`) returns `"JSON"` for such
+a column and `nil` for a plain VARCHAR — reading the alias in `ResultSet.init` and
+preferring it when non-nil closes this in about three lines.
+
+*Reassigned from Plan 2 (2026-08-09), with a live consequence now that `SiftCore`
+exists.* `kind(of:)` is correct on its own terms — it returns `.nested` for the string
+`"JSON"` — so the gap is entirely upstream of it, in what `DuckDBKit` reports. The
+consequence is concrete: `SiftEngine` will build its `Column`s from `"VARCHAR"`, so a
+JSON column classifies `.text`, and `chooseView` can then route it to the **`highcard`**
+panel — near-unique text is exactly what a column of JSON documents looks like. The user
+gets "is this a key?" for a column that should have been offered as nested. Fixing this
+in `ResultSet.init` fixes the classification everywhere downstream at once; fixing it in
+`SiftEngine` by special-casing the panel would not.
 
 **`loadedExtensions[name] == false` conflates two failures — Plan 3.** A legal name with
 no such extension installed, and a name rejected by the injection guard, both record
