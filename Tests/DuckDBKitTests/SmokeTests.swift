@@ -89,3 +89,35 @@ import Foundation
     #expect(Cell.null.display == "")
     #expect(!Cell.int(0).isNull)
 }
+
+@Test func reportsColumnNamesInOrder() throws {
+    let con = try Database.inMemory().connect()
+    let rs = try con.query("SELECT 1 AS alpha, 2 AS beta")
+    #expect(rs.columns.map(\.name) == ["alpha", "beta"])
+}
+
+@Test func reportsDecimalScaleAndWidth() throws {
+    let con = try Database.inMemory().connect()
+    let rs = try con.query("SELECT 1.23::DECIMAL(9,3) AS d")
+    #expect(rs.columns[0].typeName == "DECIMAL")
+    #expect(rs.columns[0].decimalScale == 3)
+    #expect(rs.columns[0].decimalWidth == 9)
+}
+
+@Test func aPrepareFailureThrows() throws {
+    let con = try Database.inMemory().connect()
+    #expect(throws: DuckDBError.self) {
+        _ = try con.query("SELECT * FROM nope WHERE x = ?", [.int(1)])
+    }
+}
+
+@Test func bindingAcceptsEveryValueKindWithoutThrowing() throws {
+    // Values are read back in Task 5, once chunk decoding exists. This asserts the
+    // bind path itself accepts all five cases and executes.
+    let con = try Database.inMemory().connect()
+    let rs = try con.query(
+        "SELECT ?::BOOLEAN AS b, ?::BIGINT AS i, ?::DOUBLE AS d, ?::VARCHAR AS s, ?::VARCHAR AS n",
+        [.bool(true), .int(42), .double(1.5), .text("hi"), .null]
+    )
+    #expect(rs.columns.map(\.name) == ["b", "i", "d", "s", "n"])
+}
