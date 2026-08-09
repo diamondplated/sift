@@ -67,6 +67,12 @@ import Testing
     #expect(kind(of: "integer") == .number)
 }
 
+// Python's str.strip() trims newlines too, not just spaces — .whitespaces alone would leave a
+// trailing "\n" on the type string and miss this match. Guards against that regression.
+@Test func kindOfTrimsNewlinesNotJustSpaces() {
+    #expect(kind(of: "VARCHAR\n") == .text)
+}
+
 // MARK: - Column
 
 @Test func columnComputesItsOwnKindFromItsType() {

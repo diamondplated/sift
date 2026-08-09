@@ -10,6 +10,13 @@ public enum Kind: String, Sendable {
     case number, text, temporal, bool, nested, blob, other
 }
 
+// Fmt and Op keep Python's exact snake_case/symbol raw values rather than Swift's default
+// (which would encode .globCsv as "globCsv", .notIn as "notIn"). Two real, still-live reasons,
+// not aesthetics: sqlgen.py interpolates f.op directly into SQL text (`f"{c} {f.op} ?"`), so a
+// later port can render a filter as `op.rawValue` only because the raw value *is* the SQL
+// operator/keyword; and stage.py's CATALOG_DDL persists `fmt VARCHAR` into an on-disk staging
+// table, so the string that round-trips through storage has to match what was written before.
+
 public enum Fmt: String, Sendable {
     case csv, parquet, json, ndjson, xlsx, delta
     case globParquet = "glob_parquet"
@@ -91,8 +98,8 @@ public func kind(of duckdbType: String) -> Kind {
 }
 
 // needs_string_transport is deliberately not ported: it existed only to flag values that must be
-// JSON-encoded as strings to survive JavaScript's 2**53-1 integer ceiling, and the connection
-// this layer no longer has removed the need for that workaround.
+// JSON-encoded as strings to survive JavaScript's 2**53-1 integer ceiling. There is no JSON/JS
+// wire format anymore, so BIGINT and friends never have to cross as strings in the first place.
 
 // MARK: - Bound query parameters
 
@@ -172,11 +179,17 @@ public struct SheetInfo: Sendable, Equatable {
 /// delim=',', header=true)`). Python holds these as `dict[str, Any]`; Swift needs the shapes
 /// spelled out because `Any` is neither `Sendable` nor `Equatable`.
 ///
-/// ponytail: covers only the scalar shapes source.py's sniffer produces today (flags, the sniffed
-/// delimiter/quote/escape/skip/comment). It does NOT cover the CSV column-type override map
-/// (`dict[str, str]`, keyed "columns") that read_csv also takes — that needs a shape this enum
-/// doesn't have. Whichever task ports source.py's `build_source`/`read_expr` will touch this type
-/// anyway to populate it for real, so the widening is deferred to there rather than guessed here.
+/// LANDMINE: this deliberately has no case for the CSV column-type override map
+/// (`read_args["columns"]`, a `dict[str, str]` in Python). Do NOT add `case columns([String:
+/// String])` to cover it. `build_source` builds that map as `{c.name: c.type for c in cols}` in
+/// file-column order and relies on Python dicts being insertion-ordered; DuckDB's
+/// `read_csv(columns={...})` disables header-name matching entirely and binds each entry
+/// *positionally* against the file using that order. A Swift `Dictionary` has no defined
+/// iteration order, so storing this map in one and rendering it back out would silently assign
+/// the wrong type to the wrong column — a plausible-wrong-value bug, in the one product whose
+/// entire premise is not lying about data. `SourceSpec.columns` below is already an ordered
+/// `[Column]` holding exactly the (name, type) pairs `columns=` needs — derive the argument from
+/// that directly when porting source.py's `read_expr`, and never store it in `readArgs`.
 public enum ReadArg: Sendable, Equatable {
     case bool(Bool)
     case int(Int)
