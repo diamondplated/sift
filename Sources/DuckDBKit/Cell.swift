@@ -33,10 +33,25 @@ public enum Cell: Sendable, Equatable {
         case .text(let v):     return v
         case .decimal(let v):  return "\(v)"
         case .blob(let n):
-            let f = NumberFormatter()
-            f.numberStyle = .decimal
-            let s = f.string(from: NSNumber(value: n)) ?? String(n)
-            return "<blob \(s) B>"
+            return "<blob \(Self.grouped(n)) B>"
         }
+    }
+
+    /// Comma-grouped, unconditionally — matching the Python engine's `f"{n:,}"`, which
+    /// is what the grid currently renders.
+    ///
+    /// Deliberately NOT NumberFormatter. Without an explicit `.locale` it follows
+    /// `Locale.current`, and the same value renders four different ways — MEASURED:
+    /// en_US "1,234", de_DE "1.234", fr_FR "1 234", en_US_POSIX "1234". A blob size
+    /// that changes shape with the user's region is a bug, and one that passes CI only
+    /// because the runner happens to be en_US is a worse one.
+    static func grouped(_ n: Int) -> String {
+        let digits = String(n.magnitude)
+        var out = ""
+        for (i, c) in digits.enumerated() {
+            if i > 0 && (digits.count - i) % 3 == 0 { out.append(",") }
+            out.append(c)
+        }
+        return n < 0 ? "-" + out : out
     }
 }

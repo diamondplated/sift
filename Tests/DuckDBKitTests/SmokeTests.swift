@@ -72,10 +72,16 @@ import Foundation
 }
 
 @Test func blobDisplayMatchesThePythonEngineFormat() {
-    // session.jsonable renders a blob as "<blob 1,234 B>" — thousands separator and
-    // all. The grid shows this string, so the format is a contract, not a detail.
+    // The grid renders this string, so the format is a contract, not a detail — and it
+    // must not vary with the machine's region. See Cell.grouped for the measurements.
+    #expect(Cell.blob(0).display == "<blob 0 B>")
     #expect(Cell.blob(3).display == "<blob 3 B>")
+    #expect(Cell.blob(999).display == "<blob 999 B>")
+    #expect(Cell.blob(1000).display == "<blob 1,000 B>")
     #expect(Cell.blob(1234).display == "<blob 1,234 B>")
+    #expect(Cell.blob(999999).display == "<blob 999,999 B>")
+    #expect(Cell.blob(1000000).display == "<blob 1,000,000 B>")
+    #expect(Cell.blob(1234567890).display == "<blob 1,234,567,890 B>")
 }
 
 @Test func nullDisplaysAsEmptyAndKnowsItIsNull() {
