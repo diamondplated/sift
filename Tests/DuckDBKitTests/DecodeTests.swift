@@ -118,6 +118,9 @@ private func one(_ sql: String) throws -> Cell {
             == .text("1 month -3 days 02:00:00"))
     #expect(try one("SELECT INTERVAL '0 days'") == .text("00:00:00"))
     #expect(try one("SELECT INTERVAL '13 months'") == .text("1 year 1 month"))
+    // intervalString deliberately DOES trim trailing zeros, unlike the timestamp
+    // paths — this matches DuckDB's own CAST(... AS VARCHAR). Verified against it.
+    #expect(try one("SELECT INTERVAL '0.12 seconds'") == .text("00:00:00.12"))
 }
 
 @Test func decimalKeepsItsDeclaredScale() throws {

@@ -308,10 +308,11 @@ public struct Chunk {
     /// micros, 1_000_000_000 for nanos); `fracDigits` is how many digits that scale
     /// needs. The fraction is emitted only when non-zero, matching Python's
     /// datetime.isoformat(), which omits the fraction entirely for a whole-second
-    /// value but never trims within it — isoformat() always prints microseconds at
-    /// full 6-digit width once there is a fraction at all, and the DECIMAL fix a few
-    /// lines away in Cell.swift exists for the identical reason: dropping a trailing
-    /// zero misrepresents the column's declared precision. A decisecond column and a
+    /// value but never trims within it — isoformat() always prints the fraction at
+    /// the full width of the column's own scale once there is a fraction at all (3
+    /// digits for millis, 6 for micros, 9 for nanos), and the DECIMAL fix a few lines
+    /// away in Cell.swift exists for the identical reason: dropping a trailing zero
+    /// misrepresents the column's declared precision. A decisecond column and a
     /// microsecond column must not render identically just because both happen to end
     /// in zeros.
     ///

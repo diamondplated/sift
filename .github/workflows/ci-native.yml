@@ -1,0 +1,42 @@
+name: CI (native)
+
+on:
+  pull_request:
+  push:
+    branches: [native]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-native-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build and test
+    runs-on: macos-15
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      # This machine has only the macOS 26 SDK, so macos-15 is the only oracle for
+      # SDK-version build breaks. latent hit two that were invisible locally.
+      - name: Show toolchain
+        run: |
+          sw_vers
+          swift --version
+          xcrun --show-sdk-version
+
+      - name: Fetch libduckdb
+        run: ./scripts/fetch-duckdb.sh
+
+      - name: Build
+        run: swift build
+
+      - name: Test
+        run: swift test
