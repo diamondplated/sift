@@ -444,10 +444,11 @@ Seven phases. Each ends somewhere the branch is coherent.
    requirements files. Rewrite `README.md`, `AGENTS.md`, `CONTRIBUTING.md`, `SECURITY.md`. Tag
    v2.0.0.
 
-## 13a. Known gaps carried out of Plan 1
+## 13a. Known gaps carried between plans
 
-Measured during the DuckDBKit build and deliberately not fixed there. Each names the
-plan that owns it. Nothing here is silently wrong — every unsupported path renders a
+Measured during the build and deliberately not fixed where they were found. Each entry
+names the plan that owns it. Entries have come out of Plans 1, 2 and 3 — this is the
+project's cross-plan gap list, not Plan 1's. Nothing here is silently wrong — every unsupported path renders a
 loud marker — but each is a real limitation with a known shape.
 
 **`interrupt()` is not fire-and-forget — Plan 3.** Measured against libduckdb 1.5.5: a
@@ -458,6 +459,16 @@ fired. Hammering the interrupt in a loop cancels reliably (5/5 runs, 0.000–0.0
 `INTERRUPT Error: Interrupted!`). `Session.cancel` must therefore **keep re-asserting
 the interrupt for as long as the job is meant to be cancelled**, not call it once. The
 Python engine's single `con.interrupt()` does not port across.
+
+**A sorted table over 5,000,000 rows silently drops its tail — Plan 4 (grid).**
+`Session.sortedRelation` always materializes, and materializes at most `sortMaterializeMax`
+(5,000,000) rows. Pages past that come back **empty**, while `visibleRows` still reports the
+full row count — so the grid sizes its scroll extent for 100M rows and 95M of them return
+nothing. Ported faithfully from `engine/session.py`, which has the identical gap, so this is
+not a regression; it is a pre-existing limit that the native grid will make far more visible
+than a paged web view did. Recorded 2026-08-09 during Plan 3 Task 4's review. The fix is
+either to cap `visibleRows` at the materialized count so the extent tells the truth, or to
+re-materialize a window as the user scrolls past it.
 
 **A first-party generated query returns a `LIST`, and the decoder cannot read it — CLOSED
 2026-08-09, Plan 3 Task 1.** Plan 1 deferred nested-type decoding on the premise that
