@@ -20,7 +20,7 @@ private func tempCSV(_ contents: String) throws -> String {
 
 @Test func fact1_theSniffEmptySentinelCannotBeFedBackIntoReadCsv() throws {
     // The measured oddity: sniff_csv reports an ABSENT quote/escape/comment as the
-    // literal 8-character string "(empty)", and passing that straight back into
+    // literal 7-character string "(empty)", and passing that straight back into
     // read_csv fails with "the quote option cannot exceed a size of 1 byte".
     // core/source.py's SNIFF_EMPTY normalization exists solely because of this.
     //
@@ -64,13 +64,15 @@ private func tempCSV(_ contents: String) throws -> String {
 // whether or not the behavior still holds. A test that passes for the wrong reason is
 // worse than no test. Both land in Plan 2, where the fixtures exist.
 
-@Test func fact5_timestampWithTimeZoneRoundTrips() throws {
-    // In Python this needs pytz or it raises. Through the C API there is no Python
-    // dependency at all, so this must simply work — the pytz pin disappears with it.
+@Test func fact5_timestampWithTimeZoneNeedsNoPytz() throws {
+    // In the Python engine this is a hard dependency: without pytz, fetching ANY
+    // TIMESTAMP WITH TIME ZONE raises "Required module 'pytz' failed to import".
+    // Through the C API there is no Python in the picture at all, so the pinned
+    // pytz dependency disappears with the rewrite. This test is what proves it.
     let c = try con()
     try c.execute("SET TimeZone='UTC'")
     let v = try c.query("SELECT TIMESTAMPTZ '2026-08-09 12:00:00+00'").allRows()[0][0]
-    #expect(v != .null)
+    #expect(v == .text("2026-08-09T12:00:00+00:00"))
 }
 
 @Test func fact7_allowQuotedNullsFalseKeepsEmptyStringDistinctFromNull() throws {
