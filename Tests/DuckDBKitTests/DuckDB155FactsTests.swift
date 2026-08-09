@@ -57,12 +57,46 @@ private func tempCSV(_ contents: String) throws -> String {
     #expect(selected == 3)
 }
 
-// fact4 (read_xlsx takes `sheet =>`, not `sheet_name`) and fact6 (Delta time travel is
-// `version => n`; `AT (VERSION => n)` does not parse) are NOT tested here. Both need a
-// real .xlsx and a real Delta table, and this plan has no such fixtures — a version
-// pointed at a nonexistent path throws for the missing file, so the test would pass
-// whether or not the behavior still holds. A test that passes for the wrong reason is
-// worse than no test. Both land in Plan 2, where the fixtures exist.
+/// `Bundle.module` isn't visible from this target (only SiftCoreTests has the `resources:`
+/// copy of Tests/SiftCoreTests/Fixtures in Package.swift, and this file may only be appended
+/// to, not have Package.swift edited to add a second copy). `#filePath` is this file's own
+/// absolute source path at compile time, which `swift test` preserves regardless of process
+/// cwd — two `deletingLastPathComponent()` calls walk DuckDBKitTests/ up to Tests/, then back
+/// down into the sibling SiftCoreTests/Fixtures/ the golden workbook actually lives in.
+private func siftCoreTestsFixture(_ name: String) -> String {
+    URL(fileURLWithPath: #filePath)
+        .deletingLastPathComponent().deletingLastPathComponent()
+        .appendingPathComponent("SiftCoreTests/Fixtures/\(name)").path
+}
+
+/// Mirrors Tests/SiftCoreTests/Fixtures.swift's `extensionIsAvailable` (that one isn't visible
+/// from this target either — test targets don't export to one another in SwiftPM).
+private func extensionIsAvailable(_ name: String) -> Bool {
+    guard let db = try? Database.inMemory() else { return false }
+    db.loadExtensions([name])
+    return db.loadedExtensions[name] == true
+}
+
+@Test(.enabled(if: extensionIsAvailable("excel"), "duckdb excel extension not installed"))
+func fact4_readXlsxTakesSheetArrowNotSheetName() throws {
+    // MEASURED against libduckdb 1.5.5: read_xlsx's sheet-selection keyword is `sheet`, not
+    // pandas' familiar `sheet_name` — core/source.py's build_source sets `read_args["sheet"]`
+    // because of exactly this. Using the committed book.xlsx (not a nonexistent path) so this
+    // fails for the right reason if the keyword ever changes, not because the file is missing.
+    let path = siftCoreTestsFixture("book.xlsx")
+    let db = try Database.inMemory()
+    db.harden()
+    db.loadExtensions(["excel"])
+    let c = try db.connect()
+
+    let rows = try c.query("SELECT count(*) FROM read_xlsx('\(path)', sheet => 'By Store')").allRows()
+    guard case .int(let n) = rows[0][0] else { Issue.record("expected an integer"); return }
+    #expect(n == 50)   // 51 rows minus the header
+
+    #expect(throws: DuckDBError.self) {
+        _ = try c.query("SELECT count(*) FROM read_xlsx('\(path)', sheet_name='By Store')")
+    }
+}
 
 @Test func fact5_timestampWithTimeZoneNeedsNoPytz() throws {
     // In the Python engine this is a hard dependency: without pytz, fetching ANY
@@ -73,6 +107,106 @@ private func tempCSV(_ contents: String) throws -> String {
     try c.execute("SET TimeZone='UTC'")
     let v = try c.query("SELECT TIMESTAMPTZ '2026-08-09 12:00:00+00'").allRows()[0][0]
     #expect(v == .text("2026-08-09T12:00:00+00:00"))
+}
+
+private func fact6JSONString(_ obj: [String: Any]) throws -> String {
+    let data = try JSONSerialization.data(withJSONObject: obj, options: [.sortedKeys])
+    return String(data: data, encoding: .utf8) ?? ""
+}
+
+private func fact6JSONLine(_ obj: [String: Any]) throws -> String {
+    try fact6JSONString(obj) + "\n"
+}
+
+/// A minimal, real two-version Delta table: version 0 adds two parquet files, version 1
+/// tombstones one of them (which stays physically present on disk — that's the whole point).
+/// A trimmed, single-target copy of Tests/SiftCoreTests/Fixtures.swift's `makeDelta` (not
+/// reusable directly: SwiftPM test targets don't export to one another, and this file may only
+/// be appended to, not have Package.swift edited to add a cross-target dependency).
+private func makeDeltaFixture(con: Connection, dir: String, kept: Int = 100, tombstoned: Int = 50) throws -> String {
+    let root = (dir as NSString).appendingPathComponent("dtable")
+    let logDir = (root as NSString).appendingPathComponent("_delta_log")
+    try FileManager.default.createDirectory(atPath: logDir, withIntermediateDirectories: true)
+    func entryPath(_ name: String) -> String { (root as NSString).appendingPathComponent(name) }
+
+    let part0 = "part-0.parquet"
+    let part1 = "part-1.parquet"
+    try con.execute(
+        "COPY (SELECT range AS id, 'a' AS g FROM range(\(kept))) TO '\(entryPath(part0))' (FORMAT parquet)")
+    try con.execute(
+        "COPY (SELECT range AS id, 'b' AS g FROM range(\(kept), \(kept + tombstoned))) "
+            + "TO '\(entryPath(part1))' (FORMAT parquet)")
+
+    func fileSize(_ name: String) throws -> Int {
+        let attrs = try FileManager.default.attributesOfItem(atPath: entryPath(name))
+        return (attrs[.size] as? Int) ?? 0
+    }
+
+    let ms = 1_770_000_000_000
+    let schemaString = try fact6JSONString([
+        "type": "struct",
+        "fields": [
+            ["name": "id", "type": "long", "nullable": true, "metadata": [String: Any]()],
+            ["name": "g", "type": "string", "nullable": true, "metadata": [String: Any]()],
+        ],
+    ])
+
+    var log0 = try fact6JSONLine(["protocol": ["minReaderVersion": 1, "minWriterVersion": 2]])
+    log0 += try fact6JSONLine(["metaData": [
+        "id": UUID().uuidString.lowercased(),
+        "format": ["provider": "parquet", "options": [String: Any]()],
+        "schemaString": schemaString,
+        "partitionColumns": [String](),
+        "configuration": [String: Any](),
+        "createdTime": ms,
+    ]])
+    for part in [part0, part1] {
+        log0 += try fact6JSONLine(["add": [
+            "path": part, "partitionValues": [String: Any](), "size": try fileSize(part),
+            "modificationTime": ms, "dataChange": true,
+        ]])
+    }
+    try log0.write(
+        toFile: (logDir as NSString).appendingPathComponent("00000000000000000000.json"),
+        atomically: true, encoding: .utf8)
+
+    let log1 = try fact6JSONLine(["remove": [
+        "path": part1, "deletionTimestamp": ms + 1000,
+        "dataChange": true, "partitionValues": [String: Any](),
+        "size": try fileSize(part1),
+    ]])
+    try log1.write(
+        toFile: (logDir as NSString).appendingPathComponent("00000000000000000001.json"),
+        atomically: true, encoding: .utf8)
+
+    return root
+}
+
+@Test(.enabled(if: extensionIsAvailable("delta"), "duckdb delta extension not installed"))
+func fact6_deltaTimeTravelUsesVersionArrowNotAtVersion() throws {
+    // MEASURED against libduckdb 1.5.5: `delta_scan(path, version => n)` parses and works;
+    // `delta_scan(path, AT (VERSION => n))` — the syntax DuckDB's own SQL-standard AT clause
+    // uses for other table functions — does not parse against delta_scan. core/source.py's
+    // read_expr_at is built around exactly this.
+    let dir = FileManager.default.temporaryDirectory
+        .appendingPathComponent("sift-fact6-\(UUID().uuidString)").path
+    try FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+    let db = try Database.inMemory()
+    db.harden()
+    db.loadExtensions(["delta"])
+    let c = try db.connect()
+    let root = try makeDeltaFixture(con: c, dir: dir, kept: 100, tombstoned: 50)
+
+    // version => n works, and honors the tombstone (100 kept, not the 150 a raw glob would see).
+    let versioned = try c.query("SELECT count(*) FROM delta_scan('\(root)', version => 1)").allRows()[0][0]
+    #expect(versioned == .int(100))
+
+    let scanned = try c.query("SELECT count(*) FROM delta_scan('\(root)')").allRows()[0][0]
+    #expect(scanned == .int(100), "delta_scan must honor the tombstone, not the raw 150")
+
+    #expect(throws: DuckDBError.self) {
+        _ = try c.query("SELECT count(*) FROM delta_scan('\(root)', AT (VERSION => 0))")
+    }
 }
 
 @Test func fact7_allowQuotedNullsFalseKeepsEmptyStringDistinctFromNull() throws {
