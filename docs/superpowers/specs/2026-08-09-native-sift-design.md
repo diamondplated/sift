@@ -327,6 +327,21 @@ These are behavior, not implementation, and the rewrite must preserve every one:
   legitimate `select 1 -- comment`. A keyword blocklist is not an acceptable substitute.
 - `disabled_filesystems='HTTPFileSystem,S3FileSystem'`; `autoinstall_known_extensions=false`;
   `autoload_known_extensions=false`; `allow_community_extensions=false`.
+
+  **Measured 2026-08-09 against libduckdb 1.5.5, and it changes which setting does the
+  work.** On a clean install, a `SELECT` against an `https://` URL is refused by the
+  *extension* guard — `Missing Extension Error: ... requires the extension httpfs to be
+  loaded` — because `autoload_known_extensions=false` stops httpfs ever loading, so
+  `disabled_filesystems` is never consulted. `disabled_filesystems` produces its own
+  `Permission Error: File system HTTPFileSystem has been disabled by configuration`
+  only once something has already loaded httpfs.
+
+  The two are complementary layers covering different states, not redundant belt and
+  braces — removing either one leaves a hole the other does not cover. A test asserting
+  merely that the query throws proves nothing: with hardening removed entirely the URL
+  simply 404s, which throws too. Any test here must assert on the error *message*.
+
+  This applies equally to the current Python engine, which sets the same four options.
 - `enable_external_access` stays untouched — setting it false would block `read_csv` itself.
 - `~/.sift` created and enforced at `0700`.
 - Identifiers quoted via `q()`, values always bound as parameters. Never interpolated.
