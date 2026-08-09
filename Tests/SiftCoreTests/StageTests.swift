@@ -145,13 +145,18 @@ private func entry(_ name: String, _ daysAgo: Int, _ gb: Double) -> StagedEntry 
 @Test func catalogDDLPinsTheSharedSchemaColumnByColumn() {
     #expect(catalogDDL.contains("CREATE TABLE IF NOT EXISTS _sift_sources"))
 
-    // Verbatim, in order, from CATALOG_DDL.
+    // In order, from CATALOG_DDL. One deliberate divergence from Python: the PRIMARY KEY is
+    // `table_name`, not `source_token`. Two tabs of ONE file share a source token — `openPath`
+    // derives `x_2` precisely so that flow works — so the old key made the second tab's row
+    // REPLACE the first's, stranding a full copy in the store that no purge could reach while
+    // `stagedTotalBytes()` kept counting it. Every other statement that touches this table already
+    // keys on `table_name`. See SiftEngine's `migrateCatalog` for what an older store does.
     let expectedColumns = [
-        "source_token VARCHAR PRIMARY KEY",
+        "source_token VARCHAR",
         "path         VARCHAR",
         "mtime_ns     BIGINT",
         "size         BIGINT",
-        "table_name   VARCHAR",
+        "table_name   VARCHAR PRIMARY KEY",
         "fmt          VARCHAR",
         "staged_at    TIMESTAMP",
         "last_used    TIMESTAMP",
@@ -160,6 +165,6 @@ private func entry(_ name: String, _ daysAgo: Int, _ gb: Double) -> StagedEntry 
     ]
     #expect(catalogDDL.contains(expectedColumns.joined(separator: ",\n    ")))
 
-    // Exactly one PRIMARY KEY, and (checked above) it is on source_token, not floated elsewhere.
+    // Exactly one PRIMARY KEY, and (checked above) it is on table_name, not floated elsewhere.
     #expect(catalogDDL.components(separatedBy: "PRIMARY KEY").count == 2)
 }

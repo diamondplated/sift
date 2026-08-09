@@ -579,10 +579,11 @@ func aCopyOfOneSheetIsNeverServedAsAnother() async throws {
     try await waitForStaged(session, t.name)
     try await session.closeTable(t.name)
 
-    // Rewritten in place: same file count, so the directory's own stat is untouched.
+    // Rewritten IN PLACE — `atomically: true` would write a temp file and rename it, which is a
+    // directory-entry change and does move the directory's mtime. This is the case that hides.
     let before = try statInfo(dir)
     try (header + "1,West,999.50,EDITED\n").write(
-        toFile: (dir as NSString).appendingPathComponent("a.csv"), atomically: true, encoding: .utf8)
+        toFile: (dir as NSString).appendingPathComponent("a.csv"), atomically: false, encoding: .utf8)
     let after = try statInfo(dir)
     #expect(before.mtimeNs == after.mtimeNs && before.size == after.size,
             "the premise: a folder's own stat cannot see a member being rewritten")
@@ -651,10 +652,18 @@ func aCopyOfOneSheetIsNeverServedAsAnother() async throws {
         #expect(error.message.contains("conflict"), "expected a write-write conflict; got \(error.message)")
     }
     try? worker.execute("ROLLBACK")
+    try blocker.execute("ROLLBACK")
     #expect(firstAttemptFailed, "the conflict this test relies on did not happen")
 
-    // Now the real thing, through the same conflict.
+    // Now the real thing, through the same conflict: the blocker is released 50 ms in, while
+    // `swapStaged` is inside its 150 ms backoff, so attempt one hits the conflict and attempt two
+    // succeeds. Without the retry (or without the ROLLBACK that clears the failed transaction)
+    // this throws.
+    try blocker.execute("BEGIN TRANSACTION")
+    try blocker.execute("CREATE OR REPLACE VIEW t AS SELECT 3 AS x")
     try worker.execute("CREATE OR REPLACE TABLE \(q(stagingName("t"))) AS SELECT 42 AS x")
+    let release = ConnectionBox(blocker)
+    Thread.detachNewThread { Thread.sleep(forTimeInterval: 0.05); release.rollback() }
     try swapStaged(worker, name: "t", lock: NSLock())
     let rows = try worker.query("SELECT x FROM t").allRows()
     #expect(rows.count == 1)
@@ -837,4 +846,147 @@ private final class DoneFlag: @unchecked Sendable {
     private var value = false
     func set() { lock.withLock { value = true } }
     var isSet: Bool { lock.withLock { value } }
+}
+
+/// `Connection` is deliberately not `Sendable`; this is the same narrowly-scoped box
+/// `Tests/DuckDBKitTests/SmokeTests.swift` uses for `interrupt()`, here so a test can end a
+/// blocking transaction from another thread while the swap under test is in its backoff.
+private struct ConnectionBox: @unchecked Sendable {
+    let con: Connection
+    init(_ con: Connection) { self.con = con }
+    func rollback() { try? con.execute("ROLLBACK") }
+}
+
+// MARK: - M6: the timestamp round trip, pinned rather than left to the host's zone
+
+@Test func theCatalogsTimestampsAreReadBackInTheFrameTheyWereWrittenIn() throws {
+    // The end-to-end version of this ("last_used is close to now") is VACUOUS on a UTC host: with
+    // the `::TIMESTAMPTZ` cast removed it still passes under `TZ=UTC`. This one pins the session
+    // zone itself, so it is the same test on every machine: `now()` is a TIMESTAMPTZ landing in a
+    // naive TIMESTAMP column, so it stores LOCAL time, and reading it back without the cast is off
+    // by the zone's offset from UTC.
+    let con = try Database.inMemory().connect()
+    try con.execute("SET TimeZone='America/Chicago'")
+    #expect(try con.query("SELECT current_setting('TimeZone')").allRows()[0][0] == .text("America/Chicago"),
+            "the premise: this test needs a non-UTC session zone to say anything")
+    try con.execute(catalogDDL)
+    _ = try con.query(
+        "INSERT INTO _sift_sources VALUES ('t', '/x.csv', 0, 0, 'x', 'csv', now(), now(), 0, 0)")
+
+    let row = try con.query(
+        "SELECT epoch_ms(last_used::TIMESTAMPTZ), epoch_ms(last_used) FROM _sift_sources"
+    ).allRows()[0]
+    let cast = Date(timeIntervalSince1970: Double(cellInt(row[0])) / 1000)
+    let bare = Date(timeIntervalSince1970: Double(cellInt(row[1])) / 1000)
+
+    #expect(abs(cast.timeIntervalSinceNow) < 300, "the cast reads the instant that was written")
+    #expect(abs(bare.timeIntervalSinceNow) > 3600,
+            "and without it the value is off by the zone offset — 5 h for Chicago")
+}
+
+// MARK: - M8: the size half of "mtime or size"
+
+@Test func theStalenessSweepFiresOnSizeAloneAsWellAsMtimeAlone() throws {
+    // Every end-to-end test rewrites a file, which moves BOTH fields, so either half of this
+    // condition could be deleted with the suite green. Here the stored values are planted so that
+    // exactly one field disagrees with the file on disk.
+    let dir = try newTempDir()
+    let file = (dir as NSString).appendingPathComponent("src.csv")
+    try "x\n1\n".write(toFile: file, atomically: true, encoding: .utf8)
+    let real = try statInfo(file)
+
+    let con = try Database.inMemory().connect()
+    try con.execute(catalogDDL)
+    func plant(_ name: String, mtimeNs: Int, size: Int) throws {
+        try con.execute("CREATE TABLE \(q(name)) AS SELECT 1 AS x")
+        _ = try con.query(
+            "INSERT INTO _sift_sources VALUES (?, ?, ?, ?, ?, 'csv', now(), now(), 0, 1)",
+            [.text("token-\(name)"), .text(file), .int(Int64(mtimeNs)), .int(Int64(size)), .text(name)]
+        )
+    }
+    try plant("size_moved", mtimeNs: real.mtimeNs, size: real.size + 1)
+    try plant("mtime_moved", mtimeNs: real.mtimeNs + 1, size: real.size)
+    try plant("unchanged", mtimeNs: real.mtimeNs, size: real.size)
+
+    let dropped = try Session.purgeStagedTables(con, open: [], tables: nil, all: false)
+    #expect(Set(dropped) == ["size_moved", "mtime_moved"])
+    #expect(!dropped.contains("unchanged"), "a copy that still matches its source is left alone")
+}
+
+// MARK: - the startup purge, and a second Session in the same process
+
+@Test func aFreshSessionCollectsWhatTheLastOneLeftStale() async throws {
+    // My round-0 report claimed this test was impossible because "a second Session on the same
+    // home cannot be opened in-process". That was FALSE — DuckDB's file lock is cross-process
+    // only. (What two live in-process Sessions actually are is worse than sharing and is written
+    // up in the report; this test deliberately does NOT rely on it. The first session is released
+    // before the second opens, which is the real "next launch" this is about.)
+    let home = FileManager.default.temporaryDirectory
+        .appendingPathComponent("sift-staging-startup-\(UUID().uuidString)").path
+    let path = try makeSmallCSV()
+
+    do {
+        let first = try Session(home: home)
+        let t = try await first.openPath(path)
+        _ = try await first.stageNow(t.name, force: true)
+        try await waitForStaged(first, t.name)
+        try await waitForCatalog(first, count: 1)
+        try await first.closeTable(t.name)
+    }   // released: the store is now just a file on disk, as it would be after a quit
+
+    try "order_id,region,amount,note\n1,West,1.50,note 1\n".write(
+        toFile: path, atomically: true, encoding: .utf8)
+
+    let second = try Session(home: home)
+    #expect(second.engineInfo().sharedStore == true, "it really does open the same store")
+    #expect(try await second.stagedEntries().isEmpty,
+            "a copy of a file that has since changed must not survive a restart")
+}
+
+// MARK: - a store written by an older build
+
+@Test func aStoreFromAnOlderBuildIsResetRatherThanMisread() async throws {
+    // The catalog's key moved (I5) and the token format changed (C1). Neither can be patched in
+    // place, so a legacy store is reset: its copies are DROPPED — not left stranded where nothing
+    // can reach them — and the catalog is recreated with the current schema.
+    let home = FileManager.default.temporaryDirectory
+        .appendingPathComponent("sift-staging-legacy-\(UUID().uuidString)").path
+    try FileManager.default.createDirectory(atPath: home, withIntermediateDirectories: true)
+    let store = (home as NSString).appendingPathComponent("stage.duckdb")
+    let path = try makeSmallCSV()
+
+    do {   // exactly what an older build left behind: old key, v1 token, a real copy
+        let legacy = try Database(path: store)
+        let con = try legacy.connect()
+        try con.execute("""
+            CREATE TABLE _sift_sources (
+                source_token VARCHAR PRIMARY KEY, path VARCHAR, mtime_ns BIGINT, size BIGINT,
+                table_name VARCHAR, fmt VARCHAR, staged_at TIMESTAMP, last_used TIMESTAMP,
+                row_count BIGINT, bytes BIGINT)
+            """)
+        try con.execute("CREATE TABLE small AS SELECT 1 AS order_id")
+        let stat = try statInfo(path)
+        _ = try con.query(
+            "INSERT INTO _sift_sources VALUES (?, ?, ?, ?, 'small', 'csv', now(), now(), 1, 262144)",
+            [.text("\(path):\(stat.mtimeNs):\(stat.size)"),   // v1 format: no version, no members
+             .text(path), .int(Int64(stat.mtimeNs)), .int(Int64(stat.size))]
+        )
+    }
+
+    let session = try Session(home: home)
+    #expect(try await session.stagedEntries().isEmpty, "the legacy catalog is emptied")
+
+    // The copy it named is gone too, and the file opens fresh rather than adopting anything.
+    let reopened = try await session.openPath(path)
+    #expect(reopened.name == "small")
+    #expect(reopened.staged == false, "a v1 token must never resurrect a copy")
+    #expect(try await isNativeTable(session, "small", "small") == 0)
+    let page = try await session.page("small", offset: 0, limit: 5)
+    #expect(page.columns.map(\.name) == ["order_id", "region", "amount", "note"],
+            "the real file's shape, not the legacy copy's single column")
+
+    // And the catalog this build writes from here on is keyed the new way.
+    _ = try await session.stageNow("small", force: true)
+    try await waitForStaged(session, "small")
+    #expect(try await session.stagedEntries().count == 1)
 }
