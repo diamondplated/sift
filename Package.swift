@@ -45,9 +45,15 @@ let package = Package(
         // No linkerSettings here: DuckDBKit's rpath flags already propagate transitively through
         // this target's dependency on it, and a duplicate `-Xlinker -rpath` emits
         // `ld: warning: duplicate -rpath`.
+        //
+        // CDuckDB is listed explicitly (not just pulled in via DuckDBKit) because
+        // GuardStatements.swift calls duckdb_extract_statements directly: it needs a raw
+        // duckdb_connection, and DuckDBKit.Connection.handle is internal to that module by
+        // design (Task 3 must not touch Sources/DuckDBKit/**). SwiftPM does not make a
+        // dependency's own dependencies importable transitively, so this needs its own edge.
         .target(
             name: "SiftEngine",
-            dependencies: ["SiftCore", "DuckDBKit"]
+            dependencies: ["SiftCore", "DuckDBKit", "CDuckDB"]
         ),
         .testTarget(
             name: "SiftEngineTests",

@@ -4,24 +4,21 @@ import Testing
 // The SELECT-only gate, pure half. Ported from engine/tests/test_guard.py — its own header
 // calls it "the most important test file here." Note what these tests are and are not covering:
 // `assertNoDeniedLeadingKeyword` is a message improver, not the security boundary. The real
-// enforcement is the subquery wrap, covered by SQLGenTests (ported in Task 3).
+// enforcement is the subquery wrap, covered by SQLGenTests.
 //
-// DEFERRED TO PLAN 3 (SiftEngine, which owns the DuckDB connection needed for
-// duckdb_extract_statements): every case in Python's DENY/ALLOW lists is decided here except:
-//   - "SELECT 1; DROP TABLE x" (DENY) — starts with SELECT, so the leading-keyword check waves
-//     it through; only statement counting catches the second statement.
-//   - the second half of test_rejection_messages_are_sentences_not_parser_dumps, which asserts
-//     "SELECT 1; SELECT 2" produces a message containing "one statement at a time" — same reason.
-// Every other DENY case is caught by the leading-keyword check or the empty/comment-only guard;
-// every ALLOW case is a leading keyword that isn't in the deny list, so the pure half correctly
-// lets all of them through. See task-5-report.md for the full case-by-case reasoning.
+// Two cases in Python's DENY list and test_rejection_messages_are_sentences_not_parser_dumps
+// are not decidable by this pure half — "SELECT 1; DROP TABLE x" starts with SELECT, so only
+// statement counting (which needs a connection) catches the second statement. Those live in
+// Tests/SiftEngineTests/GuardStatementsTests.swift, alongside `assertSelectOnly`, which composes
+// this file's check with that one in the right order. Every other DENY case is caught by the
+// leading-keyword check or the empty/comment-only guard; every ALLOW case is a leading keyword
+// that isn't in the deny list, so the pure half correctly lets all of them through.
 
 // MARK: - DENY (decidable by the pure half)
 
 private let deny = [
     "DROP TABLE x",
     "drop table x",
-    // "SELECT 1; DROP TABLE x" — deferred to Plan 3, see header.
     "COPY x TO '/tmp/y'",
     "COPY (SELECT 1) TO '/tmp/y.csv'",
     "ATTACH 'x.db' AS y",
@@ -94,8 +91,9 @@ func allowed(sql: String) throws {
     } catch {
         Issue.record("wrong error type: \(error)")
     }
-    // The "SELECT 1; SELECT 2" -> "one statement at a time" half of this Python test is
-    // deferred to Plan 3 — see header.
+    // The "SELECT 1; SELECT 2" -> "one statement at a time" half of this Python test is not
+    // decidable by the pure half — see header; ported in
+    // Tests/SiftEngineTests/GuardStatementsTests.swift's rejectionMessageNamesOneStatementAtATime.
 }
 
 // MARK: - strip_sql_comments preserves string literals
