@@ -387,6 +387,25 @@ Seven phases. Each ends somewhere the branch is coherent.
 - Distributing a signed binary. Releases stay source-only. Notarization needs an Apple Developer ID,
   and those credentials are Andrew's to handle. screenwren already carries a `workflow_dispatch`
   notarize workflow that could be copied later if wanted.
+
+- **The Mac App Store, and therefore App Sandbox.** Sift reads paths the user names, which is what
+  it is for; the sandbox exists to prevent exactly that. Two documented features die under it — the
+  paste-a-path box (a typed path is not a user selection, so the sandbox denies it) and the SQL
+  box's ability to read a file that is not already open.
+
+  Recorded because the usual objections to sandboxing Sift do **not** survive this rewrite. The
+  Python sidecar, the loopback HTTP server, and the ordeal of bundling a Python runtime all
+  disappear, and the primary flows — Dock drop, Finder "Open With", File > Open — are user-selected
+  and would be granted. In-process DuckDB reading a user-granted path is fine; a separate Python
+  process reading it was the hard case. The native app is therefore far more sandbox-viable than the
+  current one. It is still not worth doing.
+
+  None of this affects the distribution path actually in use. screenwren notarizes for **Developer
+  ID direct distribution** (`codesign` → `notarytool` → `stapler`), which requires the hardened
+  runtime and no sandbox whatsoever. If Sift is ever signed, that is the route. One consequence to
+  remember then: the bundled `libduckdb.dylib` must be signed too, or library validation rejects it
+  at launch.
+
 - A phone or remote companion. `PhotoServe` proves it is ~160 lines in latent, but nothing here
   needs it, and adding a server back is exactly what this rewrite removes.
 - Any change to what Sift does. No new formats, no live database connector, no write path beyond the
