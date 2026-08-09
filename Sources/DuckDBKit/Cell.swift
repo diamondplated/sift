@@ -28,6 +28,12 @@ public enum Cell: Sendable, Equatable {
 
     /// Display form. `blob` reproduces session.jsonable's `<blob N B>` exactly,
     /// thousands separator included.
+    ///
+    /// **`display` is lossy on purpose and must not be used to decide anything.** It renders
+    /// `.null` and `.text("")` identically as `""`, collapsing two of the three states — NULL,
+    /// `''`, `'N/A'` — that design spec §9 calls non-negotiable. The distinction survives in
+    /// the enum, so the grid, the profile panel and every filter branch on the CASE; only the
+    /// glyph on screen comes from here.
     public var display: String {
         switch self {
         case .null:            return ""
@@ -43,13 +49,23 @@ public enum Cell: Sendable, Equatable {
 
     /// Re-pads to `scale` digits after the point. `v * 10^scale` is an integer-valued
     /// Decimal (its own description has no decimal point), so splicing it back in by
-    /// hand — same trick `Chunk.decodeDecimal` uses on the way in — recovers exactly
+    /// hand — the same call `Chunk.decodeDecimal` makes on the way in — recovers exactly
     /// the digit count DECIMAL declared, trailing zeros included.
     static func decimalDisplay(_ v: Decimal, scale: Int) -> String {
         guard scale > 0 else { return "\(v)" }
         let scaled = v * pow(Decimal(10), scale)
         let negative = scaled < 0
-        var digits = "\(negative ? -scaled : scaled)"
+        return splice("\(negative ? -scaled : scaled)", scale: scale, negative: negative)
+    }
+
+    /// Puts a decimal point `scale` digits from the right of an unscaled magnitude,
+    /// zero-padding so at least one digit stays in front of it.
+    ///
+    /// One copy, called from both directions — the decoder on the way in and `display` on
+    /// the way out. They were two copies, and two copies of this shape is exactly how the
+    /// trailing-zero bug got shipped.
+    static func splice(_ magnitude: String, scale: Int, negative: Bool) -> String {
+        var digits = magnitude
         while digits.count <= scale { digits = "0" + digits }
         let cut = digits.index(digits.endIndex, offsetBy: -scale)
         return "\(negative ? "-" : "")\(digits[..<cut]).\(digits[cut...])"

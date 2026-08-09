@@ -55,6 +55,38 @@ private func one(_ sql: String) throws -> Cell {
     #expect(try one("SELECT (-1)::HUGEINT") == .text("-1"))
 }
 
+@Test func decodesThe128BitBoundaries() throws {
+    // The actual ends of the range, where the two's-complement negate across both halves
+    // and the carry-when-lower-is-zero either work or produce a plausible wrong number.
+    // Int128.max:
+    #expect(try one("SELECT 170141183460469231731687303715884105727::HUGEINT")
+            == .text("170141183460469231731687303715884105727"))
+    // Int128.min. Written as max-minus-one because the bare literal is parsed as UINT128
+    // before the negation and DuckDB refuses the cast — MEASURED: "Type UINT128 with value
+    // 170141183460469231731687303715884105728 can't be cast ... out of range for INT128".
+    #expect(try one("SELECT (-170141183460469231731687303715884105727)::HUGEINT - 1")
+            == .text("-170141183460469231731687303715884105728"))
+    // UInt128.max — the case where `upper` fills every bit and a signed read would print
+    // a negative number.
+    #expect(try one("SELECT 340282366920938463463374607431768211455::UHUGEINT")
+            == .text("340282366920938463463374607431768211455"))
+    #expect(try one("SELECT 0::UHUGEINT") == .text("0"))
+}
+
+@Test func nullAndEmptyStringAndASentinelStayThreeDistinctThings() throws {
+    // Design spec §9, non-negotiable. `display` renders the first two identically as "" —
+    // it is a rendering affordance, not a decision input — so the distinction has to live
+    // in the enum, and this is the test that says it still does.
+    let rows = try Database.inMemory().connect().query(
+        "SELECT * FROM (VALUES (NULL), (''), ('N/A')) AS t(v)"
+    ).allRows()
+    #expect(rows.map(\.[0]) == [.null, .text(""), .text("N/A")])
+    #expect(rows[0][0] != rows[1][0])
+    #expect(rows[0][0].isNull && !rows[1][0].isNull && !rows[2][0].isNull)
+    // The collapse `display` performs, pinned so nobody mistakes it for a decision input.
+    #expect(rows[0][0].display == rows[1][0].display)
+}
+
 @Test func aNullInsideANestedColumnStaysNull() throws {
     // The highest-value test in this file. STRUCT/ARRAY/UNION keep their values in child
     // vectors, so the top-level data pointer is nil and there is no decoder — but the

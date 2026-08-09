@@ -253,10 +253,8 @@ public final class Chunk {
         }
 
         let negative = unscaled.hasPrefix("-")
-        var digits = negative ? String(unscaled.dropFirst()) : unscaled
-        while digits.count <= scale { digits = "0" + digits }
-        let cut = digits.index(digits.endIndex, offsetBy: -scale)
-        let text = "\(negative ? "-" : "")\(digits[..<cut]).\(digits[cut...])"
+        let text = Cell.splice(negative ? String(unscaled.dropFirst()) : unscaled,
+                               scale: scale, negative: negative)
         guard let v = Decimal(string: text) else {
             return .text("⟨unparseable decimal \(text)⟩")
         }
@@ -345,12 +343,18 @@ public final class Chunk {
         var s = "\(year4(c.year))-" + String(format: "%02d-%02dT%02d:%02d:%02d",
                        c.month, c.day,
                        secOfDay / 3600, (secOfDay % 3600) / 60, secOfDay % 60)
-        if frac != 0 && fracDigits > 0 {
-            var digits = String(frac)
-            while digits.count < fracDigits { digits = "0" + digits }
-            s += "." + digits
-        }
+        if frac != 0 && fracDigits > 0 { s += "." + pad(frac, to: fracDigits) }
         return s + suffix
+    }
+
+    /// Zero-pads to `width` digits. One copy: this loop existed four times over, and the one
+    /// caller that also trimmed trailing zeros drifted from the three that must not — which
+    /// is how a shipped fraction bug got in. `intervalString` still trims, deliberately, but
+    /// now it trims a shared result instead of re-implementing the padding beside it.
+    static func pad(_ value: some BinaryInteger, to width: Int) -> String {
+        var s = String(value)
+        while s.count < width { s = "0" + s }
+        return s
     }
 
     static func isoTime(micros: Int64) -> String {
@@ -358,11 +362,7 @@ public final class Chunk {
         let frac = micros % 1_000_000
         var s = String(format: "%02d:%02d:%02d",
                        secOfDay / 3600, (secOfDay % 3600) / 60, secOfDay % 60)
-        if frac != 0 {
-            var digits = String(frac)
-            while digits.count < 6 { digits = "0" + digits }
-            s += "." + digits
-        }
+        if frac != 0 { s += "." + pad(frac, to: 6) }
         return s
     }
 
@@ -374,11 +374,7 @@ public final class Chunk {
     static func isoTimeTz(_ raw: duckdb_time_tz) -> String {
         let d = duckdb_from_time_tz(raw)
         var s = String(format: "%02d:%02d:%02d", d.time.hour, d.time.min, d.time.sec)
-        if d.time.micros != 0 {
-            var digits = String(d.time.micros)
-            while digits.count < 6 { digits = "0" + digits }
-            s += "." + digits
-        }
+        if d.time.micros != 0 { s += "." + pad(d.time.micros, to: 6) }
         let mag = abs(Int(d.offset))   // offset is bounded to +/-16h, nowhere near Int32.min
         s += (d.offset < 0 ? "-" : "+") + String(format: "%02d:%02d", mag / 3600, (mag % 3600) / 60)
         return s
@@ -425,8 +421,10 @@ public final class Chunk {
             var time = String(format: "%02d:%02d:%02d",
                               totalSeconds / 3600, (totalSeconds % 3600) / 60, totalSeconds % 60)
             if frac != 0 {
-                var digits = String(frac)
-                while digits.count < 6 { digits = "0" + digits }
+                // Trims, unlike every timestamp path — verified against DuckDB's own
+                // CAST(iv AS VARCHAR). That difference is correct, and it is the whole
+                // reason the padding itself had to stop being copy-pasted beside it.
+                var digits = pad(frac, to: 6)
                 while digits.hasSuffix("0") { digits.removeLast() }
                 time += "." + digits
             }
