@@ -444,6 +444,57 @@ Seven phases. Each ends somewhere the branch is coherent.
    requirements files. Rewrite `README.md`, `AGENTS.md`, `CONTRIBUTING.md`, `SECURITY.md`. Tag
    v2.0.0.
 
+## 13a. Known gaps carried out of Plan 1
+
+Measured during the DuckDBKit build and deliberately not fixed there. Each names the
+plan that owns it. Nothing here is silently wrong — every unsupported path renders a
+loud marker — but each is a real limitation with a known shape.
+
+**`interrupt()` is not fire-and-forget — Plan 3.** Measured against libduckdb 1.5.5: a
+single `duckdb_interrupt` call issued before execution begins is **swallowed**, and the
+query runs to completion (4.20 s in the probe). The flag is cleared as execution starts,
+so a cancel landing one instruction early is indistinguishable from one that never
+fired. Hammering the interrupt in a loop cancels reliably (5/5 runs, 0.000–0.002 s,
+`INTERRUPT Error: Interrupted!`). `Session.cancel` must therefore **keep re-asserting
+the interrupt for as long as the job is meant to be cancelled**, not call it once. The
+Python engine's single `con.interrupt()` does not port across.
+
+**Six DuckDB types do not decode — Plan 2.** `ENUM` (23), `BIT` (29), `BIGNUM` (35),
+`TIME_NS` (39), `VARIANT` (41) and `GEOMETRY` (40) render `⟨unsupported type N⟩`. NULLs
+in those columns still decode to `.null` correctly. `TIME_NS` is the notable one — the
+direct sibling of the `TIMESTAMP_NS` that Plan 1 does decode. Note that
+`DUCKDB_TYPE_VARINT` does not exist on 1.5.5; the type is `BIGNUM`.
+
+**JSON classifies as text, not nested — Plan 2.** `duckdb_column_logical_type` reports
+JSON as type id 17 (`VARCHAR`), so `kind_of` buckets a JSON column as `text` where the
+Python engine gives `nested`. `duckdb_logical_type_get_alias` (`duckdb.h:3070`) returns
+`"JSON"` for such a column and `nil` for a plain VARCHAR — reading the alias in
+`ResultSet.init` and preferring it when non-nil closes this in about three lines.
+
+**`loadedExtensions[name] == false` conflates two failures — Plan 3.** A legal name with
+no such extension installed, and a name rejected by the injection guard, both record
+`false`. Spec §11 turns this dictionary into "a missing `delta` extension refuses the
+open", so a caller cannot distinguish a missing binary from a typo in its own call.
+
+**A mid-stream result error cannot be tested here — Plan 3 if streaming is adopted.**
+`allRows()` throws if `duckdb_result_error` is set after the drain, which closes the
+silent-truncation hole. But `duckdb_execute_prepared` materializes, so on the current
+execution path nothing can fail after the first chunk and the branch is unreachable by
+test. It becomes testable only if `Connection.query` moves to
+`duckdb_execute_prepared_streaming`.
+
+**`TIME_TZ` offsets drop sub-minute seconds — nobody, unless it bites.** `+15:59:59`
+renders `+15:59`. Reachable only with historical LMT-style offsets.
+
+**`Cell.decimal` carries its scale — Plan 2 must know the shape.**
+`case decimal(Decimal, scale: Int)`. `Decimal` canonicalizes trailing zeros on
+`description`, so without the scale riding along a `DECIMAL(10,2)` money column renders
+`10.5` instead of `10.50`. Consequence for pattern-matching: `.decimal(1.5, scale: 2)`
+and `.decimal(1.5, scale: 3)` are **not** equal, while two spellings of the same stored
+value at the same scale are.
+
+---
+
 ## 14. Out of scope
 
 - Distributing a signed binary. Releases stay source-only. Notarization needs an Apple Developer ID,
