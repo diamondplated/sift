@@ -38,16 +38,19 @@
 | `Sources/DuckDBKit/Connection.swift` | One connection; `query`, `execute`, `interrupt` |
 | `Sources/DuckDBKit/DBValue.swift` | Bind-parameter enum |
 | `Sources/DuckDBKit/Statement.swift` | Prepare, bind, execute |
+| `Sources/DuckDBKit/ResultSet.swift` | Owns the `duckdb_result` handle and its column metadata |
 | `Sources/DuckDBKit/Cell.swift` | Decoded value enum |
 | `Sources/DuckDBKit/ColumnMeta.swift` | Column name, DuckDB type id, decimal scale and width |
-| `Sources/DuckDBKit/Chunk.swift` | Chunk → `[[Cell]]` decode, validity-mask aware |
+| `Sources/DuckDBKit/Chunk.swift` | Chunk → `[[Cell]]` decode, validity-mask aware; extends `ResultSet` with row reading |
 | `Tests/DuckDBKitTests/SmokeTests.swift` | Open, query, decode a literal |
-| `Tests/DuckDBKitTests/BindingTests.swift` | Every `DBValue` case round-trips (written in Task 5, covers Task 3) |
+| `Tests/DuckDBKitTests/BindingTests.swift` | Bound values round-trip (Task 5 — needs the decoder to read them back) |
 | `Tests/DuckDBKitTests/DecodeTests.swift` | Every decodable type, NULL handling, boundaries |
 | `Tests/DuckDBKitTests/DuckDB155FactsTests.swift` | Seven of the nine measured behaviors, re-pinned (two need Plan 2 fixtures) |
 | `.github/workflows/ci-native.yml` | Build + test on macos-15 |
 
-`Chunk.swift` is the only file with pointer arithmetic. Keeping it alone in one file is deliberate — it is the file most likely to be wrong and the one a reviewer must read closely.
+`Chunk.swift` is the only file with pointer arithmetic. Keeping it alone in one file is deliberate — it is the file most likely to be wrong and the one a reviewer must read closely. `ResultSet` is kept separate from it so that file owns exactly one thing: the result handle's lifetime and the schema.
+
+**Task order is dependency order, and it is load-bearing.** `ColumnMeta` (Task 3) must exist before `ResultSet` (Task 4), which must exist before `Connection.query` can return it, which must exist before the decoder (Task 5) can read rows out of it. Every task leaves `swift build && swift test` green.
 
 ---
 
@@ -455,124 +458,22 @@ git commit -m "Add Database and Connection over the DuckDB C API"
 
 ---
 
-### Task 3: Bind parameters
-
-**Files:**
-- Create: `Sources/DuckDBKit/DBValue.swift`
-- Create: `Sources/DuckDBKit/Statement.swift`
-- Test: `Tests/DuckDBKitTests/BindingTests.swift`
-
-**Interfaces:**
-- Consumes: `Connection`, `DuckDBError`.
-- Produces:
-  - `enum DBValue: Sendable, Equatable { case null, bool(Bool), int(Int64), double(Double), text(String) }`
-  - `Connection.query(_ sql: String, _ params: [DBValue]) throws -> ResultSet`
-
-  `DBValue`'s five cases are exactly what `core/sqlgen.py` produces as bound parameters: filter values, limits and offsets. Nothing else is ever bound — identifiers are quoted, never parameterized.
-
-Binding cannot be observed until values can be read back, and reading them back is
-Task 5. So this task ships the binding code and Task 5 ships the tests that exercise it
-— rather than committing a test file that does not compile for two tasks. Every commit
-in this plan leaves `swift build && swift test` green.
-
-- [ ] **Step 1: Write DBValue**
-
-Create `Sources/DuckDBKit/DBValue.swift`:
-
-```swift
-import Foundation
-
-/// A bound query parameter.
-///
-/// The invariant this exists to serve, inherited from core/sqlgen.py: identifiers are
-/// quoted, values are always bound. Nothing in Sift interpolates a user value into SQL
-/// text, so this covers every value that ever reaches DuckDB.
-public enum DBValue: Sendable, Equatable {
-    case null
-    case bool(Bool)
-    case int(Int64)
-    case double(Double)
-    case text(String)
-}
-```
-
-- [ ] **Step 2: Write Statement and the query entry point**
-
-Create `Sources/DuckDBKit/Statement.swift`:
-
-```swift
-import CDuckDB
-import Foundation
-
-extension Connection {
-    /// Prepare, bind and execute. The only way to run SQL that carries values.
-    public func query(_ sql: String, _ params: [DBValue] = []) throws -> ResultSet {
-        var stmt: duckdb_prepared_statement?
-        let prepared = duckdb_prepare(handle, sql, &stmt)
-        defer { duckdb_destroy_prepare(&stmt) }
-
-        if prepared != DuckDBSuccess {
-            let msg = duckdb_prepare_error(stmt).map(String.init(cString:)) ?? ""
-            throw DuckDBError(msg)
-        }
-
-        // DuckDB parameter indexes are 1-based.
-        for (offset, value) in params.enumerated() {
-            let idx = idx_t(offset + 1)
-            let state: duckdb_state
-            switch value {
-            case .null:            state = duckdb_bind_null(stmt, idx)
-            case .bool(let v):     state = duckdb_bind_boolean(stmt, idx, v)
-            case .int(let v):      state = duckdb_bind_int64(stmt, idx, v)
-            case .double(let v):   state = duckdb_bind_double(stmt, idx, v)
-            case .text(let v):     state = duckdb_bind_varchar(stmt, idx, v)
-            }
-            if state != DuckDBSuccess {
-                throw DuckDBError("could not bind parameter \(offset + 1)")
-            }
-        }
-
-        var result = duckdb_result()
-        if duckdb_execute_prepared(stmt, &result) != DuckDBSuccess {
-            let msg = duckdb_result_error(&result).map(String.init(cString:)) ?? ""
-            duckdb_destroy_result(&result)
-            throw DuckDBError(msg)
-        }
-        return ResultSet(result: result)
-    }
-}
-```
-
-- [ ] **Step 3: Build and confirm the existing suite still passes**
-
-Run: `swift build && swift test`
-Expected: build succeeds, the 6 tests from Tasks 1-2 still pass.
-
-- [ ] **Step 4: Commit**
-
-```bash
-git add Sources/DuckDBKit/DBValue.swift Sources/DuckDBKit/Statement.swift
-git commit -m "Add parameter binding over prepared statements"
-```
-
----
-
-### Task 4: Column metadata and the Cell type
+### Task 3: Cell and ColumnMeta
 
 **Files:**
 - Create: `Sources/DuckDBKit/Cell.swift`
 - Create: `Sources/DuckDBKit/ColumnMeta.swift`
 
 **Interfaces:**
-- Consumes: nothing.
+- Consumes: nothing (pure value types — this is why the task comes first).
 - Produces:
-  - `enum Cell: Sendable, Equatable { case null, bool(Bool), int(Int64), double(Double), text(String), decimal(Decimal), blob(Int) }`
+  - `enum Cell: Sendable, Equatable { case null, bool(Bool), int(Int64), double(Double), text(String), decimal(Decimal), blob(Int) }` with `var isNull: Bool` and `var display: String`.
   - `struct ColumnMeta: Sendable { let name: String; let typeID: duckdb_type; let decimalScale: UInt8; let decimalWidth: UInt8; let typeName: String }`
 
-  `Cell.text` carries VARCHAR, HUGEINT/UHUGEINT (128-bit, no Swift native), UUID and
-  temporal values as ISO-8601 — matching what `session.jsonable` produces today.
-  `Cell.blob` carries only a byte count, because the grid renders `<blob N B>` and
-  never the bytes.
+  `Cell.text` carries VARCHAR, HUGEINT/UHUGEINT (128-bit, no Swift native on this
+  toolchain), UUID, and temporal values as ISO-8601 — matching what the Python engine's
+  `jsonable` produces today. `Cell.blob` carries only a byte count, because the grid
+  renders `<blob N B>` and never the bytes.
 
 - [ ] **Step 1: Write Cell**
 
@@ -632,33 +533,275 @@ import CDuckDB
 import Foundation
 
 /// What the decoder needs to know about one result column.
-///
-/// `decimalScale` is carried separately because DECIMAL keeps its scale in the logical
-/// type, not the value — decoding through Double would lose exactly the precision this
-/// tool exists to preserve.
 public struct ColumnMeta: Sendable {
     public let name: String
     public let typeID: duckdb_type
-    /// DECIMAL only. Digits after the point.
+    /// DECIMAL only. Digits after the point. DECIMAL keeps its scale in the logical
+    /// type, not the value — decoding through Double would lose exactly the precision
+    /// this tool exists to preserve.
     public let decimalScale: UInt8
     /// DECIMAL only. Total digits — this picks the backing integer:
     /// <=4 SMALLINT, <=9 INTEGER, <=18 BIGINT, else HUGEINT. Reading a
-    /// DECIMAL(4,2) as BIGINT does not fail, it just returns a wrong number.
+    /// DECIMAL(4,2) as BIGINT does not fail, it silently returns a wrong number.
     public let decimalWidth: UInt8
     public let typeName: String
+
+    public init(name: String, typeID: duckdb_type, decimalScale: UInt8,
+                decimalWidth: UInt8, typeName: String) {
+        self.name = name
+        self.typeID = typeID
+        self.decimalScale = decimalScale
+        self.decimalWidth = decimalWidth
+        self.typeName = typeName
+    }
 }
 ```
 
-- [ ] **Step 3: Build**
+- [ ] **Step 3: Write the failing test**
 
-Run: `swift build`
-Expected: succeeds. (No tests yet — Task 5 exercises both types.)
+Append to `Tests/DuckDBKitTests/SmokeTests.swift`:
 
-- [ ] **Step 4: Commit**
+```swift
+@Test func blobDisplayMatchesThePythonEngineFormat() {
+    // session.jsonable renders a blob as "<blob 1,234 B>" — thousands separator and
+    // all. The grid shows this string, so the format is a contract, not a detail.
+    #expect(Cell.blob(3).display == "<blob 3 B>")
+    #expect(Cell.blob(1234).display == "<blob 1,234 B>")
+}
+
+@Test func nullDisplaysAsEmptyAndKnowsItIsNull() {
+    #expect(Cell.null.isNull)
+    #expect(Cell.null.display == "")
+    #expect(!Cell.int(0).isNull)
+}
+```
+
+- [ ] **Step 4: Run tests**
+
+Run: `swift build && swift test`
+Expected: PASS — 9 tests (7 from Tasks 1-2, 2 new). No warnings.
+
+If `blobDisplayMatchesThePythonEngineFormat` fails on the separator, the machine's
+locale is not en_US. Do not weaken the test; note it in your report — the format is a
+contract and this needs to be resolved deliberately.
+
+- [ ] **Step 5: Commit**
 
 ```bash
-git add Sources/DuckDBKit/Cell.swift Sources/DuckDBKit/ColumnMeta.swift
+git add Sources/DuckDBKit/Cell.swift Sources/DuckDBKit/ColumnMeta.swift Tests/DuckDBKitTests/SmokeTests.swift
 git commit -m "Add Cell and ColumnMeta value types"
+```
+
+---
+
+### Task 4: Binding, prepared statements, and ResultSet
+
+**Files:**
+- Create: `Sources/DuckDBKit/DBValue.swift`
+- Create: `Sources/DuckDBKit/ResultSet.swift`
+- Create: `Sources/DuckDBKit/Statement.swift`
+- Test: `Tests/DuckDBKitTests/SmokeTests.swift` (append)
+
+**Interfaces:**
+- Consumes: `Connection`, `DuckDBError`, `ColumnMeta`.
+- Produces:
+  - `enum DBValue: Sendable, Equatable { case null, bool(Bool), int(Int64), double(Double), text(String) }`
+  - `final class ResultSet` owning a `duckdb_result`, exposing `var columns: [ColumnMeta]`. Row reading (`nextChunk`, `allRows`) is added by Task 5 as an extension.
+  - `Connection.query(_ sql: String, _ params: [DBValue] = []) throws -> ResultSet`
+
+  `DBValue`'s five cases are exactly what the Python `core/sqlgen.py` produces as bound
+  parameters: filter values, limits and offsets. Nothing else is ever bound —
+  identifiers are quoted, never parameterized.
+
+  `ResultSet` lands here rather than with the decoder because `Connection.query` returns
+  it; defining it later would leave this task uncompilable.
+
+- [ ] **Step 1: Write DBValue**
+
+Create `Sources/DuckDBKit/DBValue.swift`:
+
+```swift
+import Foundation
+
+/// A bound query parameter.
+///
+/// The invariant this exists to serve, inherited from core/sqlgen.py: identifiers are
+/// quoted, values are always bound. Nothing in Sift interpolates a user value into SQL
+/// text, so this covers every value that ever reaches DuckDB.
+public enum DBValue: Sendable, Equatable {
+    case null
+    case bool(Bool)
+    case int(Int64)
+    case double(Double)
+    case text(String)
+}
+```
+
+- [ ] **Step 2: Write ResultSet**
+
+Create `Sources/DuckDBKit/ResultSet.swift`:
+
+```swift
+import CDuckDB
+import Foundation
+
+/// A query result: owns the `duckdb_result` and its column metadata.
+///
+/// Row reading lives in Chunk.swift as an extension, so this file stays responsible
+/// for exactly one thing — the handle's lifetime and the schema.
+public final class ResultSet {
+    var result: duckdb_result
+    public let columns: [ColumnMeta]
+
+    init(result: duckdb_result) {
+        var r = result
+        var metas: [ColumnMeta] = []
+        let count = Int(duckdb_column_count(&r))
+        metas.reserveCapacity(count)
+        for i in 0..<count {
+            let idx = idx_t(i)
+            let name = duckdb_column_name(&r, idx).map(String.init(cString:)) ?? ""
+            var logical = duckdb_column_logical_type(&r, idx)
+            let typeID = duckdb_get_type_id(logical)
+            let isDecimal = typeID == DUCKDB_TYPE_DECIMAL
+            let scale = isDecimal ? duckdb_decimal_scale(logical) : 0
+            let width = isDecimal ? duckdb_decimal_width(logical) : 0
+            duckdb_destroy_logical_type(&logical)
+            metas.append(ColumnMeta(name: name, typeID: typeID, decimalScale: scale,
+                                    decimalWidth: width, typeName: Self.typeName(typeID)))
+        }
+        self.result = result
+        self.columns = metas
+    }
+
+    deinit {
+        duckdb_destroy_result(&result)
+    }
+
+    static func typeName(_ t: duckdb_type) -> String {
+        switch t {
+        case DUCKDB_TYPE_BOOLEAN:      return "BOOLEAN"
+        case DUCKDB_TYPE_TINYINT:      return "TINYINT"
+        case DUCKDB_TYPE_SMALLINT:     return "SMALLINT"
+        case DUCKDB_TYPE_INTEGER:      return "INTEGER"
+        case DUCKDB_TYPE_BIGINT:       return "BIGINT"
+        case DUCKDB_TYPE_UTINYINT:     return "UTINYINT"
+        case DUCKDB_TYPE_USMALLINT:    return "USMALLINT"
+        case DUCKDB_TYPE_UINTEGER:     return "UINTEGER"
+        case DUCKDB_TYPE_UBIGINT:      return "UBIGINT"
+        case DUCKDB_TYPE_HUGEINT:      return "HUGEINT"
+        case DUCKDB_TYPE_UHUGEINT:     return "UHUGEINT"
+        case DUCKDB_TYPE_FLOAT:        return "FLOAT"
+        case DUCKDB_TYPE_DOUBLE:       return "DOUBLE"
+        case DUCKDB_TYPE_DECIMAL:      return "DECIMAL"
+        case DUCKDB_TYPE_VARCHAR:      return "VARCHAR"
+        case DUCKDB_TYPE_BLOB:         return "BLOB"
+        case DUCKDB_TYPE_DATE:         return "DATE"
+        case DUCKDB_TYPE_TIME:         return "TIME"
+        case DUCKDB_TYPE_TIMESTAMP:    return "TIMESTAMP"
+        case DUCKDB_TYPE_TIMESTAMP_TZ: return "TIMESTAMP WITH TIME ZONE"
+        case DUCKDB_TYPE_UUID:         return "UUID"
+        default:                       return "OTHER"
+        }
+    }
+}
+```
+
+- [ ] **Step 3: Write Statement and the query entry point**
+
+Create `Sources/DuckDBKit/Statement.swift`:
+
+```swift
+import CDuckDB
+import Foundation
+
+extension Connection {
+    /// Prepare, bind and execute. The only way to run SQL that carries values.
+    public func query(_ sql: String, _ params: [DBValue] = []) throws -> ResultSet {
+        var stmt: duckdb_prepared_statement?
+        let prepared = duckdb_prepare(handle, sql, &stmt)
+        defer { duckdb_destroy_prepare(&stmt) }
+
+        if prepared != DuckDBSuccess {
+            let msg = duckdb_prepare_error(stmt).map(String.init(cString:)) ?? ""
+            throw DuckDBError(msg)
+        }
+
+        // DuckDB parameter indexes are 1-based.
+        for (offset, value) in params.enumerated() {
+            let idx = idx_t(offset + 1)
+            let state: duckdb_state
+            switch value {
+            case .null:          state = duckdb_bind_null(stmt, idx)
+            case .bool(let v):   state = duckdb_bind_boolean(stmt, idx, v)
+            case .int(let v):    state = duckdb_bind_int64(stmt, idx, v)
+            case .double(let v): state = duckdb_bind_double(stmt, idx, v)
+            case .text(let v):   state = duckdb_bind_varchar(stmt, idx, v)
+            }
+            if state != DuckDBSuccess {
+                throw DuckDBError("could not bind parameter \(offset + 1)")
+            }
+        }
+
+        var result = duckdb_result()
+        if duckdb_execute_prepared(stmt, &result) != DuckDBSuccess {
+            let msg = duckdb_result_error(&result).map(String.init(cString:)) ?? ""
+            duckdb_destroy_result(&result)
+            throw DuckDBError(msg)
+        }
+        return ResultSet(result: result)
+    }
+}
+```
+
+- [ ] **Step 4: Write the failing tests**
+
+Append to `Tests/DuckDBKitTests/SmokeTests.swift`:
+
+```swift
+@Test func reportsColumnNamesInOrder() throws {
+    let con = try Database.inMemory().connect()
+    let rs = try con.query("SELECT 1 AS alpha, 2 AS beta")
+    #expect(rs.columns.map(\.name) == ["alpha", "beta"])
+}
+
+@Test func reportsDecimalScaleAndWidth() throws {
+    let con = try Database.inMemory().connect()
+    let rs = try con.query("SELECT 1.23::DECIMAL(9,3) AS d")
+    #expect(rs.columns[0].typeName == "DECIMAL")
+    #expect(rs.columns[0].decimalScale == 3)
+    #expect(rs.columns[0].decimalWidth == 9)
+}
+
+@Test func aPrepareFailureThrows() throws {
+    let con = try Database.inMemory().connect()
+    #expect(throws: DuckDBError.self) {
+        _ = try con.query("SELECT * FROM nope WHERE x = ?", [.int(1)])
+    }
+}
+
+@Test func bindingAcceptsEveryValueKindWithoutThrowing() throws {
+    // Values are read back in Task 5, once chunk decoding exists. This asserts the
+    // bind path itself accepts all five cases and executes.
+    let con = try Database.inMemory().connect()
+    let rs = try con.query(
+        "SELECT ?::BOOLEAN AS b, ?::BIGINT AS i, ?::DOUBLE AS d, ?::VARCHAR AS s, ?::VARCHAR AS n",
+        [.bool(true), .int(42), .double(1.5), .text("hi"), .null]
+    )
+    #expect(rs.columns.map(\.name) == ["b", "i", "d", "s", "n"])
+}
+```
+
+- [ ] **Step 5: Run tests**
+
+Run: `swift build && swift test`
+Expected: PASS — 13 tests (9 from Tasks 1-3, 4 new). No warnings.
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add Sources/DuckDBKit/DBValue.swift Sources/DuckDBKit/ResultSet.swift Sources/DuckDBKit/Statement.swift Tests/DuckDBKitTests/SmokeTests.swift
+git commit -m "Add parameter binding, prepared statements and ResultSet"
 ```
 
 ---
@@ -668,21 +811,20 @@ git commit -m "Add Cell and ColumnMeta value types"
 **Files:**
 - Create: `Sources/DuckDBKit/Chunk.swift`
 - Test: `Tests/DuckDBKitTests/DecodeTests.swift`
-- Test: `Tests/DuckDBKitTests/BindingTests.swift` (exercises Task 3's binding code, which
-  could not be observed until values could be read back)
+- Test: `Tests/DuckDBKitTests/BindingTests.swift`
 
 **Interfaces:**
-- Consumes: `Cell`, `ColumnMeta`, `Connection`, `DBValue`.
+- Consumes: `Cell`, `ColumnMeta`, `ResultSet`, `Connection`, `DBValue`.
 - Produces:
-  - `final class ResultSet` with `var columns: [ColumnMeta]`, `func nextChunk() -> Chunk?`, `func allRows() throws -> [[Cell]]`
-  - `struct Chunk` with `var rowCount: Int`, `func rows() -> [[Cell]]`
+  - `struct Chunk` with `var rowCount: Int`, `func rows() -> [[Cell]]`, `func destroy()`
+  - `extension ResultSet` with `func nextChunk() -> Chunk?` and `func allRows() throws -> [[Cell]]`
 
   Nested types (`STRUCT`, `LIST`, `MAP`, `UNION`, `JSON`) have **no** native decode path
-  and are returned as `.text("")`. SiftEngine is responsible for wrapping nested columns
-  in `CAST(col AS VARCHAR)` in its SELECT list, reusing the `_as_text` helper that
-  already exists in `core/sqlgen.py`. This is a contract, not an omission.
+  and return `.text("")`. SiftEngine is responsible for wrapping nested columns in
+  `CAST(col AS VARCHAR)` in its SELECT list, reusing the `_as_text` helper that already
+  exists in `core/sqlgen.py`. This is a contract, not an omission.
 
-- [ ] **Step 1: Write the failing tests**
+- [ ] **Step 1: Write the failing decode tests**
 
 Create `Tests/DuckDBKitTests/DecodeTests.swift`:
 
@@ -741,6 +883,7 @@ private func one(_ sql: String) throws -> Cell {
     #expect(try one("SELECT (-1180591620717411303424)::HUGEINT") == .text("-1180591620717411303424"))
     #expect(try one("SELECT 0::HUGEINT") == .text("0"))
     #expect(try one("SELECT 42::HUGEINT") == .text("42"))
+    #expect(try one("SELECT (-1)::HUGEINT") == .text("-1"))
 }
 
 @Test func decodesDecimalAtEveryStorageWidth() throws {
@@ -772,27 +915,21 @@ private func one(_ sql: String) throws -> Cell {
     #expect(rows[0][0] == .int(0))
     #expect(rows[4999][0] == .int(4999))
 }
-
-@Test func reportsColumnNamesInOrder() throws {
-    let con = try Database.inMemory().connect()
-    let rs = try con.query("SELECT 1 AS alpha, 2 AS beta")
-    #expect(rs.columns.map(\.name) == ["alpha", "beta"])
-}
 ```
 
-Also create `Tests/DuckDBKitTests/BindingTests.swift`, covering Task 3's binding code:
+Also create `Tests/DuckDBKitTests/BindingTests.swift`, which finally reads back what
+Task 4 could only bind:
 
 ```swift
 import Testing
 @testable import DuckDBKit
 
-@Test func bindsEveryValueKind() throws {
+@Test func boundValuesRoundTrip() throws {
     let con = try Database.inMemory().connect()
-    let rs = try con.query(
+    let rows = try con.query(
         "SELECT ?::BOOLEAN AS b, ?::BIGINT AS i, ?::DOUBLE AS d, ?::VARCHAR AS s, ?::VARCHAR AS n",
         [.bool(true), .int(42), .double(1.5), .text("hi"), .null]
-    )
-    let rows = try rs.allRows()
+    ).allRows()
     #expect(rows.count == 1)
     #expect(rows[0] == [.bool(true), .int(42), .double(1.5), .text("hi"), .null])
 }
@@ -804,21 +941,14 @@ import Testing
     let rows = try con.query("SELECT ?::VARCHAR AS s", [.text("O'Brien")]).allRows()
     #expect(rows[0] == [.text("O'Brien")])
 }
-
-@Test func aPrepareFailureThrows() throws {
-    let con = try Database.inMemory().connect()
-    #expect(throws: DuckDBError.self) {
-        _ = try con.query("SELECT * FROM nope WHERE x = ?", [.int(1)])
-    }
-}
 ```
 
 - [ ] **Step 2: Run tests to verify they fail**
 
 Run: `swift test --filter DecodeTests`
-Expected: FAIL — `cannot find 'ResultSet' in scope` / no member `allRows`.
+Expected: FAIL — `value of type 'ResultSet' has no member 'allRows'`.
 
-- [ ] **Step 3: Write Chunk and ResultSet**
+- [ ] **Step 3: Write Chunk**
 
 Create `Sources/DuckDBKit/Chunk.swift`:
 
@@ -826,43 +956,13 @@ Create `Sources/DuckDBKit/Chunk.swift`:
 import CDuckDB
 import Foundation
 
-/// A result set, read chunk by chunk.
-///
-/// `duckdb_fetch_chunk` takes the result BY VALUE, not by pointer — passing a pointer
-/// compiles and then misbehaves, so the copy below is deliberate.
-public final class ResultSet {
-    private var result: duckdb_result
-    public let columns: [ColumnMeta]
-
-    init(result: duckdb_result) {
-        var r = result
-        var metas: [ColumnMeta] = []
-        let count = Int(duckdb_column_count(&r))
-        metas.reserveCapacity(count)
-        for i in 0..<count {
-            let idx = idx_t(i)
-            let name = duckdb_column_name(&r, idx).map(String.init(cString:)) ?? ""
-            var logical = duckdb_column_logical_type(&r, idx)
-            let typeID = duckdb_get_type_id(logical)
-            let isDecimal = typeID == DUCKDB_TYPE_DECIMAL
-            let scale = isDecimal ? duckdb_decimal_scale(logical) : 0
-            let width = isDecimal ? duckdb_decimal_width(logical) : 0
-            duckdb_destroy_logical_type(&logical)
-            metas.append(ColumnMeta(name: name, typeID: typeID, decimalScale: scale,
-                                    decimalWidth: width, typeName: Self.typeName(typeID)))
-        }
-        self.result = result
-        self.columns = metas
-    }
-
-    deinit {
-        duckdb_destroy_result(&result)
-    }
-
+extension ResultSet {
     /// The next chunk, or nil when the result is exhausted.
+    ///
+    /// `duckdb_fetch_chunk` takes the result BY VALUE, not by pointer — passing a
+    /// pointer compiles and then misbehaves, so the copy here is deliberate.
     public func nextChunk() -> Chunk? {
-        let raw = duckdb_fetch_chunk(result)   // by value — see the note above
-        guard let raw else { return nil }
+        guard let raw = duckdb_fetch_chunk(result) else { return nil }
         let size = Int(duckdb_data_chunk_get_size(raw))
         if size == 0 {
             var c: duckdb_data_chunk? = raw
@@ -881,33 +981,6 @@ public final class ResultSet {
         }
         return out
     }
-
-    private static func typeName(_ t: duckdb_type) -> String {
-        switch t {
-        case DUCKDB_TYPE_BOOLEAN:     return "BOOLEAN"
-        case DUCKDB_TYPE_TINYINT:     return "TINYINT"
-        case DUCKDB_TYPE_SMALLINT:    return "SMALLINT"
-        case DUCKDB_TYPE_INTEGER:     return "INTEGER"
-        case DUCKDB_TYPE_BIGINT:      return "BIGINT"
-        case DUCKDB_TYPE_UTINYINT:    return "UTINYINT"
-        case DUCKDB_TYPE_USMALLINT:   return "USMALLINT"
-        case DUCKDB_TYPE_UINTEGER:    return "UINTEGER"
-        case DUCKDB_TYPE_UBIGINT:     return "UBIGINT"
-        case DUCKDB_TYPE_HUGEINT:     return "HUGEINT"
-        case DUCKDB_TYPE_UHUGEINT:    return "UHUGEINT"
-        case DUCKDB_TYPE_FLOAT:       return "FLOAT"
-        case DUCKDB_TYPE_DOUBLE:      return "DOUBLE"
-        case DUCKDB_TYPE_DECIMAL:     return "DECIMAL"
-        case DUCKDB_TYPE_VARCHAR:     return "VARCHAR"
-        case DUCKDB_TYPE_BLOB:        return "BLOB"
-        case DUCKDB_TYPE_DATE:        return "DATE"
-        case DUCKDB_TYPE_TIME:        return "TIME"
-        case DUCKDB_TYPE_TIMESTAMP:   return "TIMESTAMP"
-        case DUCKDB_TYPE_TIMESTAMP_TZ: return "TIMESTAMP WITH TIME ZONE"
-        case DUCKDB_TYPE_UUID:        return "UUID"
-        default:                      return "OTHER"
-        }
-    }
 }
 
 /// One columnar batch. Decoding reads each vector's data pointer and validity mask
@@ -924,12 +997,12 @@ public struct Chunk {
     }
 
     public func rows() -> [[Cell]] {
-        var out = [[Cell]](repeating: [], count: rowCount)
         var byColumn: [[Cell]] = []
         byColumn.reserveCapacity(columns.count)
         for (i, meta) in columns.enumerated() {
             byColumn.append(decodeColumn(i, meta))
         }
+        var out = [[Cell]](repeating: [], count: rowCount)
         for r in 0..<rowCount {
             out[r] = byColumn.map { $0[r] }
         }
@@ -983,7 +1056,7 @@ public struct Chunk {
             return .text(Self.hugeintString(lower: h.lower, upper: h.upper))
         case DUCKDB_TYPE_UHUGEINT:
             let h = data.assumingMemoryBound(to: duckdb_uhugeint.self)[r]
-            return .text(Self.uhugeintString(lower: h.lower, upper: h.upper))
+            return .text(Self.unsignedString(lower: h.lower, upper: h.upper))
         case DUCKDB_TYPE_DECIMAL:
             return .decimal(decodeDecimal(data: data, row: r, meta: meta))
         case DUCKDB_TYPE_VARCHAR:
@@ -1029,11 +1102,7 @@ public struct Chunk {
         return unsignedString(lower: lower, upper: UInt64(upper))
     }
 
-    static func uhugeintString(lower: UInt64, upper: UInt64) -> String {
-        unsignedString(lower: lower, upper: upper)
-    }
-
-    private static func unsignedString(lower: UInt64, upper: UInt64) -> String {
+    static func unsignedString(lower: UInt64, upper: UInt64) -> String {
         if upper == 0 { return String(lower) }
         var digits: [Character] = []
         var hi = upper
@@ -1042,7 +1111,7 @@ public struct Chunk {
             // Divide the 128-bit value by 10, carrying the remainder across halves.
             let hiQuot = hi / 10
             let hiRem = hi % 10
-            let (loQuot, loRem) = divide64(high: hiRem, low: lo, by: 10)
+            let (loQuot, loRem) = UInt64(10).dividingFullWidth((high: hiRem, low: lo))
             digits.append(Character(String(loRem)))
             hi = hiQuot
             lo = loQuot
@@ -1050,21 +1119,11 @@ public struct Chunk {
         return String(digits.reversed())
     }
 
-    /// Divides the 128-bit value (high << 64 | low) by `d`. Callers guarantee
-    /// `high < d`, so the quotient fits in 64 bits and this cannot trap.
-    /// Returns (quotient, remainder).
-    private static func divide64(high: UInt64, low: UInt64, by d: UInt64) -> (UInt64, UInt64) {
-        d.dividingFullWidth((high: high, low: low))
-    }
-
     // MARK: - decimal
 
     private func decodeDecimal(data: UnsafeMutableRawPointer, row r: Int, meta: ColumnMeta) -> Decimal {
-        // DECIMAL is stored in the smallest integer that fits its width; the scale lives
-        // in the logical type. Going through Double here would lose precision, which is
-        // the exact failure this tool exists to expose.
         let unscaled: String
-        switch decimalStorage(meta) {
+        switch Self.decimalStorage(meta) {
         case DUCKDB_TYPE_SMALLINT:
             unscaled = String(data.assumingMemoryBound(to: Int16.self)[r])
         case DUCKDB_TYPE_INTEGER:
@@ -1089,7 +1148,7 @@ public struct Chunk {
     /// DECIMAL is stored in the smallest integer its width fits into. Guessing BIGINT
     /// for everything does not fail loudly — it silently returns a wrong number, which
     /// is precisely the corruption class this tool exists to expose.
-    private func decimalStorage(_ meta: ColumnMeta) -> duckdb_type {
+    static func decimalStorage(_ meta: ColumnMeta) -> duckdb_type {
         switch meta.decimalWidth {
         case 0...4:   return DUCKDB_TYPE_SMALLINT
         case 5...9:   return DUCKDB_TYPE_INTEGER
@@ -1128,8 +1187,8 @@ public struct Chunk {
 
 - [ ] **Step 4: Run the full suite**
 
-Run: `swift test`
-Expected: PASS — 20 tests (6 from Tasks 1-2, 11 decode, 3 binding).
+Run: `swift build && swift test`
+Expected: PASS — 25 tests (13 from Tasks 1-4, 10 decode, 2 binding). No warnings.
 
 Do not weaken a failing assertion to get green. Every expectation in `DecodeTests`
 encodes a value that must survive exactly; if one fails, the decoder is wrong.
@@ -1140,6 +1199,8 @@ encodes a value that must survive exactly; if one fails, the decoder is wrong.
 git add Sources/DuckDBKit/Chunk.swift Tests/DuckDBKitTests/DecodeTests.swift Tests/DuckDBKitTests/BindingTests.swift
 git commit -m "Decode result chunks into Swift values"
 ```
+
+---
 
 ### Task 6: Re-verify the DuckDB 1.5.5 behaviors, and CI
 
