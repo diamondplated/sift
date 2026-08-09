@@ -394,10 +394,19 @@ public actor Session {
             t.notes.append("Delta table at version \(version) — tombstones honored")
         }
 
-        tables[tname] = t
-
+        // A staged copy of this exact file, left in the store by an earlier open, is reused rather
+        // than rebuilt — and a copy of a file that has since changed is dropped. Both matter for
+        // correctness, not just speed: a staged copy is a real table in a persistent store, and
+        // `CREATE OR REPLACE VIEW` over one is a hard `Catalog Error`. See `adoptStagedCopy`.
         let viewCon = try database.connect()
-        try viewCon.execute(createViewSQL(name: tname, spec: spec))
+        if let adoptedRows = adoptStagedCopy(viewCon, name: tname, spec: spec) {
+            t.staged = true
+            t.rowCount = adoptedRows
+        } else {
+            try viewCon.execute(createViewSQL(name: tname, spec: spec))
+        }
+
+        tables[tname] = t
 
         let snapshot = t
         Task.detached { [self] in

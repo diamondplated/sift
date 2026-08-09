@@ -352,6 +352,50 @@ extension Session {
         )
     }
 
+    // MARK: - reopening a file that already has a copy
+
+    /// Reuse the staged copy an earlier open of this exact file left in the store, if there is
+    /// one. Returns its recorded row count when the copy was adopted, `nil` when the caller should
+    /// create the usual view.
+    ///
+    /// **This is not in Python, and it has to be here.** A staged copy is a real table in a
+    /// file-backed store, so it outlives the tab that made it and the process that made it (that
+    /// is the entire point of the `_sift_sources` catalog) — but Python's `open_path`
+    /// unconditionally runs `CREATE OR REPLACE VIEW`, and MEASURED against DuckDB 1.5.5 that is
+    /// `Catalog Error: Existing object small is of type Table, trying to replace with type View`.
+    /// So in the Python engine, staging a file and then reopening it — same session, close the tab
+    /// and open it again; or tomorrow morning — fails outright. Nothing in `engine/tests/**`
+    /// covers it, which is presumably why it shipped. Task 6 is what makes that state reachable in
+    /// this port, so Task 6 closes it.
+    ///
+    /// Adoption is gated on `source_token` (path + mtime + size), so a copy of a file that has
+    /// since changed is never served as if it were the file: it is dropped, with its catalog row,
+    /// and the caller falls back to reading the source in place.
+    nonisolated func adoptStagedCopy(_ con: Connection, name: String, spec: SourceSpec) -> Int? {
+        // `duckdb_tables()` lists tables only — a leftover VIEW of the same name is this port's
+        // own doing and `CREATE OR REPLACE VIEW` handles it, which is why only tables land here.
+        let tableExists = (try? con.query(
+            "SELECT count(*) FROM duckdb_tables() WHERE table_name = ?", [.text(name)]
+        ).allRows().first).map { cellInt($0[0]) } ?? 0
+        guard tableExists > 0 else { return nil }
+
+        let matched = try? con.query(
+            "SELECT row_count FROM _sift_sources WHERE table_name = ? AND source_token = ?",
+            [.text(name), .text(spec.key.token())]
+        ).allRows().first
+        guard let row = matched ?? nil else {
+            // A copy of a different file, or of an older version of this one. Either way it is
+            // wrong AND it is holding the name; `purgeStaged` would have collected it eventually.
+            try? con.execute("DROP TABLE IF EXISTS \(q(name))")
+            _ = try? con.query("DELETE FROM _sift_sources WHERE table_name = ?", [.text(name)])
+            return nil
+        }
+        _ = try? con.query(
+            "UPDATE _sift_sources SET last_used = now() WHERE table_name = ?", [.text(name)]
+        )
+        return cellInt(row[0])
+    }
+
     // MARK: - the staged-data lifecycle
 
     /// Every staged copy this store knows about, newest use first. Ported from `staged_entries`.

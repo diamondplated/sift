@@ -34,11 +34,9 @@ private func newTempDir() throws -> String {
 /// decides to stage it. Built once for the whole suite: ~30 MB written per test would dominate
 /// the run, and every test that reads it only reads.
 private let bigCSVRows = 300_000
-private let bigCSV: String = {
-    // swiftlint:disable:next force_try — a fixture that cannot be written is not a test failure
-    // this suite can meaningfully report per-test; SessionTests' `try! corpus()` sets the shape.
-    try! makeBigCSV()
-}()
+// `try!`, matching SessionTests' `try! corpus()`: a fixture that cannot even be written is not a
+// per-test failure this suite can report meaningfully.
+private let bigCSV: String = try! makeBigCSV()
 
 private func makeBigCSV() throws -> String {
     let path = (try newTempDir() as NSString).appendingPathComponent("big.csv")
@@ -151,10 +149,14 @@ private func isNativeTable(_ session: Session, _ probe: String, _ name: String) 
     }
     #expect(message.contains("INTERRUPT"), "expected an interrupt error; got: \(message)")
 
-    // The window closes, and after it does the connection is usable again — which is what stops
-    // a hammer in flight from killing the swap/count/CHECKPOINT that follow a real CTAS.
+    // The window closes, and after it does the connection is usable again — which is what stops a
+    // hammer in flight from killing the swap, the count and the CHECKPOINT that follow a real
+    // CTAS. Re-running the SLOW query, not a `SELECT 1`: a fast query slips between two hammers
+    // often enough that it passes even when the window never closes at all (MEASURED — that was
+    // this assertion's first form, and making `closeInterruptWindow` a no-op left it green).
     job.closeInterruptWindow()
-    _ = try con.query("SELECT 1").allRows()
+    let recovered = try con.query(slow).allRows()
+    #expect(recovered.count == 1, "the hammer must stop when the window closes, not keep firing")
 }
 
 @Test func cancellingAStagingJobLeavesNoCopyAndNoCatalogRow() async throws {
@@ -302,6 +304,36 @@ private func isNativeTable(_ session: Session, _ probe: String, _ name: String) 
     #expect(try await session.stagedEntries().isEmpty, "a failed copy must not be recorded")
 }
 
+@Test func aCopyFinishedForAClosedAndReopenedTableIsRejected() async throws {
+    // The staging half of SessionTests' `closeAndReopenRejectsAStaleBackgroundResult`, and the
+    // reason `runStage` repairs the catalog on `.stale`: the copy is published by RENAMING it over
+    // the table's name, so a job that finishes after its table was closed and a DIFFERENT file
+    // reopened under the same name would leave that name serving the OLD file's rows — the
+    // relation-level shape of "3,000,000 rows for a 10-row file". Exercised directly with a stale
+    // `openedAt`, the way that test does, since racing a real CTAS is not reproducible at unit
+    // speed.
+    let session = try newSession()
+    let firstPath = try makeSmallCSV(rows: 200)
+    let secondPath = try makeSmallCSV(rows: 10)
+    let first = try await session.openPath(firstPath, name: "x")
+    try await session.closeTable("x")
+    let second = try await session.openPath(secondPath, name: "x")
+    #expect(first.openedAt != second.openedAt)
+
+    let result = await session.applyStaged(
+        "x", physicalRows: 3_000_000, openedAt: first.openedAt, jobID: "stage-1"
+    )
+    guard case .stale(let replacement) = result else {
+        Issue.record("a finished copy for a closed table must be rejected, not published")
+        return
+    }
+    #expect(replacement?.key.path == realPath(secondPath), "the repair must rebuild the NEW view")
+
+    let after = try await session.table("x")
+    #expect(after.staged == false)
+    #expect(after.rowCount != 3_000_000)
+}
+
 // MARK: - the catalog
 
 @Test func lastUsedRoundTripsThroughTheCatalogInTheSameClockFrame() async throws {
@@ -444,4 +476,50 @@ private func isNativeTable(_ session: Session, _ probe: String, _ name: String) 
     // Unstaging something that was never staged is a no-op, not an error.
     let again = try await session.unstage(t.name)
     #expect(again.staged == false)
+}
+
+@Test func reopeningAStagedFileReusesTheCopyItAlreadyPaidFor() async throws {
+    // Staging leaves a real TABLE in a persistent store, so the copy outlives the tab — which is
+    // what the `_sift_sources` catalog is for. Python never reads that catalog back on open: its
+    // `open_path` runs `CREATE OR REPLACE VIEW` unconditionally, and MEASURED against DuckDB
+    // 1.5.5 that fails outright over an existing table ("Existing object small is of type Table,
+    // trying to replace with type View"). Reopening a file you staged — this session or tomorrow
+    // — is therefore broken in the shipping Python. Reproduced here before it was fixed.
+    let session = try newSession()
+    let path = try makeSmallCSV()
+    let t = try await session.openPath(path)
+    _ = try await session.stageNow(t.name, force: true)
+    try await waitForStaged(session, t.name)
+    try await session.closeTable(t.name)      // staged: the copy and its catalog row stay behind
+
+    let again = try await session.openPath(path)
+    #expect(again.name == t.name)
+    #expect(again.staged == true, "the copy the user already waited for must be reused, not rebuilt")
+    #expect(again.rowCount == 200)
+    #expect(try await isNativeTable(session, again.name, again.name) == 1)
+    let page = try await session.page(again.name, offset: 0, limit: 10)
+    #expect(page.rows.count == 10)
+    #expect(try await session.stagedEntries().count == 1, "still exactly one copy, not a second")
+}
+
+@Test func reopeningAChangedFileThrowsAwayTheStaleCopy() async throws {
+    // The other half of adoption: a copy is only the file if the source token still matches.
+    // Serving a stale copy would be the "confidently wrong numbers" failure this tool exists to
+    // avoid, so the copy is dropped and the file is read in place again.
+    let session = try newSession()
+    let path = try makeSmallCSV()
+    let t = try await session.openPath(path)
+    _ = try await session.stageNow(t.name, force: true)
+    try await waitForStaged(session, t.name)
+    try await session.closeTable(t.name)
+
+    try "order_id,region,amount,note\n1,West,1.50,note 1\n".write(
+        toFile: path, atomically: true, encoding: .utf8)
+    let again = try await session.openPath(path)
+    #expect(again.staged == false, "a copy of the OLD file is not this file")
+    #expect(try await isNativeTable(session, again.name, again.name) == 0, "a view again")
+    #expect(try await session.stagedEntries().isEmpty, "and its catalog row goes with it")
+
+    let page = try await session.page(again.name, offset: 0, limit: 10)
+    #expect(page.rows.count == 1, "the new contents, not the stale copy's 200 rows")
 }
