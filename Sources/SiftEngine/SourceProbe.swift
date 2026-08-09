@@ -131,7 +131,10 @@ func describe(_ con: Connection, relationExpr: String) throws -> [Column] {
 /// `realpath(3)` syscall, matching Python's `os.path.realpath` (which is itself a thin wrapper
 /// over the same call). Falls back to the input unchanged if the path cannot be resolved (e.g.
 /// it doesn't exist) — the caller's own `stat` immediately after will raise the real error.
-private func realPath(_ path: String) -> String {
+///
+/// Not `private`: `Session.openPath` (Session.swift) needs the identical resolution for its own
+/// path argument — one copy, shared within the module, rather than a second one drifting from it.
+func realPath(_ path: String) -> String {
     // Passing NULL as the output buffer is a POSIX.1-2008 extension: realpath mallocs a
     // buffer of the right size itself, so there's no PATH_MAX guess to get wrong.
     guard let resolved = realpath(path, nil) else { return path }
@@ -205,7 +208,12 @@ public func buildSource(_ con: Connection, path: String, sheet: String? = nil) t
 
     case .xlsx:
         let sheets = try listSheets(path: resolvedPath)
-        let chosen = sheet ?? sheets.first(where: { !$0.empty })?.name ?? sheets.first?.name
+        // Python selects by truthiness (`sheet or auto-pick`), so an empty string auto-selects
+        // same as omitting the argument. `sheet ?? …` alone would instead try to open a sheet
+        // literally named "" and fail loud — caught in Task 2's review, closed here now that
+        // Task 4 adds the first caller that can pass one through from the UI.
+        let chosen = sheet.flatMap { $0.isEmpty ? nil : $0 } ?? sheets.first(where: { !$0.empty })?.name
+            ?? sheets.first?.name
         guard let chosen else {
             throw UnsupportedSource("\((resolvedPath as NSString).lastPathComponent) has no sheets.")
         }
