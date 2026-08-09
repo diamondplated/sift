@@ -139,10 +139,10 @@ public func assertSingleSelectStatement(_ sql: String) throws {
 /// composed gate — say so plainly, because it reads as if it independently catches most of the
 /// DENY list, and in the shipped composition it does not.** Walking `test_guard.py`'s DENY list
 /// against the scratch connection: every case that references a catalog object not present there
-/// (`DROP TABLE x`, `INSERT INTO x ...`, `PRAGMA database_list`, etc. — most of the list) fails
-/// to *prepare* and falls through unrejected by design (the landmine this file exists to close).
-/// Of the handful whose type *does* resolve (no missing catalog reference — `CREATE TABLE z AS
-/// SELECT 1`, `CHECKPOINT`, `BEGIN TRANSACTION`, ...), every one already starts with a denied
+/// (`DROP TABLE x`, `INSERT INTO x ...`, etc. — most of the list) fails to *prepare* and falls
+/// through unrejected by design (the landmine this file exists to close). Of the handful whose
+/// type *does* resolve (no missing catalog reference — `CREATE TABLE z AS SELECT 1`,
+/// `PRAGMA database_list`, `CHECKPOINT`, `BEGIN TRANSACTION`, ...), every one already starts with a denied
 /// leading keyword, so `assertNoDeniedLeadingKeyword` above rejects it first and the type check
 /// never runs. This is not a porting regression — `guard.py`'s own type check has the identical
 /// property for the identical reason, since it never touches a real connection either. The type
