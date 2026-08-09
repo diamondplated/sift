@@ -66,7 +66,7 @@ is already proven and its purity constraint is what makes the tests fast.
 ```
 sift/
   Package.swift
-  Vendor/duckdb/                    fetched, gitignored — libduckdb.dylib + duckdb.h + module.modulemap
+  Vendor/duckdb/                    fetched, gitignored — libduckdb.dylib only
   scripts/fetch-duckdb.sh           downloads and checksum-verifies the pinned libduckdb
   build-app.sh                      assembles Sift.app (exists; gains the dylib copy + rpath step)
   Resources/AppBundle/              Info.plist, Sift.icns
@@ -116,8 +116,9 @@ CDuckDB  <-  DuckDBKit  <-  SiftEngine  <-  SiftUI  <-  SiftApp
 ### Acquisition
 
 `scripts/fetch-duckdb.sh` downloads `libduckdb-osx-universal.zip` for the pinned version (**1.5.5**)
-from DuckDB's GitHub release, verifies a hardcoded SHA-256, and unpacks `libduckdb.dylib` and
-`duckdb.h` into `Vendor/duckdb/`. The checksum is pinned in the script.
+from DuckDB's GitHub release, verifies a hardcoded SHA-256, and unpacks `libduckdb.dylib` into
+`Vendor/duckdb/` and `duckdb.h` into `Sources/CDuckDB/` — beside the module map, so the module map
+needs no `-I` flag. Both are gitignored. The checksum is pinned in the script.
 
 Verified 2026-08-09 against
 `https://github.com/duckdb/duckdb/releases/download/v1.5.5/libduckdb-osx-universal.zip`:
@@ -151,13 +152,19 @@ on the rpath.
 `DuckDBKit` exposes four types:
 
 - `Database` — owns `duckdb_database`; opens `~/.sift/stage.duckdb`, applies hardening settings,
-  loads extensions.
+  loads extensions. Both configure steps record their per-item outcome (`hardened`,
+  `loadedExtensions`) — non-fatal, but never silent.
 - `Connection` — owns `duckdb_connection`. The direct analogue of Python's `con.cursor()`: shares
   the catalog and buffer manager, owns its transaction. **Not `Sendable`**; each unit of work
-  creates its own and never shares it across tasks.
-- `Statement` — `duckdb_prepare` plus typed `bind` calls, driven by a `DBValue` enum
-  (`null | bool | int64 | double | string`) matching what `sqlgen` produces as parameters.
-- `Chunk` — decodes a `duckdb_data_chunk` into Swift values, honoring the validity bitmask.
+  creates its own and never shares it across tasks. `interrupt()` is the one exception, by
+  design — it is the cancel path, and exists to be called from another task.
+- `ResultSet` — owns the `duckdb_result` and the column metadata. `Connection.query` prepares,
+  binds and executes in one call, driven by a `DBValue` enum (`null | bool | int64 | double |
+  string`) matching what `sqlgen` produces as parameters. There is no separate `Statement` type;
+  prepared-statement handling is entirely inside `query`.
+- `Chunk` — decodes a `duckdb_data_chunk` into Swift values, honoring the validity bitmask. A
+  reference type with a `deinit`, so the grid's page cache can hold chunks across method
+  boundaries without aliasing a C handle. A chunk may outlive the `ResultSet` it came from.
 
 `Connection.interrupt()` wraps `duckdb_interrupt`, preserving the cancel path that `Session.cancel`
 depends on today.
@@ -172,8 +179,36 @@ The chunk decoder must cover every type `kind_of` classifies. Two need explicit 
 - **`DECIMAL`** — carries width and scale in the logical type, separate from the value. Decoded to
   `Decimal` using the scale from `duckdb_decimal_scale`, never through `Double`.
 
-`BLOB` renders as `<blob N B>` exactly as `jsonable` does today. Nested types (`STRUCT`, `LIST`,
-`MAP`, `UNION`, `JSON`) decode to their DuckDB string representation, matching current behavior.
+`BLOB` renders as `<blob N B>` exactly as `jsonable` does today.
+
+### Nested types have no decoder — SiftEngine must CAST them
+
+> **Contract for Plan 3.** `DuckDBKit` does **not** decode nested types. `SiftEngine` must wrap
+> every nested column in `CAST(col AS VARCHAR)` in its SELECT list, reusing the `_as_text` helper
+> that already exists in `core/sqlgen.py`. This is a requirement on the caller, not an omission
+> in the decoder. A nested column that reaches the decoder unwrapped renders as a loud marker
+> and the user sees no data.
+
+Measured against libduckdb 1.5.5, an unwrapped nested column decodes to:
+
+| Type | Decodes to |
+|---|---|
+| `INTEGER[]` (LIST) | `⟨unsupported type 24⟩` |
+| `STRUCT(a INTEGER)` | `⟨unreadable type 25⟩` |
+| `MAP(...)` | `⟨unsupported type 26⟩` |
+| `UNION(...)` | `⟨unreadable type 28⟩` |
+| `INTEGER[3]` (ARRAY) | `⟨unreadable type 33⟩` |
+| `JSON` | works, but only incidentally — DuckDB reports JSON as `VARCHAR` |
+
+A deliberately loud marker, never `""`: an empty string is indistinguishable from real data, and
+`NULL` vs `''` vs a sentinel staying distinct is the point of the tool. A **NULL** in a nested
+column still decodes as `.null` — the validity mask is consulted before anything else, so the
+missing-vs-present distinction holds even where the value itself cannot be read.
+
+`ColumnMeta.typeName` reports nested columns by their bare shape (`LIST`, `STRUCT`, `MAP`,
+`UNION`, `ARRAY`) rather than DuckDB's fully parameterized `typeof()` form. Downstream
+classification reads the prefix, and the prefix is what matters. Scalar types match `typeof()`
+exactly, `DECIMAL` included.
 
 ## 6. Concurrency model
 

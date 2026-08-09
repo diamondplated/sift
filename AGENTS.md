@@ -74,6 +74,18 @@ engine or web change, exercise it end to end — don't trust a green unit run al
 - `pytz` is **required**: without it, fetching a `TIMESTAMP WITH TIME ZONE` value raises.
 - Delta time travel is `version => n`; `AT (VERSION => n)` does not parse.
 - The `delta` and `excel` extensions need one online `INSTALL`; autoloading is deliberately off.
+- `approx_count_distinct` overshoots: HyperLogLog reports **340** for 300 distinct values, hence
+  the clamp in `core/profile.py`.
+- `duckdb_tables().estimated_size` is a **row count, not bytes** — it read "3,000,048 B" for a
+  3M-row table, which is why staged bytes are measured as growth of `stage.duckdb` instead.
+
+**Re-verified 2026-08-09 against `libduckdb` 1.5.5 (the C API), not the Python wheel** — seven of
+the nine directly, in `Tests/DuckDBKitTests/DuckDB155FactsTests.swift`. All seven still hold,
+including `approx_count_distinct` = 340 for 300 distinct values, measured through the C API. The
+two needing fixtures (`read_xlsx`'s `sheet =>`, Delta time travel) are re-probed in the plan that
+builds those fixtures; a test pointed at a nonexistent path passes for the missing file, not for
+the behavior. One fact **changes** under the rewrite: `pytz` is a Python-wheel requirement only, so
+it disappears with the sidecar.
 
 ## Style
 
