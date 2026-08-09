@@ -70,3 +70,16 @@ import Foundation
     #expect(message.contains("httpfs") || message.contains("HTTPFileSystem"),
             "expected hardening to refuse the read; got: \(message)")
 }
+
+@Test func blobDisplayMatchesThePythonEngineFormat() {
+    // session.jsonable renders a blob as "<blob 1,234 B>" — thousands separator and
+    // all. The grid shows this string, so the format is a contract, not a detail.
+    #expect(Cell.blob(3).display == "<blob 3 B>")
+    #expect(Cell.blob(1234).display == "<blob 1,234 B>")
+}
+
+@Test func nullDisplaysAsEmptyAndKnowsItIsNull() {
+    #expect(Cell.null.isNull)
+    #expect(Cell.null.display == "")
+    #expect(!Cell.int(0).isNull)
+}
