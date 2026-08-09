@@ -17,7 +17,11 @@ public enum Cell: Sendable, Equatable {
     case int(Int64)
     case double(Double)
     case text(String)
-    case decimal(Decimal)
+    /// The scale travels with the value because `Decimal` does not: `Decimal(string:
+    /// "10.50")` normalizes to 10.5, so DECIMAL(10,2)'s trailing zero is gone the
+    /// instant you ask the value for its own description. Carrying `scale` alongside
+    /// lets `display` reconstruct the declared shape instead of a canonicalized one.
+    case decimal(Decimal, scale: Int)
     case blob(Int)
 
     public var isNull: Bool { self == .null }
@@ -31,10 +35,24 @@ public enum Cell: Sendable, Equatable {
         case .int(let v):      return String(v)
         case .double(let v):   return String(v)
         case .text(let v):     return v
-        case .decimal(let v):  return "\(v)"
+        case .decimal(let v, let scale): return Self.decimalDisplay(v, scale: scale)
         case .blob(let n):
             return "<blob \(Self.grouped(n)) B>"
         }
+    }
+
+    /// Re-pads to `scale` digits after the point. `v * 10^scale` is an integer-valued
+    /// Decimal (its own description has no decimal point), so splicing it back in by
+    /// hand — same trick `Chunk.decodeDecimal` uses on the way in — recovers exactly
+    /// the digit count DECIMAL declared, trailing zeros included.
+    static func decimalDisplay(_ v: Decimal, scale: Int) -> String {
+        guard scale > 0 else { return "\(v)" }
+        let scaled = v * pow(Decimal(10), scale)
+        let negative = scaled < 0
+        var digits = "\(negative ? -scaled : scaled)"
+        while digits.count <= scale { digits = "0" + digits }
+        let cut = digits.index(digits.endIndex, offsetBy: -scale)
+        return "\(negative ? "-" : "")\(digits[..<cut]).\(digits[cut...])"
     }
 
     /// Comma-grouped, unconditionally — matching the Python engine's `f"{n:,}"`, which

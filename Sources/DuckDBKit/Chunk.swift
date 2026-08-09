@@ -58,7 +58,10 @@ public struct Chunk {
         let vector = duckdb_data_chunk_get_vector(handle, idx_t(index))
         let validity = duckdb_vector_get_validity(vector)
         guard let data = duckdb_vector_get_data(vector) else {
-            return [Cell](repeating: .null, count: rowCount)
+            // A nil data pointer means the value lives elsewhere (STRUCT/ARRAY/UNION
+            // keep theirs in child vectors), NOT that the rows are NULL. Reporting
+            // NULL here would invent missing data.
+            return [Cell](repeating: .text("⟨unreadable \(meta.typeName)⟩"), count: rowCount)
         }
 
         var out = [Cell](repeating: .null, count: rowCount)
@@ -103,15 +106,21 @@ public struct Chunk {
             let h = data.assumingMemoryBound(to: duckdb_uhugeint.self)[r]
             return .text(Self.unsignedString(lower: h.lower, upper: h.upper))
         case DUCKDB_TYPE_DECIMAL:
-            return .decimal(decodeDecimal(data: data, row: r, meta: meta))
+            return decodeDecimal(data: data, row: r, meta: meta)
         case DUCKDB_TYPE_VARCHAR:
             var s = data.assumingMemoryBound(to: duckdb_string_t.self)[r]
             let len = Int(duckdb_string_t_length(s))
-            guard let ptr = withUnsafeMutablePointer(to: &s, { duckdb_string_t_data($0) }) else {
-                return .text("")
+            // The String must be built INSIDE the closure: for inlined strings (<=12
+            // bytes) duckdb_string_t_data returns a pointer into `s` itself, which is
+            // only valid for the lifetime of withUnsafeMutablePointer's callback.
+            // MEASURED as latent (no observed mismatch over 4000 rows) rather than
+            // active, but it is undefined behavior regardless of whether it happened
+            // to work — the one file where that is least acceptable.
+            return withUnsafeMutablePointer(to: &s) { sp -> Cell in
+                guard let ptr = duckdb_string_t_data(sp) else { return .text("") }
+                return .text(String(decoding: UnsafeRawBufferPointer(start: ptr, count: len),
+                                    as: UTF8.self))
             }
-            return .text(String(decoding: UnsafeRawBufferPointer(start: ptr, count: len),
-                                as: UTF8.self))
         case DUCKDB_TYPE_BLOB:
             let s = data.assumingMemoryBound(to: duckdb_string_t.self)[r]
             return .blob(Int(duckdb_string_t_length(s)))
@@ -121,13 +130,47 @@ public struct Chunk {
         case DUCKDB_TYPE_TIME:
             let micros = data.assumingMemoryBound(to: duckdb_time.self)[r].micros
             return .text(Self.isoTime(micros: micros))
-        case DUCKDB_TYPE_TIMESTAMP, DUCKDB_TYPE_TIMESTAMP_TZ:
+        case DUCKDB_TYPE_TIME_TZ:
+            let raw = data.assumingMemoryBound(to: duckdb_time_tz.self)[r]
+            return .text(Self.isoTimeTz(raw))
+        case DUCKDB_TYPE_TIMESTAMP:
+            // Naive — no timezone travels with this value, so no offset is appended.
             let micros = data.assumingMemoryBound(to: duckdb_timestamp.self)[r].micros
-            return .text(Self.isoTimestamp(micros: micros))
+            return .text(Self.isoTimestamp(micros, perSecond: 1_000_000, fracDigits: 6, suffix: ""))
+        case DUCKDB_TYPE_TIMESTAMP_TZ:
+            // DuckDB always stores TIMESTAMP_TZ normalized to UTC, so +00:00 is exact,
+            // not a guess.
+            let micros = data.assumingMemoryBound(to: duckdb_timestamp.self)[r].micros
+            return .text(Self.isoTimestamp(micros, perSecond: 1_000_000, fracDigits: 6, suffix: "+00:00"))
+        case DUCKDB_TYPE_TIMESTAMP_S:
+            let seconds = data.assumingMemoryBound(to: duckdb_timestamp_s.self)[r].seconds
+            return .text(Self.isoTimestamp(seconds, perSecond: 1, fracDigits: 0, suffix: ""))
+        case DUCKDB_TYPE_TIMESTAMP_MS:
+            let millis = data.assumingMemoryBound(to: duckdb_timestamp_ms.self)[r].millis
+            return .text(Self.isoTimestamp(millis, perSecond: 1_000, fracDigits: 3, suffix: ""))
+        case DUCKDB_TYPE_TIMESTAMP_NS:
+            // What pandas datetime64[ns] becomes on the way through Parquet.
+            let nanos = data.assumingMemoryBound(to: duckdb_timestamp_ns.self)[r].nanos
+            return .text(Self.isoTimestamp(nanos, perSecond: 1_000_000_000, fracDigits: 9, suffix: ""))
+        case DUCKDB_TYPE_UUID:
+            let h = data.assumingMemoryBound(to: duckdb_hugeint.self)[r]
+            return .text(Self.uuidString(lower: h.lower, upper: h.upper))
+        case DUCKDB_TYPE_INTERVAL:
+            let iv = data.assumingMemoryBound(to: duckdb_interval.self)[r]
+            return .text(Self.intervalString(months: iv.months, days: iv.days, micros: iv.micros))
         default:
-            // Nested and unhandled types. SiftEngine casts these to VARCHAR in the
-            // SELECT list, so this branch should be unreachable in Sift itself.
-            return .text("")
+            // Never an empty string: that is indistinguishable from real data, and
+            // NULL vs '' vs a sentinel staying distinct is the whole point of this
+            // tool. Loud and obviously-not-data instead.
+            //
+            // Deliberately still landing here, pending real decode paths: ENUM, BIT,
+            // BIGNUM (the C API's name for VARINT — there is no DUCKDB_TYPE_VARINT in
+            // this header). Also nested types (STRUCT/LIST/MAP/UNION) and JSON — but
+            // for those, SiftEngine is expected to CAST(col AS VARCHAR) in the SELECT
+            // list before the column ever reaches this decoder, so hitting this branch
+            // on a nested column means that contract was not honored upstream, not
+            // that this fallback is a substitute for it.
+            return .text("⟨unsupported type \(meta.typeID.rawValue)⟩")
         }
     }
 
@@ -166,7 +209,7 @@ public struct Chunk {
 
     // MARK: - decimal
 
-    private func decodeDecimal(data: UnsafeMutableRawPointer, row r: Int, meta: ColumnMeta) -> Decimal {
+    private func decodeDecimal(data: UnsafeMutableRawPointer, row r: Int, meta: ColumnMeta) -> Cell {
         let unscaled: String
         switch Self.decimalStorage(meta) {
         case DUCKDB_TYPE_SMALLINT:
@@ -180,14 +223,24 @@ public struct Chunk {
             unscaled = String(data.assumingMemoryBound(to: Int64.self)[r])
         }
         let scale = Int(meta.decimalScale)
-        guard scale > 0 else { return Decimal(string: unscaled) ?? 0 }
+        guard scale > 0 else {
+            // Substituting 0 on a parse failure would be a silent wrong number in the
+            // one file where that is unforgivable — loud marker instead.
+            guard let v = Decimal(string: unscaled) else {
+                return .text("⟨unparseable decimal \(unscaled)⟩")
+            }
+            return .decimal(v, scale: scale)
+        }
 
         let negative = unscaled.hasPrefix("-")
         var digits = negative ? String(unscaled.dropFirst()) : unscaled
         while digits.count <= scale { digits = "0" + digits }
         let cut = digits.index(digits.endIndex, offsetBy: -scale)
         let text = "\(negative ? "-" : "")\(digits[..<cut]).\(digits[cut...])"
-        return Decimal(string: text) ?? 0
+        guard let v = Decimal(string: text) else {
+            return .text("⟨unparseable decimal \(text)⟩")
+        }
+        return .decimal(v, scale: scale)
     }
 
     /// DECIMAL is stored in the smallest integer its width fits into. Guessing BIGINT
@@ -203,28 +256,149 @@ public struct Chunk {
     }
 
     // MARK: - temporal
+    //
+    // Deliberately NOT Foundation/ISO8601DateFormatter. Two measured failures against
+    // libduckdb 1.5.5 ruled it out:
+    //   - No fractional-seconds option, and it ROUNDS to the nearest second, so
+    //     12:34:56.999999 came back as 12:34:57 — the wrong second, not just missing
+    //     precision.
+    //   - It applies the 1582 Julian→Gregorian calendar cutover, but DuckDB's DATE is
+    //     proleptic Gregorian (extends the modern calendar backwards through 1582).
+    //     DATE '1500-01-01' came back 1499-12-23; DATE '0001-01-01' came back
+    //     0001-01-03.
+    // Integer arithmetic throughout avoids both: no rounding, no calendar cutover.
 
-    private static let epoch = Date(timeIntervalSince1970: 0)
-
-    static func isoDate(daysSinceEpoch: Int) -> String {
-        let d = epoch.addingTimeInterval(Double(daysSinceEpoch) * 86_400)
-        return isoFormatter(withTime: false).string(from: d)
+    /// days-since-1970-01-01 → (year, month, day), proleptic Gregorian.
+    /// Howard Hinnant's `civil_from_days` algorithm.
+    static func civilFromDays(_ z0: Int) -> (year: Int, month: Int, day: Int) {
+        let z = z0 + 719468
+        let era = (z >= 0 ? z : z - 146096) / 146097
+        let doe = z - era * 146097                                  // [0, 146096]
+        let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365   // [0, 399]
+        let y = yoe + era * 400
+        let doy = doe - (365 * yoe + yoe / 4 - yoe / 100)           // [0, 365]
+        let mp = (5 * doy + 2) / 153                                // [0, 11]
+        let d = doy - (153 * mp + 2) / 5 + 1                        // [1, 31]
+        let m = mp < 10 ? mp + 3 : mp - 9                           // [1, 12]
+        return (y + (m <= 2 ? 1 : 0), m, d)
     }
 
-    static func isoTimestamp(micros: Int64) -> String {
-        let d = epoch.addingTimeInterval(Double(micros) / 1_000_000)
-        return isoFormatter(withTime: true).string(from: d)
+    static func isoDate(daysSinceEpoch: Int) -> String {
+        let c = civilFromDays(daysSinceEpoch)
+        return String(format: "%04d-%02d-%02d", c.year, c.month, c.day)
+    }
+
+    /// Formats a count of sub-second units since the epoch.
+    ///
+    /// `perSecond` is the unit scale (1 for seconds, 1_000 for millis, 1_000_000 for
+    /// micros, 1_000_000_000 for nanos); `fracDigits` is how many digits that scale
+    /// needs. The fraction is emitted only when non-zero, matching Python's
+    /// datetime.isoformat(), which is what the engine this replaces produces.
+    ///
+    /// Integer division throughout: routing micros through Double and a formatter
+    /// dropped sub-second precision AND rounded .999999 up to the next second.
+    static func isoTimestamp(_ value: Int64, perSecond: Int64, fracDigits: Int,
+                             suffix: String) -> String {
+        let perDay = 86_400 * perSecond
+        var days = Int(value / perDay)
+        var rem = value % perDay
+        if rem < 0 { rem += perDay; days -= 1 }   // floor, so pre-epoch values are right
+        let c = civilFromDays(days)
+        let secOfDay = rem / perSecond
+        let frac = rem % perSecond
+        var s = String(format: "%04d-%02d-%02dT%02d:%02d:%02d",
+                       c.year, c.month, c.day,
+                       secOfDay / 3600, (secOfDay % 3600) / 60, secOfDay % 60)
+        if frac != 0 && fracDigits > 0 {
+            var digits = String(frac)
+            while digits.count < fracDigits { digits = "0" + digits }
+            while digits.hasSuffix("0") { digits.removeLast() }   // isoformat trims
+            s += "." + digits
+        }
+        return s + suffix
     }
 
     static func isoTime(micros: Int64) -> String {
-        let total = micros / 1_000_000
-        return String(format: "%02d:%02d:%02d", total / 3600, (total % 3600) / 60, total % 60)
+        let secOfDay = micros / 1_000_000
+        let frac = micros % 1_000_000
+        var s = String(format: "%02d:%02d:%02d",
+                       secOfDay / 3600, (secOfDay % 3600) / 60, secOfDay % 60)
+        if frac != 0 {
+            var digits = String(frac)
+            while digits.count < 6 { digits = "0" + digits }
+            while digits.hasSuffix("0") { digits.removeLast() }
+            s += "." + digits
+        }
+        return s
     }
 
-    private static func isoFormatter(withTime: Bool) -> ISO8601DateFormatter {
-        let f = ISO8601DateFormatter()
-        f.timeZone = TimeZone(secondsFromGMT: 0)
-        f.formatOptions = withTime ? [.withInternetDateTime] : [.withFullDate]
-        return f
+    /// TIME_TZ packs micros-since-midnight and a UTC offset (in seconds) into 64 bits;
+    /// `duckdb_from_time_tz` is the documented way to unpack them, so no manual
+    /// bit-shifting here. MEASURED against libduckdb 1.5.5: `'12:34:56+02:00'::TIMETZ`
+    /// decomposes to offset == 7200 (i.e. positive == east of UTC, matching the
+    /// literal's own sign), so the offset needs no inversion.
+    static func isoTimeTz(_ raw: duckdb_time_tz) -> String {
+        let d = duckdb_from_time_tz(raw)
+        var s = String(format: "%02d:%02d:%02d", d.time.hour, d.time.min, d.time.sec)
+        if d.time.micros != 0 {
+            var digits = String(d.time.micros)
+            while digits.count < 6 { digits = "0" + digits }
+            while digits.hasSuffix("0") { digits.removeLast() }
+            s += "." + digits
+        }
+        let mag = abs(Int(d.offset))   // offset is bounded to +/-16h, nowhere near Int32.min
+        s += (d.offset < 0 ? "-" : "+") + String(format: "%02d:%02d", mag / 3600, (mag % 3600) / 60)
+        return s
+    }
+
+    // MARK: - UUID
+
+    /// UUID is transported as a hugeint with the top bit of `upper` flipped, so signed
+    /// 128-bit comparison sorts the same way UUID bytes do. MEASURED against libduckdb
+    /// 1.5.5: UUID '10203040-5060-7080-90a0-b0c0d0e0f000' arrives with upper bit
+    /// pattern 0x9020304050607080 — the literal's own leading byte 0x10 with bit 63
+    /// flipped to 0x90. XOR with Int64.min's bit pattern undoes exactly that flip.
+    static func uuidString(lower: UInt64, upper: Int64) -> String {
+        let hi = UInt64(bitPattern: upper) ^ UInt64(bitPattern: Int64.min)
+        let hex = String(format: "%016llx%016llx", hi, lower)
+        let a = hex.prefix(8)
+        let b = hex.dropFirst(8).prefix(4)
+        let c = hex.dropFirst(12).prefix(4)
+        let d = hex.dropFirst(16).prefix(4)
+        let e = hex.dropFirst(20).prefix(12)
+        return "\(a)-\(b)-\(c)-\(d)-\(e)"
+    }
+
+    // MARK: - INTERVAL
+
+    /// Renders months/days/micros the same way DuckDB's own `CAST(iv AS VARCHAR)`
+    /// does (MEASURED, e.g. `1 month -3 days 02:00:00`, `-25:00:00`, `00:00:00` for a
+    /// zero interval) rather than inventing a shape: each component keeps its own
+    /// sign, years/months/days are only shown when non-zero, and the time part is
+    /// shown only when non-zero — except when the whole interval is zero, in which
+    /// case time is the sole "00:00:00".
+    static func intervalString(months: Int32, days: Int32, micros: Int64) -> String {
+        var parts: [String] = []
+        let years = months / 12
+        let remMonths = months % 12
+        if years != 0 { parts.append("\(years) year\(years.magnitude == 1 ? "" : "s")") }
+        if remMonths != 0 { parts.append("\(remMonths) month\(remMonths.magnitude == 1 ? "" : "s")") }
+        if days != 0 { parts.append("\(days) day\(days.magnitude == 1 ? "" : "s")") }
+        if micros != 0 || parts.isEmpty {
+            let negative = micros < 0
+            let mag = micros.magnitude
+            let totalSeconds = Int(mag / 1_000_000)
+            let frac = mag % 1_000_000
+            var time = String(format: "%02d:%02d:%02d",
+                              totalSeconds / 3600, (totalSeconds % 3600) / 60, totalSeconds % 60)
+            if frac != 0 {
+                var digits = String(frac)
+                while digits.count < 6 { digits = "0" + digits }
+                while digits.hasSuffix("0") { digits.removeLast() }
+                time += "." + digits
+            }
+            parts.append((negative ? "-" : "") + time)
+        }
+        return parts.joined(separator: " ")
     }
 }

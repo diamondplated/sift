@@ -59,17 +59,13 @@ private func one(_ sql: String) throws -> Cell {
     // Width picks the backing integer: <=4 SMALLINT, <=9 INTEGER, <=18 BIGINT, else
     // HUGEINT. Reading the wrong width returns a plausible wrong number rather than
     // throwing, so all four have to be covered.
-    #expect(try one("SELECT 1.23::DECIMAL(4,2)") == .decimal(Decimal(string: "1.23")!))
-    #expect(try one("SELECT 12345.678::DECIMAL(9,3)") == .decimal(Decimal(string: "12345.678")!))
-    #expect(try one("SELECT 123456789.012::DECIMAL(18,3)") == .decimal(Decimal(string: "123456789.012")!))
+    #expect(try one("SELECT 1.23::DECIMAL(4,2)") == .decimal(Decimal(string: "1.23")!, scale: 2))
+    #expect(try one("SELECT 12345.678::DECIMAL(9,3)") == .decimal(Decimal(string: "12345.678")!, scale: 3))
+    #expect(try one("SELECT 123456789.012::DECIMAL(18,3)")
+            == .decimal(Decimal(string: "123456789.012")!, scale: 3))
     #expect(try one("SELECT 1234567890123456789.01::DECIMAL(38,2)")
-            == .decimal(Decimal(string: "1234567890123456789.01")!))
-    #expect(try one("SELECT (-0.001)::DECIMAL(9,3)") == .decimal(Decimal(string: "-0.001")!))
-}
-
-@Test func decodesTemporalAsISO8601() throws {
-    #expect(try one("SELECT DATE '2026-08-09'") == .text("2026-08-09"))
-    #expect(try one("SELECT TIMESTAMP '2026-08-09 12:34:56'") == .text("2026-08-09T12:34:56Z"))
+            == .decimal(Decimal(string: "1234567890123456789.01")!, scale: 2))
+    #expect(try one("SELECT (-0.001)::DECIMAL(9,3)") == .decimal(Decimal(string: "-0.001")!, scale: 3))
 }
 
 @Test func decodesBlobAsAByteCount() throws {
@@ -83,4 +79,55 @@ private func one(_ sql: String) throws -> Cell {
     #expect(rows.count == 5000)
     #expect(rows[0][0] == .int(0))
     #expect(rows[4999][0] == .int(4999))
+}
+
+@Test func decodesTimestampsWithSubSecondPrecision() throws {
+    #expect(try one("SELECT TIMESTAMP '2026-08-09 12:34:56.123456'")
+            == .text("2026-08-09T12:34:56.123456"))
+    // Rounds to the WRONG SECOND if the formatter path ever comes back.
+    #expect(try one("SELECT TIMESTAMP '2026-08-09 12:34:56.999999'")
+            == .text("2026-08-09T12:34:56.999999"))
+    #expect(try one("SELECT TIMESTAMP '2026-08-09 12:34:56'")
+            == .text("2026-08-09T12:34:56"))
+}
+
+@Test func decodesDatesBeforeTheGregorianCutover() throws {
+    // ISO8601DateFormatter shifts these 9-10 days; DuckDB DATE is proleptic Gregorian.
+    #expect(try one("SELECT DATE '1500-01-01'") == .text("1500-01-01"))
+    #expect(try one("SELECT DATE '1582-10-04'") == .text("1582-10-04"))
+    #expect(try one("SELECT DATE '0001-01-01'") == .text("0001-01-01"))
+    #expect(try one("SELECT DATE '1969-07-20'") == .text("1969-07-20"))
+    #expect(try one("SELECT DATE '9999-12-31'") == .text("9999-12-31"))
+}
+
+@Test func decodesEveryTimestampScale() throws {
+    #expect(try one("SELECT TIMESTAMP_S '2026-08-09 12:34:56'") == .text("2026-08-09T12:34:56"))
+    #expect(try one("SELECT TIMESTAMP_MS '2026-08-09 12:34:56.123'") == .text("2026-08-09T12:34:56.123"))
+    // What pandas datetime64[ns] becomes in Parquet — previously decoded to "".
+    #expect(try one("SELECT TIMESTAMP_NS '2026-08-09 12:34:56.123456789'")
+            == .text("2026-08-09T12:34:56.123456789"))
+}
+
+@Test func decodesUuidAndInterval() throws {
+    #expect(try one("SELECT UUID '10203040-5060-7080-90a0-b0c0d0e0f000'")
+            == .text("10203040-5060-7080-90a0-b0c0d0e0f000"))
+    // Shape: DuckDB's own CAST(iv AS VARCHAR) rendering (postgres-style) — each
+    // component keeps its own sign, zero components are omitted. MEASURED against
+    // libduckdb via CLI: months=1, days=-3, micros=7200000000 renders exactly this.
+    #expect(try one("SELECT INTERVAL '1 month -3 days 02:00:00'")
+            == .text("1 month -3 days 02:00:00"))
+    #expect(try one("SELECT INTERVAL '0 days'") == .text("00:00:00"))
+    #expect(try one("SELECT INTERVAL '13 months'") == .text("1 year 1 month"))
+}
+
+@Test func decimalKeepsItsDeclaredScale() throws {
+    // The Python engine returns str(Decimal), which preserves trailing zeros. A money
+    // column must not change shape on screen.
+    let c = try one("SELECT 10.50::DECIMAL(10,2)")
+    #expect(c.display == "10.50")
+}
+
+@Test func timeKeepsSubSecondPrecision() throws {
+    #expect(try one("SELECT TIME '12:34:56.123456'") == .text("12:34:56.123456"))
+    #expect(try one("SELECT TIME '12:34:56'") == .text("12:34:56"))
 }
