@@ -8,13 +8,9 @@ extension ResultSet {
     /// pointer compiles and then misbehaves, so the copy here is deliberate.
     public func nextChunk() -> Chunk? {
         guard let raw = duckdb_fetch_chunk(result) else { return nil }
-        let size = Int(duckdb_data_chunk_get_size(raw))
-        if size == 0 {
-            var c: duckdb_data_chunk? = raw
-            duckdb_destroy_data_chunk(&c)
-            return nil
-        }
-        return Chunk(handle: raw, rowCount: size, columns: columns)
+        let chunk = Chunk(handle: raw, rowCount: Int(duckdb_data_chunk_get_size(raw)),
+                          columns: columns)
+        return chunk.rowCount == 0 ? nil : chunk   // deinit frees the empty one
     }
 
     /// Every row. Only for bounded results — Sift pages the grid instead.
@@ -22,7 +18,14 @@ extension ResultSet {
         var out: [[Cell]] = []
         while let chunk = nextChunk() {
             out.append(contentsOf: chunk.rows())
-            chunk.destroy()
+        }
+        // duckdb.h:5392 documents duckdb_fetch_chunk as returning NULL "if the result has
+        // an error" — NULL is NOT documented as meaning only exhaustion, and nextChunk maps
+        // both to nil. Without this check a result that fails mid-stream returns a SHORT row
+        // list and no error at all, which is the exact silent-truncation defect this product
+        // exists to expose. MEASURED: nil after a clean 5000-row drain, so it costs nothing.
+        if let e = duckdb_result_error(&result) {
+            throw DuckDBError(String(cString: e))
         }
         return out
     }
@@ -31,12 +34,25 @@ extension ResultSet {
 /// One columnar batch. Decoding reads each vector's data pointer and validity mask
 /// directly — no per-value allocation on the way in, which is the whole reason this
 /// path is faster than the JSON one it replaces.
-public struct Chunk {
+///
+/// A class, not a struct, and deliberately: the payload is a C handle, so a copied struct
+/// would alias it — `let copy = c` then two `destroy()` calls is a double free, and reading
+/// a destroyed copy is a use-after-free, with no compiler help for either. `deinit` makes
+/// the lifetime the compiler's problem instead, which is what lets the grid's page cache
+/// hold chunks across method boundaries. MEASURED: a Chunk outliving its ResultSet still
+/// decodes correctly, so the independent lifetime is sound.
+public final class Chunk {
     let handle: duckdb_data_chunk
     public let rowCount: Int
     let columns: [ColumnMeta]
 
-    public func destroy() {
+    init(handle: duckdb_data_chunk, rowCount: Int, columns: [ColumnMeta]) {
+        self.handle = handle
+        self.rowCount = rowCount
+        self.columns = columns
+    }
+
+    deinit {
         var c: duckdb_data_chunk? = handle
         duckdb_destroy_data_chunk(&c)
     }
@@ -57,24 +73,23 @@ public struct Chunk {
     private func decodeColumn(_ index: Int, _ meta: ColumnMeta) -> [Cell] {
         let vector = duckdb_data_chunk_get_vector(handle, idx_t(index))
         let validity = duckdb_vector_get_validity(vector)
-        guard let data = duckdb_vector_get_data(vector) else {
-            // A nil data pointer means the value lives elsewhere (STRUCT/ARRAY/UNION
-            // keep theirs in child vectors), NOT that the rows are NULL. Reporting
-            // NULL here would invent missing data.
-            //
-            // meta.typeID.rawValue, not meta.typeName: ResultSet.typeName collapses
-            // every type it doesn't special-case — including STRUCT, ARRAY and UNION,
-            // the exact types that reach this branch — down to the single string
-            // "OTHER", which names nothing.
-            return [Cell](repeating: .text("⟨unreadable type \(meta.typeID.rawValue)⟩"), count: rowCount)
-        }
-
+        // The validity mask is consulted FIRST, always. A nil data pointer means the value
+        // lives elsewhere (STRUCT/ARRAY/UNION keep theirs in child vectors), NOT that the
+        // rows are NULL — but a NULL in such a column is still a NULL, and the mask is the
+        // only thing that knows. MEASURED: skipping the mask on this path reported every
+        // row of `VALUES ({'a': 1}), (NULL)` as a present unreadable value, inventing data
+        // in the one place NULL-vs-present must stay exact.
+        //
+        // meta.typeID.rawValue, not meta.typeName: for a type with no decoder the id is the
+        // only thing that names it precisely.
+        let data = duckdb_vector_get_data(vector)
         var out = [Cell](repeating: .null, count: rowCount)
         for r in 0..<rowCount {
             if let validity, !duckdb_validity_row_is_valid(validity, idx_t(r)) {
                 continue   // already .null
             }
-            out[r] = decodeOne(data: data, row: r, meta: meta)
+            out[r] = data.map { decodeOne(data: $0, row: r, meta: meta) }
+                ?? .text("⟨unreadable type \(meta.typeID.rawValue)⟩")
         }
         return out
     }

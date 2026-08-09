@@ -55,6 +55,49 @@ private func one(_ sql: String) throws -> Cell {
     #expect(try one("SELECT (-1)::HUGEINT") == .text("-1"))
 }
 
+@Test func aNullInsideANestedColumnStaysNull() throws {
+    // The highest-value test in this file. STRUCT/ARRAY/UNION keep their values in child
+    // vectors, so the top-level data pointer is nil and there is no decoder — but the
+    // validity mask still knows which rows are NULL, and NULL vs present is the one
+    // distinction this product sells. Reporting a present-but-unreadable marker for a NULL
+    // invents data, and would corrupt the profile panel's null counts and the grid's NULL
+    // styling. MEASURED before the fix: BOTH rows came back .text("⟨unreadable type 25⟩")
+    // with isNull == false.
+    let con = try Database.inMemory().connect()
+
+    let structRows = try con.query("SELECT * FROM (VALUES ({'a': 1}), (NULL)) AS t(v)").allRows()
+    #expect(structRows[0][0] == .text("⟨unreadable type 25⟩"))
+    #expect(!structRows[0][0].isNull)
+    #expect(structRows[1][0] == .null)
+    #expect(structRows[1][0].isNull)
+
+    let arrayRows = try con.query(
+        "SELECT * FROM (VALUES ([1,2,3]::INTEGER[3]), (NULL)) AS t(v)"
+    ).allRows()
+    #expect(arrayRows[0][0] == .text("⟨unreadable type 33⟩"))
+    #expect(arrayRows[1][0] == .null)
+}
+
+@Test func aChunkOutlivesTheResultSetItCameFrom() throws {
+    // Chunk is a class with a deinit rather than a struct with destroy(), so the grid's
+    // page cache can hold chunks across method boundaries without aliasing a C handle.
+    // This pins the property that makes that safe: the chunk owns its own memory.
+    let con = try Database.inMemory().connect()
+    var chunk: Chunk?
+    do {
+        chunk = try con.query("SELECT 42 AS n, 'hi' AS s").nextChunk()
+    }
+    #expect(chunk?.rows() == [[.int(42), .text("hi")]])
+}
+
+@Test func anEmptyResultDrainsToNoRowsWithoutThrowing() throws {
+    // allRows() checks duckdb_result_error after the loop, so the failure mode this
+    // guards against is the opposite one: a legitimately empty result must not look
+    // like a truncated one.
+    let con = try Database.inMemory().connect()
+    #expect(try con.query("SELECT 1 WHERE false").allRows().isEmpty)
+}
+
 @Test func decodesDecimalAtEveryStorageWidth() throws {
     // Width picks the backing integer: <=4 SMALLINT, <=9 INTEGER, <=18 BIGINT, else
     // HUGEINT. Reading the wrong width returns a plausible wrong number rather than
