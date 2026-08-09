@@ -21,18 +21,22 @@ public func qlit(_ value: String) -> String {
     "'" + value.replacingOccurrences(of: "'", with: "''") + "'"
 }
 
-/// The last path component, mirroring pathlib.Path(...).name.
+/// The last path component, mirroring pathlib.Path(...).name: trailing and repeated slashes
+/// are normalized away first (a folder picker hands directory names with a trailing "/").
 private func pathName(_ path: String) -> String {
-    if let idx = path.lastIndex(of: "/") {
-        return String(path[path.index(after: idx)...])
-    }
-    return path
+    var trimmed = path
+    while trimmed.hasSuffix("/") { trimmed.removeLast() }
+    guard let idx = trimmed.lastIndex(of: "/") else { return trimmed }
+    return String(trimmed[trimmed.index(after: idx)...])
 }
 
 /// Mirrors pathlib.Path(...).suffix: the final ".ext", or "" if the name has no extension
-/// (a leading dot with nothing before it, e.g. ".csv", does not count as an extension).
+/// (a leading dot with nothing before it, e.g. ".csv", or a trailing dot with nothing after
+/// it, e.g. "file.", does not count as an extension).
 private func pathSuffix(_ name: String) -> String {
-    guard let dotIdx = name.lastIndex(of: "."), dotIdx != name.startIndex else { return "" }
+    guard let dotIdx = name.lastIndex(of: "."), dotIdx != name.startIndex,
+        name.index(after: dotIdx) != name.endIndex
+    else { return "" }
     return String(name[dotIdx...])
 }
 
@@ -56,9 +60,16 @@ public func stripDataExtensions(_ filename: String) -> String {
     return name
 }
 
+/// Thrown when every collision suffix `_2`..`_999` is already taken. Mirrors Python's
+/// `raise ValueError(f"cannot find a free table name for {filename!r}")`.
+public struct NoFreeTableName: Error, Equatable, CustomStringConvertible {
+    public let filename: String
+    public var description: String { "cannot find a free table name for '\(filename)'" }
+}
+
 /// Derive a lowercase SQL-safe table name from a filename or directory name:
 /// '2026 Sales (final).csv' -> 't_2026_sales_final'; collisions get a _2 suffix.
-public func sanitizeTableName(_ filename: String, taken: Set<String> = []) -> String {
+public func sanitizeTableName(_ filename: String, taken: Set<String> = []) throws -> String {
     var raw = filename.trimmingCharacters(in: .whitespacesAndNewlines)
     while raw.hasSuffix("/") { raw.removeLast() }
     var stem = stripDataExtensions(raw)
@@ -107,5 +118,5 @@ public func sanitizeTableName(_ filename: String, taken: Set<String> = []) -> St
             return candidate
         }
     }
-    fatalError("cannot find a free table name for \(filename)")
+    throw NoFreeTableName(filename: filename)
 }
