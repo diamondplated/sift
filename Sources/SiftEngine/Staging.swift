@@ -465,7 +465,12 @@ extension Session {
     /// different shape. It is a backstop, not the fix; the fix is `stagingToken`.
     private nonisolated func columnsMatch(_ con: Connection, table: String, spec: SourceSpec) -> Bool {
         guard let result = try? con.query("SELECT * FROM \(q(table)) LIMIT 0") else { return false }
-        return result.columns.map(\.name) == spec.columns.map(\.name)
+        // `starts(with:)`, not `==`: a folder source's read expression appends a `filename`
+        // provenance column that `spec.columns` does not list, so an exact comparison rejected
+        // EVERY folder copy — silently turning adoption off for a whole source class while the
+        // test that should have caught it passed for this very reason. The spec's columns must all
+        // be there, in order; provenance may follow.
+        return result.columns.map(\.name).starts(with: spec.columns.map(\.name))
     }
 
     // MARK: - the staged-data lifecycle

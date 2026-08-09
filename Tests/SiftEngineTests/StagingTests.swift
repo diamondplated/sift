@@ -594,6 +594,16 @@ func aCopyOfOneSheetIsNeverServedAsAnother() async throws {
     let amounts = page.rows.map { $0[2].display }.sorted()
     #expect(amounts.contains("999.5") || amounts.contains("999.50"),
             "the edited value must be visible; got \(amounts)")
+
+    // And the positive case, in the same test: a folder whose members have NOT moved must still
+    // adopt its copy. Without this, "never adopt a folder" passes the assertions above while
+    // quietly turning adoption off for every folder source — which is exactly what an earlier
+    // version of the column backstop did.
+    _ = try await session.stageNow(again.name, force: true)
+    try await waitForStaged(session, again.name)
+    try await session.closeTable(again.name)
+    let third = try await session.openPath(dir)
+    #expect(third.staged == true, "an unchanged folder must reuse the copy it already paid for")
 }
 
 @Test func theStagingTokenSeparatesSheetsAndFolderContents() throws {
@@ -989,4 +999,29 @@ private struct ConnectionBox: @unchecked Sendable {
     _ = try await session.stageNow("small", force: true)
     try await waitForStaged(session, "small")
     #expect(try await session.stagedEntries().count == 1)
+}
+
+@Test func aCopyWhoseShapeDisagreesWithTheFileIsNotAdoptedEvenWhenTheTokenMatches() async throws {
+    // The backstop for the one hole the token cannot close (review C1(c)): a file replaced by a
+    // different file of the same size with the same mtime — a restore that preserves timestamps —
+    // produces a MATCHING token for content that is not the same. Constructed directly, because
+    // faking an identical mtime through the filesystem is the same test with more moving parts.
+    let session = try newSession()
+    let path = try makeSmallCSV()
+    let t = try await session.openPath(path)
+    let con = try session.database.connect()
+
+    // A copy under this table's name whose columns are not this file's columns, and a catalog row
+    // whose token matches the live spec exactly.
+    try con.execute("DROP VIEW IF EXISTS \(q(t.name))")
+    try con.execute("CREATE TABLE \(q(t.name)) AS SELECT 1 AS wrong_column")
+    _ = try con.query(
+        "INSERT INTO _sift_sources VALUES (?, ?, 0, 0, ?, 'csv', now(), now(), 1, 1)",
+        [.text(stagingToken(t.spec)), .text(path), .text(t.name)]
+    )
+    #expect(session.adoptStagedCopy(con, name: t.name, spec: t.spec) == nil,
+            "a copy shaped differently from the file is not a copy of the file")
+    // …and it was cleared away rather than left holding the name.
+    _ = try await session.openPath(path)
+    #expect(try await session.stagedEntries().isEmpty)
 }
