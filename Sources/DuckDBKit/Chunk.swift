@@ -82,25 +82,37 @@ public final class Chunk {
         //
         // meta.typeID.rawValue, not meta.typeName: for a type with no decoder the id is the
         // only thing that names it precisely.
+        //
+        // For LIST specifically, this ordering is load-bearing, not just an optimization.
+        // MEASURED against libduckdb 1.5.5: a NULL list row's own `duckdb_list_entry` can
+        // carry a STALE, out-of-bounds (offset, length) left over from a previous row rather
+        // than (0, 0) — e.g. `SELECT CASE WHEN i%2=0 THEN NULL ELSE range(0,i%4) END` produced
+        // offset=8 length=2, then offset=10 length=3, against a child vector of size 8. Those
+        // entries are never read only because this validity check runs BEFORE decodeOne is
+        // called for row r. A refactor that inlines or reorders this ahead of that call turns
+        // a garbage offset into a silent read of another row's memory.
         let data = duckdb_vector_get_data(vector)
+        // Resolved once per column, not per row: the accessors below are vector-level facts,
+        // fixed for the whole chunk, and re-deriving them inside the row loop broke this
+        // file's own "no per-value allocation" promise for LIST columns specifically —
+        // MEASURED: 200k LIST rows took 0.337s vs 0.118s for 200k BIGINT (2.9x) before this
+        // hoist, from calling duckdb_list_vector_get_child / duckdb_vector_get_column_type
+        // (which allocates a logical type) / get_validity / get_data once per row instead of
+        // once per column.
+        let listChild = meta.typeID == DUCKDB_TYPE_LIST ? Self.resolveListChild(vector) : nil
         var out = [Cell](repeating: .null, count: rowCount)
         for r in 0..<rowCount {
             if let validity, !duckdb_validity_row_is_valid(validity, idx_t(r)) {
                 continue   // already .null
             }
-            out[r] = data.map { decodeOne(vector: vector, data: $0, row: r, meta: meta) }
+            out[r] = data.map { decodeOne(data: $0, row: r, meta: meta, listChild: listChild) }
                 ?? .text("⟨unreadable type \(meta.typeID.rawValue)⟩")
         }
         return out
     }
 
-    /// `vector` is only consumed by the LIST case (to reach the shared child vector via
-    /// `duckdb_list_vector_get_child`) — every other case still reads exclusively through
-    /// `data`, unchanged. Optional because `duckdb_data_chunk_get_vector` imports that way;
-    /// every C accessor here happily takes the same optional through, same as before this
-    /// parameter existed.
-    private func decodeOne(vector: duckdb_vector?, data: UnsafeMutableRawPointer, row r: Int,
-                           meta: ColumnMeta) -> Cell {
+    private func decodeOne(data: UnsafeMutableRawPointer, row r: Int, meta: ColumnMeta,
+                           listChild: ListChild?) -> Cell {
         switch meta.typeID {
         case DUCKDB_TYPE_BOOLEAN:
             return .bool(data.assumingMemoryBound(to: Bool.self)[r])
@@ -189,7 +201,7 @@ public final class Chunk {
             // SQLGenPanels.badRowsSQL's own generated SQL (`list_filter([...]) AS
             // bad_columns`) produces a first-party LIST column — spec §13a, Gap 1.
             let entry = data.assumingMemoryBound(to: duckdb_list_entry.self)[r]
-            return decodeList(parent: vector, offset: entry.offset, length: entry.length)
+            return decodeList(listChild, offset: entry.offset, length: entry.length)
         default:
             // Never an empty string: that is indistinguishable from real data, and
             // NULL vs '' vs a sentinel staying distinct is the whole point of this
@@ -210,46 +222,92 @@ public final class Chunk {
 
     // MARK: - LIST
 
-    /// Decodes one row of a LIST column. `offset`/`length` slice into the child vector
-    /// every row in the column shares (`duckdb_list_vector_get_child`) — DuckDB's own
-    /// documented layout (duckdb.h:442-449): a parent vector of `duckdb_list_entry`
-    /// metadata plus one child vector holding every list's entries back to back.
+    /// Everything decoding one LIST column's entries needs, resolved ONCE per column
+    /// (`resolveListChild`, called from `decodeColumn`) rather than once per row — see the
+    /// MEASURED note there. `nestedListChild` is non-nil only when the child's own type is
+    /// itself LIST, so LIST-of-LIST resolves its whole chain up front too: nesting depth is
+    /// a vector-level fact fixed for the column, exactly like everything else here, so
+    /// there is nothing to re-derive per row or per element at any depth.
+    // A class, not a struct: a struct can't hold an optional `ListChild` field of its own
+    // type (LIST-of-LIST would make it infinitely sized) without `indirect`, which only
+    // enums get. This is a read-only accessor bag built once and never mutated, so the
+    // reference-vs-value distinction has no other consequence here.
+    private final class ListChild {
+        let vector: duckdb_vector?
+        let meta: ColumnMeta
+        let validity: UnsafeMutablePointer<UInt64>?
+        let data: UnsafeMutableRawPointer?
+        /// `duckdb_list_vector_get_size` — the child vector's total element count, i.e. the
+        /// valid range for every row's (offset, length) in this column. See I1 below.
+        let size: UInt64
+        let nestedListChild: ListChild?
+
+        init(vector: duckdb_vector?, meta: ColumnMeta, validity: UnsafeMutablePointer<UInt64>?,
+             data: UnsafeMutableRawPointer?, size: UInt64, nestedListChild: ListChild?) {
+            self.vector = vector
+            self.meta = meta
+            self.validity = validity
+            self.data = data
+            self.size = size
+            self.nestedListChild = nestedListChild
+        }
+    }
+
+    /// `parent` is a LIST vector (top-level or, recursively, a LIST-typed child). Returns
+    /// nil only if `duckdb_list_vector_get_child` itself returns nil, which the header
+    /// documents as not happening for a genuine list vector — same "shouldn't happen,
+    /// so fail loud rather than crash" policy as everywhere else in this file.
+    private static func resolveListChild(_ parent: duckdb_vector?) -> ListChild? {
+        guard let child = duckdb_list_vector_get_child(parent) else { return nil }
+        let meta = Self.meta(forChildOf: child)
+        let nested = meta.typeID == DUCKDB_TYPE_LIST ? resolveListChild(child) : nil
+        return ListChild(vector: child, meta: meta, validity: duckdb_vector_get_validity(child),
+                         data: duckdb_vector_get_data(child),
+                         size: duckdb_list_vector_get_size(parent), nestedListChild: nested)
+    }
+
+    /// Decodes one row of a LIST column. `offset`/`length` (from the row's own
+    /// `duckdb_list_entry`) slice into the child vector every row in the column shares —
+    /// DuckDB's own documented layout (duckdb.h:442-449): a parent vector of
+    /// `duckdb_list_entry` metadata plus one child vector holding every list's entries
+    /// back to back.
+    ///
+    /// I1: `offset + length <= listChild.size` is checked before either pointer is
+    /// touched. MEASURED against libduckdb 1.5.5: this cannot be made to fire through any
+    /// SQL shape tried (21 list-producing shapes, ~45k rows) — the parent's validity mask,
+    /// checked in `decodeColumn` before this function is ever called, keeps a NULL row's
+    /// stale/out-of-bounds entry from reaching here. It stays as defense-in-depth: that
+    /// ordering is easy to break in a future refactor, and the moment it breaks, an
+    /// unchecked offset is a silent read of another row's memory.
     ///
     /// The child vector carries its OWN validity mask, separate from the parent's: the
-    /// parent mask says whether the LIST value itself is NULL (handled before
-    /// `decodeOne` is ever called, same as every other type); this mask says whether one
-    /// ELEMENT inside a present list is NULL. Skipping it would report a NULL element as
-    /// present-but-unreadable — the exact class of invented data `aNullInsideANestedColumnStaysNull`
-    /// exists to catch for STRUCT/ARRAY.
-    private func decodeList(parent: duckdb_vector?, offset: UInt64, length: UInt64) -> Cell {
-        // duckdb_list_vector_get_child returns Optional in its Swift import even though the
-        // header documents it as always valid for a genuine list vector; a nil here means
-        // something upstream is not the LIST this code assumes, so — same policy as every
-        // other "shouldn't happen" branch in this file — a loud marker, not a crash.
-        guard let child = duckdb_list_vector_get_child(parent) else {
+    /// parent mask says whether the LIST value itself is NULL (handled before `decodeOne`
+    /// is ever called, same as every other type); this mask says whether one ELEMENT
+    /// inside a present list is NULL. Skipping it would report a NULL element as
+    /// present-but-unreadable — the exact class of invented data
+    /// `aNullInsideANestedColumnStaysNull` exists to catch for STRUCT/ARRAY.
+    private func decodeList(_ listChild: ListChild?, offset: UInt64, length: UInt64) -> Cell {
+        guard let listChild, offset + length <= listChild.size else {
             return .text("⟨unreadable type \(DUCKDB_TYPE_LIST.rawValue)⟩")
         }
-        let childMeta = Self.meta(forChildOf: child)
-        let childValidity = duckdb_vector_get_validity(child)
-        let childData = duckdb_vector_get_data(child)
         var items = [Cell](repeating: .null, count: Int(length))
         for i in 0..<Int(length) {
             let r = Int(offset) + i
-            if let childValidity, !duckdb_validity_row_is_valid(childValidity, idx_t(r)) {
+            if let v = listChild.validity, !duckdb_validity_row_is_valid(v, idx_t(r)) {
                 continue   // already .null
             }
-            items[i] = childData.map { decodeOne(vector: child, data: $0, row: r, meta: childMeta) }
-                ?? .text("⟨unreadable type \(childMeta.typeID.rawValue)⟩")
+            items[i] = listChild.data.map {
+                decodeOne(data: $0, row: r, meta: listChild.meta, listChild: listChild.nestedListChild)
+            } ?? .text("⟨unreadable type \(listChild.meta.typeID.rawValue)⟩")
         }
         return .list(items)
     }
 
     /// The `ColumnMeta` a child vector needs to decode through the same `decodeOne` every
-    /// top-level column uses — this is what makes LIST-of-LIST recurse for free, with no
-    /// separate nested-list code path. Only `typeID`/`decimalScale`/`decimalWidth` are
-    /// ever read below the top level (`decodeOne`/`decodeDecimal`); `name`/`typeName`
-    /// are not, so they're left blank rather than duplicating `ResultSet.typeName`'s
-    /// alias-reading logic for a value nothing consumes.
+    /// top-level column uses. Only `typeID`/`decimalScale`/`decimalWidth` are ever read
+    /// below the top level (`decodeOne`/`decodeDecimal`); `name`/`typeName` are not, so
+    /// they're left blank rather than duplicating `ResultSet.typeName`'s alias-reading
+    /// logic for a value nothing consumes.
     private static func meta(forChildOf vector: duckdb_vector) -> ColumnMeta {
         var logical = duckdb_vector_get_column_type(vector)
         let typeID = duckdb_get_type_id(logical)

@@ -249,6 +249,15 @@ private func one(_ sql: String) throws -> Cell {
     #expect(try one("SELECT []::VARCHAR[]") == .list([]))
 }
 
+// Review Minor 2: display must not collapse CARDINALITY the way it deliberately collapses
+// NULL-vs-''. .list([]) and .list([.null]) are a different fact about the data (zero
+// elements vs one absent element) and must not both print "[]".
+@Test func emptyListAndAListOfOneNullDisplayDifferently() throws {
+    #expect(Cell.list([]).display == "[]")
+    #expect(Cell.list([.null]).display == "[NULL]")
+    #expect(Cell.list([]).display != Cell.list([.null]).display)
+}
+
 @Test func decodesAListOfIntegers() throws {
     // A different element type than the VARCHAR case above, to prove the child decode
     // dispatches on the CHILD's type, not a copy of the parent's.
@@ -264,6 +273,50 @@ private func one(_ sql: String) throws -> Cell {
     #expect(rows[0][0] == .list([.text("a")]))
     #expect(rows[1][0] == .null)
     #expect(rows[1][0].isNull)
+}
+
+// Review I2/Minor 3: nested lists recurse through the same decodeOne with no separate
+// code path, but the recursion is exactly where an off-by-one in offset/length hides —
+// nothing above exercised depth > 1 before this.
+@Test func decodesAListOfLists() throws {
+    #expect(try one("SELECT [[1, 2], [3]]")
+            == .list([.list([.int(1), .int(2)]), .list([.int(3)])]))
+}
+
+@Test func decodesAListOfListsWithANullInnerList() throws {
+    // The NULL here is a whole inner LIST value, not an int inside one — a different
+    // validity check (the middle vector's own mask) than aNullListItselfStaysNullNotAnEmptyList.
+    #expect(try one("SELECT [[1, 2], NULL]")
+            == .list([.list([.int(1), .int(2)]), .null]))
+}
+
+@Test func decodesListsThreeLevelsDeep() throws {
+    // LIST(LIST(LIST(INTEGER))) — resolveListChild's recursive chain has to be right at
+    // every level, not just the first.
+    #expect(try one("SELECT [[[1, 2]], [[3]]]")
+            == .list([.list([.list([.int(1), .int(2)])]), .list([.list([.int(3)])])]))
+}
+
+// Review Minor 4: LIST elements this decoder can't read individually must stay loud, the
+// same policy decodeOne already enforces at the top level. Two different loud markers are
+// pinned here because they come from two different code paths inside decodeOne: STRUCT/
+// ARRAY have a nil data pointer (the "unreadable" fallback outside the switch); MAP/ENUM
+// have a real data pointer but no case (the "unsupported" fallback inside the switch,
+// i.e. this file's `default:`). A future edit could turn either into "" without this.
+@Test func listOfStructOrArrayElementsStaysLoudNotEmpty() throws {
+    #expect(try one("SELECT [{'a': 1}, {'a': 2}]")
+            == .list([.text("⟨unreadable type 25⟩"), .text("⟨unreadable type 25⟩")]))
+    #expect(try one("SELECT [[1, 2, 3]::INTEGER[3]]")
+            == .list([.text("⟨unreadable type 33⟩")]))
+}
+
+@Test func listOfMapOrEnumElementsStaysLoudNotEmpty() throws {
+    #expect(try one("SELECT [MAP(['a'], [1])]") == .list([.text("⟨unsupported type 26⟩")]))
+
+    let con = try Database.inMemory().connect()
+    try con.execute("CREATE TYPE mood AS ENUM ('ok', 'sad')")
+    let rows = try con.query("SELECT ['ok'::mood]").allRows()
+    #expect(rows[0][0] == .list([.text("⟨unsupported type 23⟩")]))
 }
 
 // MARK: - JSON alias (spec §13a, Gap 2)

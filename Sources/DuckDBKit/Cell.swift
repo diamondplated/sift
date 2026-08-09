@@ -55,12 +55,14 @@ public enum Cell: Sendable, Equatable {
         case .blob(let n):
             return "<blob \(Self.grouped(n)) B>"
         case .list(let items):
-            // Bracketed, comma-joined `display` of each element — readable in a grid cell,
-            // consistent with the file's documented lossiness (NULL and "" already collapse
-            // to the same glyph elsewhere; a NULL list element does here too). Real
-            // consumers (the bad-rows panel) match on `.list` directly for the column
-            // names, never on this string.
-            return "[" + items.map(\.display).joined(separator: ", ") + "]"
+            // Bracketed, comma-joined `display` of each element — readable in a grid cell.
+            // A NULL element renders as the literal "NULL", not "" like display's usual
+            // NULL/'' collapse: that collapse is about a single cell's own glyph, but here
+            // it would also erase CARDINALITY — .list([.null]) and .list([]) must not both
+            // print "[]", or a one-element list reads as an empty one. Matches DuckDB's own
+            // CAST(list AS VARCHAR), which prints `[NULL]`. Real consumers (the bad-rows
+            // panel) match on `.list` directly for the column names, never on this string.
+            return "[" + items.map { $0.isNull ? "NULL" : $0.display }.joined(separator: ", ") + "]"
         }
     }
 
