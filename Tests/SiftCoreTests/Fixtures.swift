@@ -68,12 +68,17 @@ func makeCSV(
     }
     for i in 0..<rows {
         var region = regions[i % regions.count]
-        if let ne = nullsEvery, i % ne == 0 { region = "" }   // unquoted empty reads as NULL
+        // `ne != 0` guards match Python's `n and i % n == 0`, which short-circuits on a falsy
+        // (zero) `n` and treats 0 as "disabled" rather than computing `i % 0`. Unreachable via
+        // any fixture built by this file today, but `i % 0` traps in Swift where Python's `%`
+        // would too were it ever reached — the guard is what makes 0 behave as documented
+        // ("disabled") instead of as a crash for the next caller who passes it.
+        if let ne = nullsEvery, ne != 0, i % ne == 0 { region = "" }   // unquoted empty reads as NULL
         var amount = "\(i).50"
         if let bir = badIntRow, i == bir { amount = "N/A" }
         var note = "note \(i)"
-        if let ee = emptiesEvery, i % ee == 0 { note = "\"\"" }   // quoted empty, distinct from NULL
-        if let nie = nullishEvery, i % nie == 0 { note = "N/A" }
+        if let ee = emptiesEvery, ee != 0, i % ee == 0 { note = "\"\"" }   // quoted empty, distinct from NULL
+        if let nie = nullishEvery, nie != 0, i % nie == 0 { note = "N/A" }
         if quoteNotes { note = "\"\(note)\"" }
         if let qnr = quotedNewlineRow, i == qnr { note = "\"line one\(eol)line two\"" }
         var fields = [String(i), region, amount, note]
