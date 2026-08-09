@@ -43,10 +43,10 @@ private func cellText(_ cell: Cell) -> String {
     return ""
 }
 
-private func cellInt(_ cell: Cell) -> Int {
-    if case .int(let n) = cell { return Int(n) }
-    return 0
-}
+// `cellInt` lives in Session.swift (widened from `private` to internal) and is shared from
+// there — see its doc comment. Not duplicated here: it decodes the same shape (a bare
+// count/BIGINT cell), and a second copy is exactly the kind of decoder drift this branch has
+// already ruled against twice (Plan 2 Task 4's `col`/`asText`, Plan 2 Task 10's `grouped`).
 
 private func cellBool(_ cell: Cell) -> Bool {
     if case .bool(let b) = cell { return b }

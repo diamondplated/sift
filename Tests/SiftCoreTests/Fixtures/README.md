@@ -1,6 +1,6 @@
 # Golden test fixtures
 
-These three workbooks are committed rather than generated, and that is deliberate.
+These four workbooks are committed rather than generated, and that is deliberate.
 
 ## Why they are not generated
 
@@ -27,6 +27,12 @@ Task 9's review-fix pass, to close a gap the review caught: nothing exercised th
 `XMLParser`-not-regex decision and the empty-`<dimension>` handling both exist for. It has
 no Python-suite equivalent — it did not need one, since it targets bugs the port itself
 introduced, not behavior being carried over.
+
+`excel_serial.xlsx` was added during the SiftEngine plan's Task 5 review-fix pass (still
+2026-08-09), in a throwaway venv (`python3 -m venv`, `pip install openpyxl==3.1.5`) since the
+system Python is externally managed — `engine/` and `requirements.txt` were both still in the
+tree at the time (this plan does not delete them; Plan 5 does), so generating it followed the
+exact same recipe as `amp.xlsx`, not the hand-rolled-OOXML trap warned about above.
 
 ## What each one is for
 
@@ -76,9 +82,33 @@ Two things this proves that `book.xlsx`/`odd.xlsx` don't:
    number — which is how a span-based bug in `parseDimensionRef` shipped past both of them
    during Task 9 and was only caught in review.
 
+**`excel_serial.xlsx`** — one sheet (`Sheet1`), two columns, five data rows:
+
+```python
+import openpyxl
+wb = openpyxl.Workbook()
+ws = wb.active
+ws.title = "Sheet1"
+ws["A1"] = "id"
+ws["B1"] = "serial"
+values = [25100, 30000, 35000, 40000, 45999]
+for i, v in enumerate(values, start=2):
+    ws[f"A{i}"] = i - 1
+    ws[f"B{i}"] = v
+wb.save("excel_serial.xlsx")
+```
+
+Exercises `SessionQueries.computeProfile`'s Excel-serial-date note: `serial`'s five values sit
+entirely inside `looksLikeExcelSerialDates`' 25,000–50,000 window, with more than one distinct
+value, and `id` is an ordinary small integer that must NOT trigger the same note — the two
+columns together pin that the check is column-scoped, not table-wide. Unlike `book.xlsx`/
+`odd.xlsx`/`amp.xlsx` (which pin `XLSXSheets.swift`'s sheet-enumeration parsing), this one is
+consumed by `Tests/SiftEngineTests/SessionQueriesTests.swift` — it needs real numeric *data* in
+a specific range, not a specific sheet-metadata shape.
+
 ## Regenerating, if it ever becomes necessary
 
-Requires a Python with openpyxl. `amp.xlsx`'s generating script is inlined above;
+Requires a Python with openpyxl. Every workbook's generating script is inlined above;
 `book.xlsx`/`odd.xlsx`'s recipe lived in `engine/tests/fixtures.py` before that tree was
 deleted — `git log -- Tests/SiftCoreTests/Fixtures` will find the commit that added them,
 and its message carries the generating script.

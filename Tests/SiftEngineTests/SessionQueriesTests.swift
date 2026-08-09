@@ -74,6 +74,17 @@ private func orderID(_ row: [Cell]) -> Int {
     return Int(v)
 }
 
+/// A single-column CSV of `count` distinct integers, one each, 0..<count — the identical shape
+/// `DuckDB155FactsTests.fact8_approxCountDistinctIsAnEstimate` measured `approx_count_distinct`
+/// overshooting for (340 reported for 300 real distinct values).
+private func makeUniqueIntCSV(dir: String, count: Int) throws -> String {
+    let path = (dir as NSString).appendingPathComponent("unique.csv")
+    var out = "v\n"
+    for i in 0..<count { out += "\(i)\n" }
+    try out.write(toFile: path, atomically: true, encoding: .utf8)
+    return path
+}
+
 // MARK: - faceting (brief gotcha #1) — both halves in one test
 
 @Test func distinctFacetingIgnoresItsOwnColumnsFilterButRespectsOtherColumns() async throws {
@@ -116,6 +127,57 @@ private func orderID(_ row: [Cell]) -> Int {
     }
 }
 
+// MARK: - distinct clamps an approx count that overshoots the real row count (brief gotcha #3)
+
+@Test func distinctClampsAnApproxCountThatOvershootsTheRealRowCount() async throws {
+    // `wantsExactDistinct` only lets `distinct()` reach the approximate/clamp branch when the
+    // CACHED profile's own `approxDistinct` is already >= 100,000 — a real table would need that
+    // many actual distinct values to get there, which is not a size worth paying for in a unit
+    // test. So the cached profile is overridden directly (the same sentinel-trick shape as
+    // `setUncastableForTest`) while the REAL `distinctStatsSQL` query underneath still runs
+    // against the real table below and can still genuinely overshoot.
+    let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString).path
+    try FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+    let path = try makeUniqueIntCSV(dir: dir, count: 300)
+
+    let session = try newSession()
+    let t = try await session.openPath(path)
+
+    // Prove the overshoot is real on THIS data, independent of `distinct()` entirely — the same
+    // method fact8 uses, rather than trusting a hardcoded "340" to still hold on a CSV-sniffed
+    // BIGINT column (as opposed to fact8's raw `range(300)`).
+    let probe = try Database.inMemory().connect()
+    let rawApproxCell = try probe.query(
+        "SELECT approx_count_distinct(v) FROM read_csv(\(qlit(path)))"
+    ).allRows()[0][0]
+    guard case .int(let rawApproxRaw) = rawApproxCell else {
+        Issue.record("expected an integer: \(rawApproxCell)"); return
+    }
+    let rawApprox = Int(rawApproxRaw)
+    #expect(rawApprox > 300, "the whole point of this fixture is a HyperLogLog overshoot to clamp")
+
+    var profile = try await session.computeProfile(t.name)
+    guard let i = profile.firstIndex(where: { $0.name == "v" }) else {
+        Issue.record("no 'v' column in the profile"); return
+    }
+    let original = profile[i]
+    profile[i] = ColumnProfile(
+        name: original.name, type: original.type, kind: original.kind, n: original.n,
+        nNull: original.nNull, nEmpty: original.nEmpty, nNullish: original.nNullish,
+        approxDistinct: 999_999, exactDistinct: original.exactDistinct,
+        minS: original.minS, maxS: original.maxS, avg: original.avg, std: original.std,
+        q25: original.q25, q50: original.q50, q75: original.q75, maxLen: original.maxLen,
+        nUncastable: original.nUncastable, view: original.view
+    )
+    await session.setProfileForTest(t.name, profile)
+
+    let panel = try await session.distinct(t.name, col: "v", limit: 5)
+    #expect(panel.nDistinct.exact == false, "the exact branch must not have been taken")
+    #expect(panel.nRows == 300)
+    #expect(panel.nDistinct.value == 300, "clampDistinct caps the overshoot at the real row count")
+    #expect(panel.nDistinct.value < rawApprox, "the clamp must have actually reduced the raw estimate")
+}
+
 // MARK: - compute_profile reuses the cached bad-cell scan (brief gotcha #2)
 
 @Test func computeProfileReusesTheCachedUncastableScanInsteadOfRescanning() async throws {
@@ -148,6 +210,31 @@ private func orderID(_ row: [Cell]) -> Int {
     } catch {
         Issue.record("wrong error type: \(error)")
     }
+}
+
+// MARK: - the Excel-serial-date note is column-scoped, not table-wide (brief gotcha #8)
+
+@Test func computeProfileNotesAnExcelSerialDateLookingColumnOnlyForXlsx() async throws {
+    // excel_serial.xlsx: "serial" holds five values inside looksLikeExcelSerialDates' 25,000-
+    // 50,000 window (2 distinct is already > 1), "id" is an ordinary small integer. Both columns
+    // together pin that the note fires per-column, not once the source format is merely xlsx —
+    // `&& t.spec.fmt == .xlsx` is new code unique to this task, so SiftCoreTests' coverage of the
+    // pure predicate alone (which knows nothing about `spec.fmt`) cannot exercise this gate; only
+    // going through `Session.computeProfile` can.
+    let session = try newSession()
+    let t = try await session.openPath(siftCoreTestsFixture("excel_serial.xlsx"))
+    #expect(t.spec.fmt == .xlsx)
+
+    _ = try await session.computeProfile(t.name)
+    let after = try await session.table(t.name)
+    #expect(
+        after.notes.contains { $0.contains("serial") && $0.contains("Excel serial dates") },
+        "expected an Excel-serial-date note naming the 'serial' column; got: \(after.notes)"
+    )
+    #expect(
+        !after.notes.contains { $0.contains("\u{201C}id\u{201D}") },
+        "the ordinary 'id' column must not also get the note"
+    )
 }
 
 // MARK: - bad_rows decodes the LIST of failing column names (brief gotcha #4)

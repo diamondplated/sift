@@ -446,20 +446,14 @@ public struct BadRowsPanel: Sendable {
 
 // MARK: - small Cell helpers local to this file
 //
-// `toDBValue` (the SQLValue<->DBValue mapping used by every bound query above) already exists in
-// Session.swift, widened from `private` to internal so both files share one copy — it is five
-// lines of real logic, worth not drifting. `cellInt` is NOT shared the same way: Session.swift and
-// SourceProbe.swift each already keep their own file-scoped copy of this exact three-line
-// coercion (same call there was already made, pre-Task-5), so a fourth copy here follows the
-// codebase's own established convention for a helper this trivial rather than fighting it.
-// `cellText`/`cellDouble`/`cellEquals` below have no equivalent elsewhere yet — same
-// "swallow instead of throw" contract as SiftCore.Profile's looseInt/looseFloat: a shape a query
-// should never actually produce degrades rather than throws.
-
-private func cellInt(_ cell: Cell) -> Int {
-    if case .int(let v) = cell { return Int(v) }
-    return 0
-}
+// `toDBValue`/`cellInt` (the SQLValue<->DBValue mapping, and Cell->Int for every count(*)-shaped
+// result above) already exist in Session.swift, widened from `private` to internal so every file
+// in this module shares one copy of each rather than a second copy that could silently drift —
+// this branch has already ruled against exactly that duplication twice (Plan 2 Task 4's `col`/
+// `asText`, Plan 2 Task 10's `grouped`), and both of these are decoders: drift changes a parsed
+// value, not a format. `cellText`/`cellDouble`/`cellEquals` below have no equivalent elsewhere
+// yet — same "swallow instead of throw" contract as SiftCore.Profile's looseInt/looseFloat: a
+// shape a query should never actually produce degrades rather than throws.
 
 private func cellText(_ cell: Cell) -> String {
     if case .text(let s) = cell { return s }

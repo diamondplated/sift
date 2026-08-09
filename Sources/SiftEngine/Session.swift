@@ -275,6 +275,17 @@ public actor Session {
         tables[name] = t
     }
 
+    /// Test support: overwrite an open table's cached profile directly. Lets a test drive
+    /// `distinct` down its approximate/clamp branch without a genuinely 100,000-plus-distinct
+    /// fixture — plant a `ColumnProfile` whose `approxDistinct` already clears
+    /// `wantsExactDistinct`'s threshold, while the real `distinctStatsSQL` query underneath still
+    /// runs against the real (small) table and can still genuinely overshoot.
+    func setProfileForTest(_ name: String, _ profile: [ColumnProfile]) {
+        guard var t = tables[name] else { return }
+        t.profile = profile
+        tables[name] = t
+    }
+
     /// Safe relation SQL for this table — a quoted name, or the user's wrapped query.
     public nonisolated func relation(_ t: Table) -> String {
         if t.sqlMode, let text = t.sqlText {
@@ -680,7 +691,12 @@ private func detectBadRows(_ con: Connection, spec: SourceSpec, raw: String) thr
     return BadRowScan(uncastable: uncastable, badCells: badCells, badRows: badRows)
 }
 
-private func cellInt(_ cell: Cell) -> Int {
+/// Not `private`: SourceProbe.swift and SessionQueries.swift decode plenty of `count(*)`-shaped
+/// `Cell`s of their own and share this exact coercion rather than a second (or third) copy that
+/// could silently drift from it — decoders drift into a wrong parsed value, not just a wrong
+/// format, which is why this branch has twice ruled against the same move for `col`/`asText`
+/// (Plan 2 Task 4) and `grouped` (Plan 2 Task 10).
+func cellInt(_ cell: Cell) -> Int {
     if case .int(let v) = cell { return Int(v) }
     return 0
 }
