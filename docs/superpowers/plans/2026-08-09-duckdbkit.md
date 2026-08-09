@@ -1629,13 +1629,15 @@ private func tempCSV(_ contents: String) throws -> String {
 // whether or not the behavior still holds. A test that passes for the wrong reason is
 // worse than no test. Both land in Plan 2, where the fixtures exist.
 
-@Test func fact5_timestampWithTimeZoneRoundTrips() throws {
-    // In Python this needs pytz or it raises. Through the C API there is no Python
-    // dependency at all, so this must simply work — the pytz pin disappears with it.
+@Test func fact5_timestampWithTimeZoneNeedsNoPytz() throws {
+    // In the Python engine this is a hard dependency: without pytz, fetching ANY
+    // TIMESTAMP WITH TIME ZONE raises "Required module 'pytz' failed to import".
+    // Through the C API there is no Python in the picture at all, so the pinned
+    // pytz dependency disappears with the rewrite. This test is what proves it.
     let c = try con()
     try c.execute("SET TimeZone='UTC'")
     let v = try c.query("SELECT TIMESTAMPTZ '2026-08-09 12:00:00+00'").allRows()[0][0]
-    #expect(v != .null)
+    #expect(v == .text("2026-08-09T12:00:00+00:00"))
 }
 
 @Test func fact7_allowQuotedNullsFalseKeepsEmptyStringDistinctFromNull() throws {
@@ -1650,17 +1652,24 @@ private func tempCSV(_ contents: String) throws -> String {
     #expect(rows[1][0] == .text(""))
 }
 
-@Test func fact8_approxCountDistinctCanExceedTheRowCount() throws {
-    // Measured at 340 for 300 distinct values. HyperLogLog is an estimate, so
-    // core/profile.py clamps it. This test records that clamping is still needed.
+@Test func fact8_approxCountDistinctIsAnEstimate() throws {
+    // The documented measurement is that approx_count_distinct reported 340 for 300
+    // distinct values — it is HyperLogLog, so it can exceed the true count, which is
+    // why core/profile.py clamps it.
+    //
+    // MEASURE BEFORE PINNING. Run this, observe what 1.5.5 actually returns for 300
+    // distinct, and replace the expectation below with that exact value. If it comes
+    // back exactly 300, say so in your report rather than deleting the test — that
+    // would mean the estimator changed, and the clamp's justification needs rewriting
+    // rather than the clamp being removed.
     let rows = try con().query(
         "SELECT approx_count_distinct(i), count(*) FROM range(300) AS t(i)"
     ).allRows()
     guard case .int(let approx) = rows[0][0], case .int(let exact) = rows[0][1] else {
-        Issue.record("expected two integers"); return
+        Issue.record("expected two integers, got \(rows[0])"); return
     }
     #expect(exact == 300)
-    #expect(approx > 0)   // the point is only that it is an estimate, not that it is wrong
+    #expect(approx == 300)   // <- replace with the measured value if it differs
 }
 
 @Test func fact9_duckdbTablesEstimatedSizeIsRowsNotBytes() throws {
@@ -1695,6 +1704,10 @@ private func tempCSV(_ contents: String) throws -> String {
 
 Run: `swift test --filter DuckDB155FactsTests`
 Expected: PASS — 8 tests (seven behaviors plus the SELECT-only wrap).
+
+`fact8` may need its expectation set from the observed value on first run — that is
+deliberate and called out in the test body. Every other expectation is fixed and must
+not be adjusted to match output.
 
 **If any fail:** stop. Do not adjust the test to match. Record which behavior changed
 and report it — it changes the SiftCore design in Plan 2. These tests run entirely on
