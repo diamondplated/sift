@@ -223,3 +223,61 @@ private func one(_ sql: String) throws -> Cell {
     #expect(try one("SELECT TIMETZ '12:34:56+02:00'") == .text("12:34:56+02:00"))
     #expect(try one("SELECT TIMETZ '12:34:56-05:30'") == .text("12:34:56-05:30"))
 }
+
+// MARK: - LIST (spec §13a, Gap 1)
+//
+// Before this fix every one of these decoded as .text("⟨unsupported type 24⟩") — 24 is
+// DUCKDB_TYPE_LIST. The case that matters most isn't a hand-written literal; it's
+// SQLGenPanels.badRowsSQL's own generated `list_filter(...) AS bad_columns`, covered
+// separately in SQLGenPanelsTests.badRowsSQLDecodesBadColumnsAsTheFailingColumnNames
+// because it needs SiftCore to build that SQL — this file stays DuckDBKit-only.
+
+@Test func decodesAPlainListOfText() throws {
+    #expect(try one("SELECT ['a', 'b', 'c']")
+            == .list([.text("a"), .text("b"), .text("c")]))
+}
+
+@Test func decodesAListContainingANullElement() throws {
+    // The child vector's OWN validity mask, distinct from the parent's — this is the case
+    // that mask exists for. A present list with an absent element must not silently invent
+    // a value for that element.
+    #expect(try one("SELECT ['a', NULL, 'c']")
+            == .list([.text("a"), .null, .text("c")]))
+}
+
+@Test func decodesAnEmptyList() throws {
+    #expect(try one("SELECT []::VARCHAR[]") == .list([]))
+}
+
+@Test func decodesAListOfIntegers() throws {
+    // A different element type than the VARCHAR case above, to prove the child decode
+    // dispatches on the CHILD's type, not a copy of the parent's.
+    #expect(try one("SELECT [1, 2, 3]") == .list([.int(1), .int(2), .int(3)]))
+}
+
+@Test func aNullListItselfStaysNullNotAnEmptyList() throws {
+    // The parent's own validity mask must still win: a NULL list is NULL, not .list([]) —
+    // those are two different facts about the data and must not collapse into one.
+    let rows = try Database.inMemory().connect().query(
+        "SELECT * FROM (VALUES (['a']), (NULL)) AS t(v)"
+    ).allRows()
+    #expect(rows[0][0] == .list([.text("a")]))
+    #expect(rows[1][0] == .null)
+    #expect(rows[1][0].isNull)
+}
+
+// MARK: - JSON alias (spec §13a, Gap 2)
+
+@Test func jsonColumnReportsTypeNameJSON() throws {
+    let con = try Database.inMemory().connect()
+    let cols = try con.query("SELECT '{\"a\": 1}'::JSON AS v").columns
+    #expect(cols[0].typeName == "JSON")
+}
+
+@Test func plainVarcharColumnStillReportsTypeNameVARCHAR() throws {
+    // Pins the alias read to be conditional, not unconditional — a version that always
+    // returned "JSON" regardless of the alias would pass the test above and still be wrong.
+    let con = try Database.inMemory().connect()
+    let cols = try con.query("SELECT 'hello'::VARCHAR AS v").columns
+    #expect(cols[0].typeName == "VARCHAR")
+}

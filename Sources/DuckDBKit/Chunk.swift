@@ -88,13 +88,19 @@ public final class Chunk {
             if let validity, !duckdb_validity_row_is_valid(validity, idx_t(r)) {
                 continue   // already .null
             }
-            out[r] = data.map { decodeOne(data: $0, row: r, meta: meta) }
+            out[r] = data.map { decodeOne(vector: vector, data: $0, row: r, meta: meta) }
                 ?? .text("⟨unreadable type \(meta.typeID.rawValue)⟩")
         }
         return out
     }
 
-    private func decodeOne(data: UnsafeMutableRawPointer, row r: Int, meta: ColumnMeta) -> Cell {
+    /// `vector` is only consumed by the LIST case (to reach the shared child vector via
+    /// `duckdb_list_vector_get_child`) — every other case still reads exclusively through
+    /// `data`, unchanged. Optional because `duckdb_data_chunk_get_vector` imports that way;
+    /// every C accessor here happily takes the same optional through, same as before this
+    /// parameter existed.
+    private func decodeOne(vector: duckdb_vector?, data: UnsafeMutableRawPointer, row r: Int,
+                           meta: ColumnMeta) -> Cell {
         switch meta.typeID {
         case DUCKDB_TYPE_BOOLEAN:
             return .bool(data.assumingMemoryBound(to: Bool.self)[r])
@@ -178,6 +184,12 @@ public final class Chunk {
         case DUCKDB_TYPE_INTERVAL:
             let iv = data.assumingMemoryBound(to: duckdb_interval.self)[r]
             return .text(Self.intervalString(months: iv.months, days: iv.days, micros: iv.micros))
+        case DUCKDB_TYPE_LIST:
+            // The premise that nested columns only arrive pre-CAST to VARCHAR was false:
+            // SQLGenPanels.badRowsSQL's own generated SQL (`list_filter([...]) AS
+            // bad_columns`) produces a first-party LIST column — spec §13a, Gap 1.
+            let entry = data.assumingMemoryBound(to: duckdb_list_entry.self)[r]
+            return decodeList(parent: vector, offset: entry.offset, length: entry.length)
         default:
             // Never an empty string: that is indistinguishable from real data, and
             // NULL vs '' vs a sentinel staying distinct is the whole point of this
@@ -185,13 +197,67 @@ public final class Chunk {
             //
             // Deliberately still landing here, pending real decode paths: ENUM, BIT,
             // BIGNUM (the C API's name for VARINT — there is no DUCKDB_TYPE_VARINT in
-            // this header). Also nested types (STRUCT/LIST/MAP/UNION) and JSON — but
-            // for those, SiftEngine is expected to CAST(col AS VARCHAR) in the SELECT
-            // list before the column ever reaches this decoder, so hitting this branch
-            // on a nested column means that contract was not honored upstream, not
-            // that this fallback is a substitute for it.
+            // this header). Also STRUCT/MAP/UNION and JSON — but for those, SiftEngine
+            // is expected to CAST(col AS VARCHAR) in the SELECT list before the column
+            // ever reaches this decoder, so hitting this branch on one of them means
+            // that contract was not honored upstream, not that this fallback is a
+            // substitute for it. LIST is the one nested shape that decodes for real,
+            // above, because it is not just user data — it's the shape Sift's own SQL
+            // generates.
             return .text("⟨unsupported type \(meta.typeID.rawValue)⟩")
         }
+    }
+
+    // MARK: - LIST
+
+    /// Decodes one row of a LIST column. `offset`/`length` slice into the child vector
+    /// every row in the column shares (`duckdb_list_vector_get_child`) — DuckDB's own
+    /// documented layout (duckdb.h:442-449): a parent vector of `duckdb_list_entry`
+    /// metadata plus one child vector holding every list's entries back to back.
+    ///
+    /// The child vector carries its OWN validity mask, separate from the parent's: the
+    /// parent mask says whether the LIST value itself is NULL (handled before
+    /// `decodeOne` is ever called, same as every other type); this mask says whether one
+    /// ELEMENT inside a present list is NULL. Skipping it would report a NULL element as
+    /// present-but-unreadable — the exact class of invented data `aNullInsideANestedColumnStaysNull`
+    /// exists to catch for STRUCT/ARRAY.
+    private func decodeList(parent: duckdb_vector?, offset: UInt64, length: UInt64) -> Cell {
+        // duckdb_list_vector_get_child returns Optional in its Swift import even though the
+        // header documents it as always valid for a genuine list vector; a nil here means
+        // something upstream is not the LIST this code assumes, so — same policy as every
+        // other "shouldn't happen" branch in this file — a loud marker, not a crash.
+        guard let child = duckdb_list_vector_get_child(parent) else {
+            return .text("⟨unreadable type \(DUCKDB_TYPE_LIST.rawValue)⟩")
+        }
+        let childMeta = Self.meta(forChildOf: child)
+        let childValidity = duckdb_vector_get_validity(child)
+        let childData = duckdb_vector_get_data(child)
+        var items = [Cell](repeating: .null, count: Int(length))
+        for i in 0..<Int(length) {
+            let r = Int(offset) + i
+            if let childValidity, !duckdb_validity_row_is_valid(childValidity, idx_t(r)) {
+                continue   // already .null
+            }
+            items[i] = childData.map { decodeOne(vector: child, data: $0, row: r, meta: childMeta) }
+                ?? .text("⟨unreadable type \(childMeta.typeID.rawValue)⟩")
+        }
+        return .list(items)
+    }
+
+    /// The `ColumnMeta` a child vector needs to decode through the same `decodeOne` every
+    /// top-level column uses — this is what makes LIST-of-LIST recurse for free, with no
+    /// separate nested-list code path. Only `typeID`/`decimalScale`/`decimalWidth` are
+    /// ever read below the top level (`decodeOne`/`decodeDecimal`); `name`/`typeName`
+    /// are not, so they're left blank rather than duplicating `ResultSet.typeName`'s
+    /// alias-reading logic for a value nothing consumes.
+    private static func meta(forChildOf vector: duckdb_vector) -> ColumnMeta {
+        var logical = duckdb_vector_get_column_type(vector)
+        let typeID = duckdb_get_type_id(logical)
+        let isDecimal = typeID == DUCKDB_TYPE_DECIMAL
+        let scale = isDecimal ? duckdb_decimal_scale(logical) : 0
+        let width = isDecimal ? duckdb_decimal_width(logical) : 0
+        duckdb_destroy_logical_type(&logical)
+        return ColumnMeta(name: "", typeID: typeID, decimalScale: scale, decimalWidth: width, typeName: "")
     }
 
     // MARK: - 128-bit integers

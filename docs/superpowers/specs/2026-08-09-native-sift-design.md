@@ -459,15 +459,20 @@ fired. Hammering the interrupt in a loop cancels reliably (5/5 runs, 0.000–0.0
 the interrupt for as long as the job is meant to be cancelled**, not call it once. The
 Python engine's single `con.interrupt()` does not port across.
 
-**A first-party generated query returns a `LIST`, and the decoder cannot read it — Plan 3.**
-Plan 1 deferred nested-type decoding on the premise that nested columns only arrive in
-*user data*, which SiftEngine would wrap in `CAST(col AS VARCHAR)`. That premise is
-false. `sqlgen.bad_rows_sql` emits `list_filter([...], x -> x IS NOT NULL) AS
-bad_columns` — Sift's own SQL, generating a `LIST` column — so `bad_columns` currently
-decodes as `⟨unsupported type 24⟩` and the per-cell highlighting in the "rows your file
-lost" panel cannot work end to end. Measured 2026-08-09 by running the generated SQL
-through `DuckDBKit`. Plan 3 must either add a `LIST` case to `Chunk.decodeColumn` or
-cast this one column in the query; the generated SQL itself is correct either way.
+**A first-party generated query returns a `LIST`, and the decoder cannot read it — CLOSED
+2026-08-09, Plan 3 Task 1.** Plan 1 deferred nested-type decoding on the premise that
+nested columns only arrive in *user data*, which SiftEngine would wrap in `CAST(col AS
+VARCHAR)`. That premise was false. `sqlgen.bad_rows_sql` emits `list_filter([...], x ->
+x IS NOT NULL) AS bad_columns` — Sift's own SQL, generating a `LIST` column — so
+`bad_columns` decoded as `⟨unsupported type 24⟩` and the per-cell highlighting in the
+"rows your file lost" panel could not work end to end. Fixed by adding a `LIST` case to
+`Chunk.decodeColumn`/`decodeOne` (reading `duckdb_list_entry` plus
+`duckdb_list_vector_get_child`, duckdb.h:442-449 and :3535) and a `Cell.list([Cell])`
+case that keeps each element as its own `Cell` rather than joining into text. Covered by
+`DecodeTests.swift`'s LIST tests and, as the actual consumer,
+`SQLGenPanelsTests.badRowsSQLDecodesBadColumnsAsTheFailingColumnNames`, which runs
+`badRowsSQL`'s generated SQL against a real dirty CSV and asserts the decoded
+`bad_columns` names the failing column.
 
 **Six DuckDB types do not decode — Plan 3.** `ENUM` (23), `BIT` (29), `BIGNUM` (35),
 `TIME_NS` (39), `VARIANT` (41) and `GEOMETRY` (40) render `⟨unsupported type N⟩`. NULLs
@@ -481,21 +486,22 @@ Foundation only and so cannot touch the decoder at all — the fix lives in
 result path is `SiftEngine`. Plan 2's own "Deliberately not in this plan" had already
 pushed it to "Plan 2's successor work" without naming it; this names it.
 
-**JSON classifies as text, not nested — Plan 3.** `duckdb_column_logical_type` reports
-JSON as type id 17 (`VARCHAR`), so a JSON column arrives from `DuckDBKit` typed
-`"VARCHAR"`. `duckdb_logical_type_get_alias` (`duckdb.h:3070`) returns `"JSON"` for such
-a column and `nil` for a plain VARCHAR — reading the alias in `ResultSet.init` and
-preferring it when non-nil closes this in about three lines.
+**JSON classifies as text, not nested — CLOSED 2026-08-09, Plan 3 Task 1.**
+`duckdb_column_logical_type` reports JSON as type id 17 (`VARCHAR`), so a JSON column
+arrived from `DuckDBKit` typed `"VARCHAR"`. `duckdb_logical_type_get_alias`
+(`duckdb.h:3070`) returns `"JSON"` for such a column and `nil` for a plain VARCHAR —
+`ResultSet.init` now reads the alias and prefers it whenever non-nil, freeing the
+returned string with `duckdb_free` per duckdb.h:3065.
 
-*Reassigned from Plan 2 (2026-08-09), with a live consequence now that `SiftCore`
-exists.* `kind(of:)` is correct on its own terms — it returns `.nested` for the string
-`"JSON"` — so the gap is entirely upstream of it, in what `DuckDBKit` reports. The
-consequence is concrete: `SiftEngine` will build its `Column`s from `"VARCHAR"`, so a
-JSON column classifies `.text`, and `chooseView` can then route it to the **`highcard`**
-panel — near-unique text is exactly what a column of JSON documents looks like. The user
-gets "is this a key?" for a column that should have been offered as nested. Fixing this
-in `ResultSet.init` fixes the classification everywhere downstream at once; fixing it in
-`SiftEngine` by special-casing the panel would not.
+`kind(of:)` was already correct on its own terms — it returns `.nested` for the string
+`"JSON"` — so the gap was entirely upstream of it, in what `DuckDBKit` reported. The
+consequence was concrete: `SiftEngine` would have built its `Column`s from `"VARCHAR"`,
+so a JSON column classified `.text`, and `chooseView` could then route it to the
+**`highcard`** panel — near-unique text is exactly what a column of JSON documents looks
+like. Fixing it in `ResultSet.init` fixes the classification everywhere downstream at
+once. Covered by `DecodeTests.swift`'s `jsonColumnReportsTypeNameJSON` (paired with
+`plainVarcharColumnStillReportsTypeNameVARCHAR` so the alias read can't just always
+return `"JSON"`).
 
 **`loadedExtensions[name] == false` conflates two failures — Plan 3.** A legal name with
 no such extension installed, and a name rejected by the injection guard, both record

@@ -23,6 +23,16 @@ public enum Cell: Sendable, Equatable {
     /// lets `display` reconstruct the declared shape instead of a canonicalized one.
     case decimal(Decimal, scale: Int)
     case blob(Int)
+    /// A DuckDB LIST, decoded element-by-element rather than joined into one string.
+    ///
+    /// Not text: the first consumer is the "rows your file lost" panel's `bad_columns`
+    /// column (SQLGenPanels.badRowsSQL emits `list_filter([...]) AS bad_columns`), whose
+    /// whole job is naming *which* columns failed so the UI can highlight those specific
+    /// cells. A joined string would have to be re-split downstream, and re-splitting
+    /// breaks the instant a column name contains the separator — in a product whose
+    /// entire premise is not mangling data. Keeping the children as `Cell`s also means
+    /// nested LISTs decode for free, with no special-casing.
+    case list([Cell])
 
     public var isNull: Bool { self == .null }
 
@@ -44,6 +54,13 @@ public enum Cell: Sendable, Equatable {
         case .decimal(let v, let scale): return Self.decimalDisplay(v, scale: scale)
         case .blob(let n):
             return "<blob \(Self.grouped(n)) B>"
+        case .list(let items):
+            // Bracketed, comma-joined `display` of each element — readable in a grid cell,
+            // consistent with the file's documented lossiness (NULL and "" already collapse
+            // to the same glyph elsewhere; a NULL list element does here too). Real
+            // consumers (the bad-rows panel) match on `.list` directly for the column
+            // names, never on this string.
+            return "[" + items.map(\.display).joined(separator: ", ") + "]"
         }
     }
 

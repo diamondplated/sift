@@ -22,10 +22,22 @@ public final class ResultSet {
             let isDecimal = typeID == DUCKDB_TYPE_DECIMAL
             let scale = isDecimal ? duckdb_decimal_scale(logical) : 0
             let width = isDecimal ? duckdb_decimal_width(logical) : 0
+            // JSON reports as VARCHAR (type id 17) — duckdb_get_type_id has no JSON case, so
+            // typeID alone can't tell a JSON column from a plain string one. The alias is the
+            // only signal that does: DuckDB sets it to "JSON" for a JSON column and leaves it
+            // nil otherwise (duckdb.h:3070). Read it before destroying the logical type, and
+            // prefer it over the derived name whenever it's non-nil. Spec §13a, Gap 2.
+            let aliasPtr = duckdb_logical_type_get_alias(logical)
+            let resolvedTypeName: String
+            if let aliasPtr {
+                resolvedTypeName = String(cString: aliasPtr)
+                duckdb_free(aliasPtr)   // "must be destroyed with duckdb_free" — duckdb.h:3065
+            } else {
+                resolvedTypeName = Self.typeName(typeID, width: width, scale: scale)
+            }
             duckdb_destroy_logical_type(&logical)
             metas.append(ColumnMeta(name: name, typeID: typeID, decimalScale: scale,
-                                    decimalWidth: width,
-                                    typeName: Self.typeName(typeID, width: width, scale: scale)))
+                                    decimalWidth: width, typeName: resolvedTypeName))
         }
         self.result = result
         self.columns = metas

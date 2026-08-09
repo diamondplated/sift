@@ -1,4 +1,6 @@
 import Testing
+import DuckDBKit
+import Foundation
 @testable import SiftCore
 
 // SQL generation for the panels: top-N, distinct stats, histogram, the extra profiling scan,
@@ -153,4 +155,53 @@ private let cols: [String: Column] = Dictionary(uniqueKeysWithValues: colsList.m
     let (sql, params) = try badRowsSQL(q("t"), onlyText)
     #expect(sql == "SELECT * FROM \(q("t")) LIMIT 0")
     #expect(params.isEmpty)
+}
+
+// MARK: - bad_rows_sql, decoded for real (spec §13a, Gap 1)
+//
+// The two tests above only check the SQL text. This one is the actual consumer the gap
+// broke: bad_rows_sql's `bad_columns` is a LIST, and until DuckDBKit gained a LIST
+// decoder, running this exact SQL against real data returned .text("⟨unsupported type
+// 24⟩") for that column — the per-cell highlighting in the "rows your file lost" panel
+// could not work end to end. This runs the generated SQL through a live DuckDB connection
+// against a genuinely dirty CSV and decodes the result the way SiftEngine will.
+// `tempDir()` in Fixtures.swift is file-private, so this file gets its own — same pattern
+// SnippetTests.swift already uses, one temp-dir helper is not worth sharing across files.
+private func badRowsTempDir() throws -> String {
+    let dir = FileManager.default.temporaryDirectory
+        .appendingPathComponent("sift-badrows-\(UUID().uuidString)")
+    try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+    return dir.path
+}
+
+@Test func badRowsSQLDecodesBadColumnsAsTheFailingColumnNames() throws {
+    let dir = try badRowsTempDir()
+    let path = try makeCSV(dir: dir, rows: 20, badIntRow: 5)   // row 5's amount becomes "N/A"
+    let con = try Database.inMemory().connect()
+
+    // The "all-varchar relation" badRowsSQL expects: every column read as VARCHAR so its
+    // generated TRY_CAST checks can run in SQL (see badRowCountSQL's doc comment for why).
+    let relVarchar = "read_csv(\(qlit(path)), columns={'order_id':'VARCHAR','region':'VARCHAR'," +
+        "'amount':'VARCHAR','note':'VARCHAR'}, header=true)"
+    let typedCols = [
+        Column(name: "order_id", type: "BIGINT"),
+        Column(name: "region", type: "VARCHAR"),
+        Column(name: "amount", type: "DOUBLE"),
+        Column(name: "note", type: "VARCHAR"),
+    ]
+    let (sql, params) = try badRowsSQL(relVarchar, typedCols, limit: 200)
+    let bound: [DBValue] = params.map {
+        switch $0 {
+        case .null:          return .null
+        case .bool(let v):   return .bool(v)
+        case .int(let v):    return .int(v)
+        case .double(let v): return .double(v)
+        case .text(let v):   return .text(v)
+        }
+    }
+
+    let rows = try con.query(sql, bound).allRows()
+    #expect(rows.count == 1, "only row 5's amount cell fails to cast — one bad row expected")
+    #expect(rows[0][0] == .list([.text("amount")]),
+            "bad_columns must decode as the LIST of failing column names, not a marker string")
 }
