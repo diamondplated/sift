@@ -22,6 +22,7 @@
 - The dylib's install name is `@rpath/libduckdb.dylib`, so an rpath is mandatory for both `swift test` and the bundled app.
 - Work happens in the `sift-native` worktree on branch `native`. Never `git reset` this branch — a concurrent session shares the underlying repo.
 - Commit as `diamondplated <580248+diamondplated@users.noreply.github.com>`. The repo is configured for this already; do not override it.
+- **Any script committed here needs `git add --chmod=+x`.** This repo has `core.fileMode=false` (its `.git` lives on an SMB share), so a plain `chmod +x` + `git add` records mode `100644` and a fresh clone gets a non-executable file — CI then dies on `./scripts/...` with "Permission denied". Verify with `git ls-files -s <path>` showing `100755`. Never "fix" this by changing `core.fileMode`.
 - Existing files at the repo root (`engine/`, `web/`, `shell/`, `build-app.sh`, `dev.sh`) stay untouched in this plan. They are deleted in Plan 5.
 
 ## File Structure
@@ -62,7 +63,7 @@
 
 **Interfaces:**
 - Consumes: nothing.
-- Produces: a buildable package with a `DuckDBKit` library target linking `libduckdb`; `DuckDBError(message: String)`.
+- Produces: a buildable package whose test binary genuinely links `libduckdb` (proven by a version-pin test, not by a green build); `DuckDBError(message: String)`.
 
 - [ ] **Step 1: Write the fetch script**
 
@@ -162,8 +163,10 @@ let package = Package(
         ),
         .testTarget(
             name: "DuckDBKitTests",
-            dependencies: ["DuckDBKit"],
-            linkerSettings: duckdbLink
+            dependencies: ["DuckDBKit"]
+            // Deliberately no linkerSettings: target linker settings propagate
+            // transitively from DuckDBKit, and a second copy makes every `swift test`
+            // emit `ld: warning: duplicate -rpath ... ignored`.
         ),
     ]
 )
@@ -213,8 +216,19 @@ public struct DuckDBError: Error, CustomStringConvertible, Equatable {
 Create `Tests/DuckDBKitTests/SmokeTests.swift`:
 
 ```swift
+import CDuckDB
 import Testing
 @testable import DuckDBKit
+
+/// This test is why the module map's `link "duckdb"` directive actually fires.
+/// Autolink only activates when some compilation unit imports the module — without
+/// an `import CDuckDB` anywhere, `-lduckdb` reaches no link line and the whole suite
+/// passes just as happily with the dylib deleted. It earns its place twice: it forces
+/// the link, and it pins that the library loaded is the 1.5.5 we checksummed rather
+/// than some other copy the linker found first.
+@Test func linkedLibraryIsThePinnedDuckDBVersion() {
+    #expect(String(cString: duckdb_library_version()) == "v1.5.5")
+}
 
 @Test func errorKeepsOnlyTheFirstLine() {
     let e = DuckDBError("Binder Error: no such column\nLINE 1: SELECT nope\n        ^")
@@ -234,7 +248,14 @@ import Testing
 - [ ] **Step 7: Build and test**
 
 Run: `swift build && swift test --filter DuckDBKitTests`
-Expected: build succeeds (proving `CDuckDB` resolves `duckdb.h` and the linker finds `libduckdb`), 3 tests pass.
+Expected: 4 tests pass, with no linker warnings in the output.
+
+`swift build` alone proves nothing about linking — `DuckDBKit` compiles to a module
+without invoking a linker. The link is proven by `linkedLibraryIsThePinnedDuckDBVersion`
+in the test binary. Confirm it is a real proof rather than a tautology: move
+`Vendor/duckdb/libduckdb.dylib` aside, re-run `swift test`, and check it fails with
+`library 'duckdb' not found` / `Undefined symbols: _duckdb_library_version`. Put the
+dylib back — the remaining five tasks need it.
 
 If the build fails with `library 'duckdb' not found`, `scripts/fetch-duckdb.sh` has not been run.
 
