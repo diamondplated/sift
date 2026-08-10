@@ -8,9 +8,9 @@ import SiftCore
 // work, and paging. Ported from engine/session.py's `Session.__init__`, `open_path`,
 // `_after_open`, `_detect_bad_rows`, `page`, `_sorted_relation`, `table`, `_tlock`, `relation`,
 // `raw_relation`, `engine_info`, `state`, `close_table`, `shutdown`, `drop_private_store`, and
-// `_sweep_private_stores`. Everything else in session.py (run_sql, profiling, staging, joins,
-// merge, export) is a later task — see the design spec's port map, which splits session.py across
-// Session.swift, Staging.swift, Joins.swift and Export.swift.
+// `_sweep_private_stores`. The rest of session.py lives beside it, per the design spec's port
+// map: run_sql and profiling in SessionQueries.swift, the staging lifecycle in Staging.swift,
+// joins and merge in Joins.swift, and export in Export.swift.
 //
 // Concurrency, in three facts (replacing Python's own docstring, which described a single
 // DuckDBPyConnection guarded by cursors and a thread pool):
@@ -96,9 +96,11 @@ public actor Session {
     /// dictionary's get-or-create needs actor isolation; the returned `NSLock` itself is meant to
     /// be locked/unlocked from the caller's own (non-actor) context.
     private var tableLocks: [String: NSLock] = [:]
-    /// Source of `Table.openedAt` — see its doc comment. Incremented once per `openPath` call,
-    /// never reused; only `openPath` touches it.
-    private var nextOpenGeneration = 0
+    /// Source of `Table.openedAt` — see its doc comment. Incremented once per table this session
+    /// puts into the catalog, never reused. Two writers: `openPath` and Joins.swift's `merge`,
+    /// which produces a `Table` that is not backed by a file but still needs an identity no later
+    /// open can collide with.
+    var nextOpenGeneration = 0
 
     // Staging job state (Staging.swift owns every method that touches these; they live here
     // because Swift extensions cannot add stored properties).
@@ -235,7 +237,9 @@ public actor Session {
         SessionState(tables: Array(tables.values), engine: engineInfo())
     }
 
-    private nonisolated func fileSize(_ path: String) -> Int {
+    /// Not `private`: Export.swift reports the bytes it just wrote with this, rather than a
+    /// second copy of the same `attributesOfItem` dance.
+    nonisolated func fileSize(_ path: String) -> Int {
         guard let attrs = try? FileManager.default.attributesOfItem(atPath: path),
             let size = attrs[.size] as? Int
         else { return 0 }
@@ -330,6 +334,19 @@ public actor Session {
         guard var t = tables[name] else { return }
         t.staged = false
         t.staging = StagingProgress(jobID: "stage-test", state: "running", pct: 0, estSeconds: 0)
+        tables[name] = t
+    }
+
+    /// Test support: put a table into SQL mode with arbitrary stored text, bypassing `runSQL`'s
+    /// SELECT-only gate. The seam that makes Export.swift's re-check testable at all: `runSQL` is
+    /// currently the only writer of `sqlText` and it guards on the way in, so no production path
+    /// can currently store a non-SELECT — which is precisely why `export` re-checks rather than
+    /// trusting the flag, and why proving it re-checks needs a way in that `runSQL` will not give.
+    /// Same internal-seam trick as `setFilteredCountForTest`/`setProfileForTest` above.
+    func setSQLTextForTest(_ name: String, _ text: String?) {
+        guard var t = tables[name] else { return }
+        t.sqlMode = text != nil
+        t.sqlText = text
         tables[name] = t
     }
 
