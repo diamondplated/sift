@@ -430,8 +430,11 @@ private func isNativeTable(_ session: Session, _ probe: String, _ name: String) 
         _ = try con.query(
             "INSERT INTO _sift_sources VALUES (?, ?, 0, 0, ?, 'csv', now(), "
                 + "now() - INTERVAL (?) DAY, 0, ?)",
-            [.text("token-\(name)"), .text("/nonexistent/\(name).csv"), .text(name),
-             .int(Int64(ageDays)), .int(Int64(bytes))]
+            // Current-format token: without the version prefix the format sweep collects these
+            // rows before the age/budget policy is ever consulted, which silently stops this test
+            // from testing anything (review round 3).
+            [.text("\(stagingTokenVersion)|token-\(name)"), .text("/nonexistent/\(name).csv"),
+             .text(name), .int(Int64(ageDays)), .int(Int64(bytes))]
         )
     }
     // `defaultMaxAgeDays` is 14 and `defaultBudgetBytes` is 20 GB.
@@ -816,7 +819,7 @@ func aCopyOfOneSheetIsNeverServedAsAnother() async throws {
         _ = try con.query(
             "INSERT INTO _sift_sources VALUES (?, '/nonexistent/x.csv', 0, 0, ?, 'csv', now(), "
                 + "now() - INTERVAL 30 DAY, 0, 1)",
-            [.text("token-\(name)"), .text(name)]
+            [.text("\(stagingTokenVersion)|token-\(name)"), .text(name)]
         )
     }
 
@@ -1224,4 +1227,53 @@ func aCopyOfOneMonthsSheetIsNeverServedAsAnother() async throws {
     #expect(dropped == ["old_format"])
     #expect(try con.query("SELECT count(*) FROM _sift_sources").allRows()[0][0] == .int(1),
             "the current-format row is left alone")
+}
+
+// MARK: - N4 (folder half): a member rewritten with its timestamp restored
+
+@Test func aCopyIsNotAdoptedWhenAFolderMemberWasRewrittenWithItsTimestampRestored() async throws {
+    // The file half of this is `aCopyIsNotAdopted…TimestampRestored`; this is the per-member half,
+    // which was unpinned — removing ctime from the digest left all 320 green. Written by the
+    // round-2 reviewer, delivered as-is apart from naming and these comments.
+    //
+    // The premises are what make it load-bearing: the member's mtime and size are restored to the
+    // nanosecond, AND the directory's own stat — ctime included — never moves, because rewriting a
+    // member in place is not a directory-entry change. So nothing about this folder looks different
+    // except the member's ctime, which the kernel maintains and userspace cannot set.
+    let dir = try newTempDir()
+    let header = "order_id,region,amount,note\n"
+    let a = (dir as NSString).appendingPathComponent("a.csv")
+    try (header + "1,West,100.50,a\n").write(toFile: a, atomically: true, encoding: .utf8)
+    try (header + "2,South,200.50,b\n").write(
+        toFile: (dir as NSString).appendingPathComponent("b.csv"), atomically: true, encoding: .utf8)
+
+    let session = try newSession()
+    let t = try await session.openPath(dir)
+    _ = try await session.stageNow(t.name, force: true)
+    try await waitForStaged(session, t.name)
+    try await session.closeTable(t.name)
+
+    let originalDir = try statInfo(dir)
+    let originalMember = try statInfo(a)
+    try (header + "1,West,999.50,z\n").write(toFile: a, atomically: false, encoding: .utf8)
+    var times = [
+        timespec(tv_sec: originalMember.mtimeNs / 1_000_000_000,
+                 tv_nsec: originalMember.mtimeNs % 1_000_000_000),
+        timespec(tv_sec: originalMember.mtimeNs / 1_000_000_000,
+                 tv_nsec: originalMember.mtimeNs % 1_000_000_000),
+    ]
+    #expect(utimensat(AT_FDCWD, a, &times, 0) == 0)
+    let forgedMember = try statInfo(a)
+    let afterDir = try statInfo(dir)
+    #expect(forgedMember.mtimeNs == originalMember.mtimeNs && forgedMember.size == originalMember.size,
+            "premise: the member's mtime and size are indistinguishable from the staged folder's")
+    #expect(afterDir.mtimeNs == originalDir.mtimeNs && afterDir.ctimeNs == originalDir.ctimeNs,
+            "premise: the directory's own stat, ctime included, did not move")
+
+    let again = try await session.openPath(dir)
+    #expect(again.staged == false, "a member's ctime moved, so this is not the folder that was copied")
+    let page = try await session.page(again.name, offset: 0, limit: 10)
+    let amounts = page.rows.map { $0[2].display }.sorted()
+    #expect(amounts.contains("999.5") || amounts.contains("999.50"),
+            "the disk's contents, not the copy's; got \(amounts)")
 }
