@@ -34,9 +34,20 @@ import SiftCore
 //     removed so the destination is left exactly as it was found.
 //
 // CONNECTION STRATEGY: its own throwaway `Connection`, like everything in SessionQueries.swift
-// and Joins.swift. Never `pagingConnection` — a COPY of a large table is seconds of work, and
-// that connection's safety proof (Session.swift's header, fact 3) depends on its users not
-// blocking the actor.
+// and Joins.swift — but NOT for the reason an earlier version of this comment gave, which said
+// `pagingConnection` was avoided because a large COPY is "seconds of work". That is not what
+// makes `pagingConnection` safe to share. Its proof (Session.swift's header, fact 3) is that
+// every user runs to completion WITHOUT AWAITING, not that they finish quickly — and `export`
+// has no suspension point either, so by that argument it would have been safe on it. The real
+// reason is narrower and duller: `pagingConnection` exists to keep `sortedRelation`'s TEMP TABLE
+// visible across `page()` calls, nothing here creates or reads one, so there is nothing to share.
+//
+// And to be explicit about what a separate `Connection` does NOT buy: `export` is an
+// actor-isolated method making a synchronous C call, so a large COPY freezes paging for its full
+// duration either way. That is a branch-wide tradeoff, not something special about export — the
+// design spec's §13a page-latency cliff, which `page` and `runSQL` also accept by design.
+// `computeProfile` is the one case measured unacceptable (~1.29 s on a 200-column table) and is
+// being detached onto its own connection separately.
 
 // MARK: - the format table
 
@@ -138,6 +149,12 @@ extension Session {
         }
 
         // Rule 3. Claiming the name IS the existence check — no check-then-write window.
+        //
+        // The cost, stated rather than hidden: this opens a *different*, smaller window Python
+        // does not have. A crash or SIGKILL between the claim and the COPY leaves a zero-byte
+        // file that blocks its own retry with "already exists" until the user deletes it. Judged
+        // the better trade by a wide margin — a lost check-then-write race silently destroys
+        // someone's file, while a stale placeholder is one visible, empty, deletable file.
         var claimed = false
         if !overwrite {
             do {

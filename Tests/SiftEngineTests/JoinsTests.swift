@@ -29,6 +29,12 @@ private func newSession() throws -> Session {
 //    right side has a duplicate too (1 appears twice). That makes distinct-key counting and
 //    pairing counting produce different numbers, which is the whole reason `join_probe` is a
 //    semi join.
+//  - `zz` is deliberately NOT functionally dependent on `k`: the left has TWO different `zz`
+//    values under k=1 (alpha, epsilon) and the right's k=2 row carries `gamma` where the left's
+//    carries `beta`. That is load-bearing — the first version of this fixture had zz determined
+//    by k on both sides, which made `["k"]` and `["k","zz"]` produce identical numbers and let
+//    "use only the first key column" pass every test in this file. Composite keys now produce
+//    different numbers from single keys in all three of leftDistinct, matched and unmatched.
 //  - The two files share five columns (zz, k, v, big, aaa) in DIFFERENT orders, so a candidate
 //    list that came out of an unordered dictionary cannot accidentally look right.
 //  - `v` is integers on the left and letters on the right (incompatible kinds); `big` is whole
@@ -53,6 +59,7 @@ private func makeJoinCorpus() throws -> JoinCorpus {
     beta,2,21,e3,300,C
     gamma,3,30,e4,400,D
     delta,,40,e5,500,E
+    epsilon,1,50,e6,600,F
 
     """.write(toFile: lhs, atomically: true, encoding: .utf8)
 
@@ -61,7 +68,7 @@ private func makeJoinCorpus() throws -> JoinCorpus {
     k,v,zz,rextra,aaa,big
     1,x,alpha,r1,P,1.5
     1,x,alpha,r2,Q,2.5
-    2,y,beta,r3,R,3.5
+    2,y,gamma,r3,R,3.5
     9,z,omega,r4,S,4.5
 
     """.write(toFile: rhs, atomically: true, encoding: .utf8)
@@ -85,20 +92,18 @@ private func sessionWithBothSides() async throws -> Session {
     let session = try await sessionWithBothSides()
     let probe = try await session.joinProbe("lhs", "rhs", on: ["k"])
 
-    // Five physical rows on the left, four distinct key values (1, 2, 3, NULL) — the duplicate
-    // 2 collapses. Counting rows here would say 5.
+    // Six physical rows on the left, four distinct key values (1, 2, 3, NULL) — the duplicate 2
+    // collapses and so does the second 1. Counting rows here would say 6.
     #expect(probe.leftDistinct == 4)
     // Two of them find a partner (1 and 2). Counting PAIRINGS of the raw key columns instead
-    // says 4 — key 1 pairs with two right rows, and key 2's two left rows pair with one right
-    // row — which answers "how many pairings exist", not "how many of my keys line up". Keeping
-    // that number off the screen is what this test is for.
+    // says 6 — key 1's two left rows pair with two right rows, and key 2's two left rows pair
+    // with one — which answers "how many pairings exist", not "how many of my keys line up".
+    // Keeping that number off the screen is what this test is for.
     //
-    // Said honestly, because it is the kind of thing a green test hides: TWO independent things
-    // in `joinProbe` each prevent that 4, and MEASURED, removing either one alone leaves this
-    // assertion green — the subqueries are DISTINCT (so there is nothing left to multiply) and
-    // the join is a SEMI join (so the right side cannot multiply anyway). Only removing BOTH
-    // turns this red. The belt-and-braces is deliberate; the mutation log in task-7-report.md
-    // records which single mutations survive here and why.
+    // `DISTINCT` on both subqueries and a `SEMI` join are two ways of spelling the same
+    // guarantee, so mutating away either one alone is an EQUIVALENT mutant — there is nothing
+    // semantically different for a test to catch, and no test can kill it. Removing both (the
+    // pairing count above) is red. See task-7-report.md's mutation log.
     #expect(probe.matched == 2)
     #expect(probe.unmatched == 2)
     #expect(probe.pct == 0.5)
@@ -117,13 +122,40 @@ private func sessionWithBothSides() async throws -> Session {
     #expect(unmatched.rows.contains { $0[0] == .null })
 }
 
-@Test func joinProbeHandlesACompositeKey() async throws {
+/// Every key column counts, not just the first.
+///
+/// This test was the eighth vacuous test found on this branch: with the old fixture, `zz` was
+/// functionally dependent on `k` on both sides, so `["k"]` and `["k","zz"]` measured the same
+/// numbers and "use only `on[0]`" passed the whole file. The fixture now breaks that dependency
+/// (left has two `zz` under k=1; right's k=2 carries `gamma` where left's carries `beta`), so
+/// single and composite disagree on all three numbers. That direction of error matters: dropping
+/// key columns reports a HIGHER match rate than reality — the exact lie `joinProbe` exists to
+/// prevent, on the composite keys (`customer_id + order_date`) where nobody can eyeball it.
+@Test func joinProbeCountsEveryKeyColumnNotJustTheFirst() async throws {
     let session = try await sessionWithBothSides()
-    let probe = try await session.joinProbe("lhs", "rhs", on: ["k", "zz"])
-    // (1,alpha), (2,beta) [twice, collapsed], (3,gamma), (NULL,delta) — four distinct tuples,
-    // two of which the right side also has.
-    #expect(probe.leftDistinct == 4)
-    #expect(probe.matched == 2)
+    let single = try await session.joinProbe("lhs", "rhs", on: ["k"])
+    let composite = try await session.joinProbe("lhs", "rhs", on: ["k", "zz"])
+
+    // (1,alpha), (2,beta), (3,gamma), (NULL,delta), (1,epsilon) — five distinct tuples, of which
+    // only (1,alpha) exists on the right.
+    #expect(composite.leftDistinct == 5)
+    #expect(composite.matched == 1)
+    #expect(composite.unmatched == 4)
+    #expect(composite.pct == 0.2)
+    #expect(composite.on == ["k", "zz"])
+
+    // The whole point: an implementation that silently used only `k` would report these.
+    #expect(single.leftDistinct == 4 && single.matched == 2 && single.pct == 0.5)
+}
+
+@Test func unmatchedKeysCountsEveryKeyColumnNotJustTheFirst() async throws {
+    let session = try await sessionWithBothSides()
+    let composite = try await session.unmatchedKeys("lhs", "rhs", on: ["k", "zz"])
+    #expect(composite.columns.map(\.name) == ["k", "zz"])
+    // (2,beta), (3,gamma), (NULL,delta), (1,epsilon) — four, against two for `["k"]` alone.
+    #expect(composite.rows.count == 4)
+    #expect(Set(composite.rows.map { "\($0[0].display)|\($0[1].display)" })
+        == ["2|beta", "3|gamma", "|delta", "1|epsilon"])
 }
 
 @Test func joinProbeRejectsAKeyMissingFromEitherSide() async throws {
@@ -276,17 +308,39 @@ private func sessionWithBothSides() async throws -> Session {
     #expect(page.columns.map(\.name) == merged.spec.columns.map(\.name))
 }
 
-@Test func mergeRowCountsFollowTheJoinType() async throws {
-    // inner: key 1 pairs 1x2, key 2 pairs 2x1 -> 4.
-    // left:  + the two left rows whose key (3, NULL) has no partner -> 6.
-    // right: + the one right row whose key (9) has no partner -> 5.
-    // full:  both -> 7.
-    for (how, expected) in [(JoinType.inner, 4), (.left, 6), (.right, 5), (.full, 7)] {
+@Test func mergeDropsEveryKeyColumnFromTheRightSideNotJustTheFirst() async throws {
+    let session = try await sessionWithBothSides()
+    let merged = try await session.merge("lhs", "rhs", on: ["k", "zz"])
+
+    // `zz_1` is GONE relative to the single-key merge above — that is the visible signature of
+    // the second key column reaching the `USING` clause. An implementation that used only `k`
+    // would produce the single-key list, `zz_1` and all.
+    #expect(merged.spec.columns.map(\.name) == [
+        "zz", "k", "v", "extra", "big", "aaa", "v_1", "rextra", "aaa_1", "big_1",
+    ])
+    #expect(!merged.spec.columns.contains { $0.name == "zz_1" })
+    // Only (1, alpha) matches on both columns, against two right rows.
+    #expect(merged.rowCount == 2)
+    #expect(merged.notes.contains { $0.contains("on k, zz") })
+}
+
+@Test func mergeRowCountsAndItsNoteFollowTheJoinType() async throws {
+    // inner: key 1 pairs 2x2, key 2 pairs 2x1 -> 6.
+    // left:  + the two left rows whose key (3, NULL) has no partner -> 8.
+    // right: + the one right row whose key (9) has no partner -> 7.
+    // full:  both -> 9.
+    for (how, expected) in [(JoinType.inner, 6), (.left, 8), (.right, 7), (.full, 9)] {
         let session = try await sessionWithBothSides()
         let merged = try await session.merge("lhs", "rhs", on: ["k"], how: how)
         #expect(merged.rowCount == expected, "\(how.rawValue) join")
         let page = try await session.page(merged.name, offset: 0, limit: 100)
         #expect(page.rows.count == expected, "\(how.rawValue) join, paged")
+        // The note is the ONLY thing in the sidebar saying what was built, so a LEFT join
+        // labelled "inner join" is a wrong answer sitting on screen indefinitely.
+        #expect(
+            merged.notes.contains { $0.hasPrefix("\(how.rawValue) join of lhs + rhs on k ") },
+            "\(how.rawValue) join, note: \(merged.notes)"
+        )
     }
 }
 
@@ -349,4 +403,43 @@ private func sessionWithBothSides() async throws -> Session {
     // The name is free again, and re-merging reuses it rather than climbing to _2 — which only
     // works if `closeTable` actually dropped the view underneath.
     #expect(try await session.merge("lhs", "rhs", on: ["k"]).name == "lhs_rhs")
+}
+
+/// Not in Python, and it closes a hole Python has: a merge view reads its sources by NAME, and
+/// `closeTable` drops a non-staged table's view — so closing either source used to leave the
+/// merge in the catalog, in `state()`, looking healthy, and throwing
+/// `Catalog Error: Table with name lhs does not exist!` on every page and every export.
+@Test func closingASourceUnderALiveMergeIsRefusedUntilTheMergeIsClosed() async throws {
+    let session = try await sessionWithBothSides()
+    let merged = try await session.merge("lhs", "rhs", on: ["k"])
+
+    // Both sides, not just the left one.
+    await #expect(throws: SessionError("'lhs' is merged into 'lhs_rhs'. Close 'lhs_rhs' first.")) {
+        try await session.closeTable("lhs")
+    }
+    await #expect(throws: SessionError("'rhs' is merged into 'lhs_rhs'. Close 'lhs_rhs' first.")) {
+        try await session.closeTable("rhs")
+    }
+
+    // A refused close changes nothing: both sources are still open, and the merge still reads.
+    #expect(try await session.table("lhs").name == "lhs")
+    #expect(try await session.page(merged.name, offset: 0, limit: 100).rows.count == 6)
+
+    // ...and once the merge is gone, the source closes normally.
+    try await session.closeTable(merged.name)
+    try await session.closeTable("lhs")
+    await #expect(throws: SessionError("No open table named 'lhs'.")) {
+        try await session.table("lhs")
+    }
+}
+
+@Test func theRefusalNamesEveryMergeBuiltOnTheTable() async throws {
+    let session = try await sessionWithBothSides()
+    _ = try await session.merge("lhs", "rhs", on: ["k"])
+    _ = try await session.merge("lhs", "rhs", on: ["k"])   // lhs_rhs_2
+    await #expect(throws: SessionError(
+        "'lhs' is merged into 'lhs_rhs' and 'lhs_rhs_2'. Close 'lhs_rhs' and 'lhs_rhs_2' first."
+    )) {
+        try await session.closeTable("lhs")
+    }
 }

@@ -230,6 +230,9 @@ extension Session {
             name: base, spec: spec, qspec: QuerySpec(relation: base), openedAt: nextOpenGeneration
         )
         t.rowCount = rowCount
+        // What this view reads. `closeTable` refuses to close either of them while this table is
+        // open — see `assertNoLiveMerge`.
+        t.mergedFrom = [lt.name, rt.name]
         t.notes.append(
             "\(how.rawValue) join of \(left) + \(right) on \(on.joined(separator: ", ")) "
                 + "\u{2014} a view; Export it to save a copy"
@@ -242,6 +245,30 @@ extension Session {
         // `Table` is a struct, so the profile `computeProfile` just stored lives in the catalog's
         // copy, not in `t` — return the catalog's (the same object Python's caller gets back).
         return tables[base] ?? t
+    }
+
+    /// Refuse to close a table a live merge view is built over. Called by `closeTable`.
+    ///
+    /// **Not in Python, and it closes a hole Python has.** `merge` builds its view over
+    /// `q(left)`/`q(right)` by NAME, and `closeTable` drops a non-staged table's view — so
+    /// closing a merged table's source leaves the merge sitting in the catalog and in `state()`,
+    /// looking perfectly healthy, and throwing `Catalog Error: Table with name a does not exist!`
+    /// on every page and every export. MEASURED against this port before the guard; Python does
+    /// exactly the same thing.
+    ///
+    /// A refusal, deliberately, not a cascade: closing tabs the user did not ask to close is its
+    /// own surprise, and the merge may be the thing they actually care about. The message names
+    /// the dependents so the fix is one click away.
+    func assertNoLiveMerge(on name: String) throws {
+        let dependents = tables.values.filter { $0.mergedFrom.contains(name) }.map(\.name).sorted()
+        guard !dependents.isEmpty else { return }
+        let quoted = dependents.map { "'\($0)'" }
+        // Hand-joined rather than `ListFormatter`, which is locale-sensitive — the same rule the
+        // rest of this branch follows for NumberFormatter/DateFormatter.
+        let list = quoted.count == 1
+            ? quoted[0]
+            : quoted.dropLast().joined(separator: ", ") + " and " + quoted[quoted.count - 1]
+        throw SessionError("'\(name)' is merged into \(list). Close \(list) first.")
     }
 }
 

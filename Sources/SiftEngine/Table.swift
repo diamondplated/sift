@@ -72,6 +72,15 @@ public struct Table: Sendable {
     public var firstAggregateAt: Date?
     public var notes: [String] = []
 
+    /// The open tables a `merge` view reads, or empty for anything backed by a file. Recorded
+    /// rather than parsed back out of `spec.key.path` ("merge://a+b") because a table named
+    /// `a+b` would make that string ambiguous, and because it dies with the table for free.
+    ///
+    /// `closeTable` refuses to close a table this names — see Joins.swift's `assertNoLiveMerge`.
+    /// Without it, closing a merged table's source left the merge in the catalog looking fine
+    /// and throwing a raw `Catalog Error` on every read.
+    public var mergedFrom: [String] = []
+
     /// Name of the temp table currently holding a sorted result set, or `nil` when the current
     /// page request carries no sort. Set only by `Session.sortedRelation`.
     var sortKey: String?

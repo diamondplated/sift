@@ -663,6 +663,11 @@ public actor Session {
 
     public func closeTable(_ name: String) async throws {
         let t = try table(name)
+        // Before the `defer` below registers, so a refused close removes nothing: a merge view is
+        // built over this table's NAME, and dropping the view underneath one leaves it in the
+        // catalog looking healthy and throwing a raw catalog dump on every read. See
+        // Joins.swift's `assertNoLiveMerge` for why this refuses rather than cascading.
+        try assertNoLiveMerge(on: name)
         defer { tables.removeValue(forKey: name) }
 
         let con = pagingConnection
