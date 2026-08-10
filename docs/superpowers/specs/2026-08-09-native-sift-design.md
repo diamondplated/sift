@@ -514,6 +514,27 @@ once. Covered by `DecodeTests.swift`'s `jsonColumnReportsTypeNameJSON` (paired w
 `plainVarcharColumnStillReportsTypeNameVARCHAR` so the alias read can't just always
 return `"JSON"`).
 
+**Two `Session`s on one home silently corrupt each other — Plan 4 (the UI is what would
+construct the second).** Measured 2026-08-09 during Plan 3 Task 6's review, independently by
+two reviewers. Two `DuckDBKit.Database` handles opened on the same file *in one process* are
+two independent DuckDB instances that cannot see each other's catalog: A inserts and
+checkpoints, A sees 2, **B still sees 1**; B then inserts and has written its version over A's
+file. Not a shared store with a coordination problem — two uncoordinated writers on one file,
+last flush wins. Observed directly: `sharedStore a=true b=true; b sees a's table=0; a sees b's
+table=0`.
+
+The `sharedStore` fallback does **not** protect against this. It fires only on a DuckDB *lock*
+error, and there is no lock error in-process — which is precisely why both sessions above
+report `sharedStore=true`. The guard written for the cross-process case is silently inert for
+the in-process one, and the per-PID `stage-<pid>.duckdb` fallback is consequently only ever
+reachable across processes.
+
+Nothing constructs two `Session`s today — the app builds exactly one. It becomes live the
+moment a second exists on the same home: a multi-window or "new session" path, a preferences
+change that rebuilds the engine, or a test suite that opens two on one home. **Plan 4 must not
+add a second window without closing this first.** The fix is small — a process-wide set of open
+home paths in `Session.init` that either throws or hands back the existing `Database`.
+
 **`loadedExtensions[name] == false` conflates two failures — Plan 3.** A legal name with
 no such extension installed, and a name rejected by the injection guard, both record
 `false`. Spec §11 turns this dictionary into "a missing `delta` extension refuses the
