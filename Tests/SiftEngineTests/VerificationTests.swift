@@ -225,17 +225,17 @@ private func newHome() -> String {
     #expect(lines[1].hasSuffix("West"))
 }
 
-@Test func renderGridDistinguishesNullFromAnEmptyStringExactlyAsTheGridDoes() {
+@Test func renderGridKeepsNullAndTheEmptyStringApartTheWayTheWebGridDoes() {
     let lines = renderGrid(
         columns: [column("id", "BIGINT"), column("note", "VARCHAR")],
         rows: [[.int(1), .null], [.int(2), .text("")]],
         width: 100
     )
-    // Both render blank — `Cell.display` is lossy on purpose and this renderer is a display, not
-    // a decision. Pinned so a future "improvement" that prints NULL here is a deliberate change.
-    // ("  " margin, then "1" right-aligned under the two-character header "id", then nothing.)
-    #expect(lines[1] == "   1")
-    #expect(lines[2] == "   2")
+    // `Cell.display` renders both as "" — which is why this renderer goes through
+    // `glyph(for:kind:)` instead. ("  " margin, then the id right-aligned under the
+    // two-character header "id".)
+    #expect(lines[1] == "   1  null")
+    #expect(lines[2] == "   2  ''")
 }
 
 @Test func renderGridClipsLongCellsAndDropsColumnsThatDoNotFitTheWidth() {
@@ -277,16 +277,18 @@ private func newHome() -> String {
         path: "/tmp/a.csv", table: "a", format: "csv", rows: 1200, rowsExact: true,
         rowsBasis: nil, notes: [], columns: columns, preview: [[.int(1)]], milliseconds: 1
     ))
-    #expect(exact.contains("a \u{2014} csv \u{2014} 1200 rows"))
+    // Thousands-grouped through the same public rule the cells go through — the third consumer
+    // of a rule that used to exist privately twice.
+    #expect(exact.contains("a \u{2014} csv \u{2014} 1,200 rows"))
     #expect(!exact.contains("estimate:"))
-    #expect(exact.contains("showing 1 of 1200 rows"))
+    #expect(exact.contains("showing 1 of 1,200 rows"))
 
     let estimated = renderOverview(FileOverview(
         path: "/tmp/a.csv", table: "a", format: "csv", rows: 1200, rowsExact: false,
         rowsBasis: "3x256KiB sample, no quote characters seen", notes: ["a note"],
         columns: columns, preview: [[.int(1)]], milliseconds: 1
     ))
-    #expect(estimated.contains("~1200 rows"))
+    #expect(estimated.contains("~1,200 rows"))
     #expect(estimated.contains("estimate: 3x256KiB sample, no quote characters seen"))
     #expect(estimated.contains("note: a note"))
 
@@ -439,6 +441,31 @@ private func newHome() -> String {
     let rendered = renderOverview(overview)
     #expect(rendered.contains("sales \u{2014} csv \u{2014} 40 rows"))
     #expect(rendered.contains("showing 4 of 40 rows"))
+}
+
+@Test func openAndDescribeCountsAShortFileExactlyEvenBeforeTheBackgroundScanLands() async throws {
+    let home = newHome()
+    let scratch = newHome()
+    let folder = (scratch as NSString).appendingPathComponent("daily")
+    try FileManager.default.createDirectory(atPath: folder, withIntermediateDirectories: true)
+    defer {
+        try? FileManager.default.removeItem(atPath: home)
+        try? FileManager.default.removeItem(atPath: scratch)
+    }
+    try writeSmallCSV((folder as NSString).appendingPathComponent("a.csv"), rows: 6, from: 0)
+    try writeSmallCSV((folder as NSString).appendingPathComponent("b.csv"), rows: 4, from: 6)
+
+    // A folder source has NO row count when `openPath` returns — `buildSource` has nothing free to
+    // read (unlike a parquet footer) and the exact count runs in the detached background pipeline.
+    // Deterministic, not a race: `openAndDescribe` reads the snapshot `openPath` returned.
+    let overview = try await openAndDescribe(path: folder, rows: 50, home: home)
+    #expect(overview.format == "glob_csv")
+    #expect(overview.preview.count == 10)
+    // The page came back short of the 50 asked for, so the file ended — 10 rows, exactly, and
+    // not "counting rows…" printed over a preview that already shows all of them.
+    #expect(overview.rows == 10)
+    #expect(overview.rowsExact)
+    #expect(renderOverview(overview).contains("\u{2014} 10 rows"))
 }
 
 // MARK: - 2f. waiting

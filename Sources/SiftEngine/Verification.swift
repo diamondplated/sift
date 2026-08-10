@@ -868,13 +868,25 @@ public func openAndDescribe(
     let page = try await session.page(t.name, offset: 0, limit: max(0, rows))
     await session.shutdown()
 
+    // A short page at offset 0 IS the end of the table, so the count is exact even though the
+    // background scan has not landed yet. That matters here: `openPath` returns no count at all
+    // for a folder or a Delta table, and printing "counting rows…" above a preview that already
+    // shows the whole file is the kind of thing that reads as broken. This never waits — a file
+    // that filled the page keeps whatever `openPath` knew.
+    var rowCount = t.rowCount
+    var exact = t.rowCount != nil
+    if rowCount == nil, rows > 0, page.rows.count < rows {
+        rowCount = page.rows.count
+        exact = true
+    }
+
     return FileOverview(
         path: t.spec.key.path,
         table: t.name,
         format: t.spec.fmt.rawValue,
-        rows: t.rowCount ?? t.spec.rowEstimate?.rows,
-        rowsExact: t.rowCount != nil,
-        rowsBasis: t.rowCount == nil ? t.spec.rowEstimate?.basis : nil,
+        rows: rowCount ?? t.spec.rowEstimate?.rows,
+        rowsExact: exact,
+        rowsBasis: exact ? nil : t.spec.rowEstimate?.basis,
         notes: t.notes,
         columns: page.columns,
         preview: page.rows,
@@ -884,16 +896,19 @@ public func openAndDescribe(
 
 /// The whole `sift <path>` output: a headline, the schema, and the first rows as a grid.
 ///
-/// Row counts print ungrouped ("120000", not "120,000"). Both grouping helpers that exist here
-/// (`DuckDBKit.Cell.grouped`, `SiftCore.grouped`) are module-internal and unreachable from this
-/// module, and this branch has twice ruled against a third copy of that loop — a bare integer is
-/// locale-independent and honest, which is the property that actually matters.
+/// Row counts are thousands-grouped through `CellDisplay.groupDigits` — the same public rule the
+/// grid's cells go through, and the same one SiftUI will use. (An earlier version of this comment
+/// explained why they printed ungrouped: the two grouping helpers that already existed,
+/// `DuckDBKit.Cell.grouped` and `SiftCore.grouped(_:decimals:)`, are module-internal and cannot be
+/// reached from here. That was true and it was the wrong conclusion — a rule that exists privately
+/// twice is a rule the third consumer goes without, which is exactly what happened. It is public
+/// once now, in the layer both consumers import.)
 public func renderOverview(_ overview: FileOverview, width: Int = 100) -> String {
     var lines: [String] = []
 
     let count: String
     if let rows = overview.rows {
-        count = overview.rowsExact ? "\(rows) rows" : "~\(rows) rows"
+        count = (overview.rowsExact ? "" : "~") + groupDigits(String(rows)) + " rows"
     } else {
         count = "counting rows\u{2026}"
     }
@@ -912,7 +927,10 @@ public func renderOverview(_ overview: FileOverview, width: Int = 100) -> String
         lines.append(contentsOf: renderGrid(columns: overview.columns, rows: overview.preview, width: width))
         if let total = overview.rows, total > overview.preview.count {
             lines.append("")
-            lines.append("  showing \(overview.preview.count) of \(total) rows")
+            lines.append(
+                "  showing \(groupDigits(String(overview.preview.count))) of "
+                    + "\(groupDigits(String(total))) rows"
+            )
         }
     }
     return lines.joined(separator: "\n")
@@ -933,16 +951,17 @@ let overviewCellMax = 24
 /// Lay rows out as a fixed-width grid, dropping trailing columns that do not fit `width`.
 ///
 /// Numbers are right-aligned, which is the one alignment rule that makes a column of figures
-/// readable at all. Every cell's glyph comes from `Cell.display` — the engine's own display logic,
-/// which is where `DECIMAL(10,2)` learns to stay `10.50` — and newlines are flattened to spaces,
-/// since a quoted newline in a CSV cell would otherwise tear the grid in half.
+/// readable at all. Every cell's glyph comes from `CellDisplay.glyph(for:kind:)` — the SHARED
+/// presentation layer the SwiftUI grid uses too, never `Cell.display`, which collapses NULL and
+/// `''` into the same blank. Newlines are flattened to spaces, since a quoted newline in a CSV
+/// cell would otherwise tear the grid in half.
 func renderGrid(
     columns: [TablePage.ColumnInfo], rows: [[Cell]], width: Int, cellMax: Int = overviewCellMax
 ) -> [String] {
     guard !columns.isEmpty else { return [] }
 
     let texts: [[String]] = columns.indices.map { i in
-        rows.map { row in i < row.count ? flatten(row[i].display) : "" }
+        rows.map { row in i < row.count ? flatten(glyph(for: row[i], kind: columns[i].kind)) : "" }
     }
     let widths: [Int] = columns.indices.map { i in
         min(cellMax, max(columns[i].name.count, texts[i].map(\.count).max() ?? 0))
