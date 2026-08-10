@@ -156,15 +156,20 @@ func realPath(_ path: String) -> String {
 /// place; SourceKey identity is the same idea one level up).
 ///
 /// Not `private`: Staging.swift re-stats a staged copy's source to answer "has this file changed
-/// since we copied it" — the same two fields, compared against the same `SourceKey` they were
-/// read into. A throw there means the file is gone, which is a different answer, not an error.
-func statInfo(_ path: String) throws -> (mtimeNs: Int, size: Int) {
+/// since we copied it" — the same fields, compared against the same `SourceKey` they were read
+/// into. A throw there means the file is gone, which is a different answer, not an error.
+///
+/// `ctimeNs` is carried for `stagingToken` alone (nothing in `SourceKey` uses it): `utimensat` can
+/// restore an exact mtime, but ctime is maintained by the kernel and cannot be set from userspace,
+/// so it is the one field a timestamp-preserving rewrite cannot forge.
+func statInfo(_ path: String) throws -> (mtimeNs: Int, size: Int, ctimeNs: Int) {
     var st = stat()
     guard stat(path, &st) == 0 else {
         throw UnsupportedSource("Cannot read \(path): file not found or not readable")
     }
     let mtimeNs = Int(st.st_mtimespec.tv_sec) * 1_000_000_000 + Int(st.st_mtimespec.tv_nsec)
-    return (mtimeNs, Int(st.st_size))
+    let ctimeNs = Int(st.st_ctimespec.tv_sec) * 1_000_000_000 + Int(st.st_ctimespec.tv_nsec)
+    return (mtimeNs, Int(st.st_size), ctimeNs)
 }
 
 /// `Path(path).suffix.lower() in COMPRESSION_EXT`, checking only the final extension — mirrors
@@ -180,7 +185,7 @@ private func isCompressedPath(_ path: String) -> Bool {
 /// Resolve a path into everything needed to query it, reading as little as possible.
 public func buildSource(_ con: Connection, path: String, sheet: String? = nil) throws -> SourceSpec {
     let resolvedPath = realPath(path)
-    let (mtimeNs, size) = try statInfo(resolvedPath)
+    let (mtimeNs, size, _) = try statInfo(resolvedPath)
     // A directory's st_mtime_ns changes when children are added — the invalidation signal wanted
     // for glob/Delta sources too.
     let key = SourceKey(path: resolvedPath, mtimeNs: mtimeNs, size: size)

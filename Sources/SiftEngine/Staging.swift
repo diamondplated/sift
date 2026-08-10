@@ -48,6 +48,9 @@ final class StageJob: @unchecked Sendable {
     private var hammering = false
 
     var isCancelled: Bool { lock.withLock { cancelled } }
+    /// Is the hammer thread still running? The observable half of "every exit closes the window" —
+    /// a job left hammering is the M4/N1 failure, and it is invisible from the outside otherwise.
+    var isHammering: Bool { lock.withLock { hammering } }
 
     /// Hand the job the connection its CTAS runs on. Called once, before the CTAS starts.
     func attach(_ connection: Connection) {
@@ -197,22 +200,31 @@ extension Session {
     /// and must not run on the actor. Every mutation of the catalog goes through a small isolated
     /// `apply*`/`finishStage` call carrying `openedAt`, so a job whose table was closed (or closed
     /// and reopened) mid-copy cannot write onto the table that now holds its name.
+    /// `connect` exists only so a test can reach the connection-failure path below, which is
+    /// otherwise unreachable — `database.connect()` does not fail on demand. Production passes
+    /// nothing. It is a parameter rather than a mutable flag on the actor so the seam is visible
+    /// in the signature and carries no state between jobs.
     nonisolated func runStage(
-        name: String, spec: SourceSpec, jobID: String, job: StageJob, openedAt: Int
+        name: String, spec: SourceSpec, jobID: String, job: StageJob, openedAt: Int,
+        connect: (() throws -> Connection)? = nil
     ) async {
+        // FIRST STATEMENT IN THE FUNCTION, above the `do`/`catch` below, and that placement is the
+        // whole point: Swift registers a `defer` when control REACHES it, so one written below an
+        // early `return` never runs on that path. This guard spent round 1 sitting under the
+        // `catch` it was written for, with a comment claiming it covered it (review N1) — the
+        // cancel hammer really did keep spinning at ~5 kHz for the life of the process when
+        // `database.connect()` failed. Idempotent, so the explicit early close still does the real
+        // work of shutting the window before the swap.
+        defer { job.closeInterruptWindow() }
+
         let con: Connection
         do {
-            con = try database.connect()
+            con = try (connect ?? database.connect)()
         } catch {
             await finishStage(name, jobID: jobID, openedAt: openedAt, error: "staging failed: \(error)")
             return
         }
         job.attach(con)
-        // The cancel hammer must stop even on a path that never reaches the explicit close below
-        // — `database.connect()` failing above returns before `attach`, and a `cancel` racing that
-        // window would otherwise leave a thread spinning at ~5 kHz for the life of the process
-        // (review M4). Idempotent, so the explicit early close still does the real work.
-        defer { job.closeInterruptWindow() }
 
         var failure: String?
         do {
@@ -336,7 +348,23 @@ extension Session {
     /// Python emits `{"type": "error", ...}`; in-process that event is `Table.stagingError`.
     func finishStage(_ name: String, jobID: String, openedAt: Int, error: String?) {
         stageJobs.removeValue(forKey: jobID)
-        guard var t = tables[name], t.openedAt == openedAt else { return }
+        guard var t = tables[name], t.openedAt == openedAt else {
+            // The tab was closed while this job was in flight, and `closeTable` deliberately left
+            // the name alone because a staging job may have already turned it into a TABLE
+            // mid-swap. Every path that lands here — cancel, CTAS failure, and the pre-swap
+            // `isStillOpen` bail that made "close a tab mid-copy" the COMMON case — is pre-swap,
+            // so the name is still the view `openPath` created, and this is the last place that
+            // can collect it. Without this the views pile up in a persistent store where no purge
+            // can see them (review N2).
+            //
+            // Only when the name is unclaimed: if a DIFFERENT open now holds it (generation
+            // mismatch), that table's own view is not this job's to drop. Safe on
+            // `pagingConnection` for the reason `applyStaged` states — no suspension point here.
+            if tables[name] == nil {
+                try? pagingConnection.execute("DROP VIEW IF EXISTS \(q(name))")
+            }
+            return
+        }
         t.staging = nil
         t.stagingError = error
         tables[name] = t
@@ -468,12 +496,14 @@ extension Session {
     /// different shape. It is a backstop, not the fix; the fix is `stagingToken`.
     private nonisolated func columnsMatch(_ con: Connection, table: String, spec: SourceSpec) -> Bool {
         guard let result = try? con.query("SELECT * FROM \(q(table)) LIMIT 0") else { return false }
-        // `starts(with:)`, not `==`: a folder source's read expression appends a `filename`
-        // provenance column that `spec.columns` does not list, so an exact comparison rejected
-        // EVERY folder copy — silently turning adoption off for a whole source class while the
-        // test that should have caught it passed for this very reason. The spec's columns must all
-        // be there, in order; provenance may follow.
-        return result.columns.map(\.name).starts(with: spec.columns.map(\.name))
+        // Exact, against the shape this source actually produces. A folder read appends ONE
+        // `filename` provenance column that `spec.columns` does not list (SourceProbe sets
+        // `filename: true` for globs), which is why a bare `== spec.columns` rejected every folder
+        // copy and silently disabled adoption for the whole class. `starts(with:)` fixed that but
+        // admitted any number of extra trailing columns for any source kind (review N3); naming
+        // the one column that is actually expected keeps the fix without the slack.
+        let provenance = (spec.fmt == .globCsv || spec.fmt == .globParquet) ? ["filename"] : []
+        return result.columns.map(\.name) == spec.columns.map(\.name) + provenance
     }
 
     // MARK: - the staged-data lifecycle
@@ -554,6 +584,14 @@ extension Session {
                 maxAgeDays: stageMaxAgeDays()
             )
             targets = aged + over
+            // A copy whose token this build can no longer interpret can never be adopted again, so
+            // leaving it is disk nothing will ever reach. `migrateCatalog` handles the older store
+            // whose KEY also changed; this is the lighter case — a store whose schema is current
+            // but whose tokens predate a format bump (v2 -> v3 when ctime joined the identity).
+            for row in rows where !cellText(row[4]).hasPrefix("\(stagingTokenVersion)|") {
+                let name = cellText(row[0])
+                if !targets.contains(name) { targets.append(name) }
+            }
             // A staged copy of a file that has since changed on disk is simply wrong. A source
             // that has *vanished* is not swept here, matching Python — the copy may be the only
             // thing left of it, and `stagedEntries` surfaces it as `sourceMissing` instead.
@@ -677,7 +715,7 @@ func swapStaged(_ con: Connection, name: String, lock: NSLock) throws {
 /// Bumped whenever `stagingToken`'s format changes, and the first field of every token, so a token
 /// written by an older build can never compare equal to one written by this build. A copy whose
 /// identity we can no longer interpret must never be adopted.
-let stagingTokenVersion = "v2"
+let stagingTokenVersion = "v3"
 
 /// The identity a staged copy is matched on: the exact bytes it was made from.
 ///
@@ -707,6 +745,7 @@ let stagingTokenVersion = "v2"
 /// up, cache it against the directory's own mtime.
 func stagingToken(_ spec: SourceSpec) -> String {
     var parts = [stagingTokenVersion, spec.key.path, String(spec.key.mtimeNs), String(spec.key.size)]
+    if let ctime = try? statInfo(spec.key.path).ctimeNs { parts.append("ctime=\(ctime)") }
     if let sheet = spec.sheet, !sheet.isEmpty { parts.append("sheet=\(sheet)") }
     if let members = directoryDigest(spec.key.path) { parts.append("members=\(members)") }
     return parts.joined(separator: "|")
@@ -723,7 +762,7 @@ private func directoryDigest(_ path: String) -> String? {
         guard let member = try? statInfo((path as NSString).appendingPathComponent(entry)) else {
             continue
         }
-        lines.append("\(entry):\(member.mtimeNs):\(member.size)")
+        lines.append("\(entry):\(member.mtimeNs):\(member.size):\(member.ctimeNs)")
     }
     return fnv1a(lines.sorted().joined(separator: "\n"))
 }

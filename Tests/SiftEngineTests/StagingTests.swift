@@ -911,7 +911,7 @@ private struct ConnectionBox: @unchecked Sendable {
         try con.execute("CREATE TABLE \(q(name)) AS SELECT 1 AS x")
         _ = try con.query(
             "INSERT INTO _sift_sources VALUES (?, ?, ?, ?, ?, 'csv', now(), now(), 0, 1)",
-            [.text("token-\(name)"), .text(file), .int(Int64(mtimeNs)), .int(Int64(size)), .text(name)]
+            [.text("\(stagingTokenVersion)|token-\(name)"), .text(file), .int(Int64(mtimeNs)), .int(Int64(size)), .text(name)]
         )
     }
     try plant("size_moved", mtimeNs: real.mtimeNs, size: real.size + 1)
@@ -1024,4 +1024,204 @@ private struct ConnectionBox: @unchecked Sendable {
     // …and it was cleared away rather than left holding the name.
     _ = try await session.openPath(path)
     #expect(try await session.stagedEntries().isEmpty)
+}
+
+// ============================================================================================
+// Round-2 review fixes.
+// ============================================================================================
+
+// MARK: - N1: the hammer stops on EVERY exit from runStage, including a failed connect
+
+@Test func aJobThatCannotEvenConnectStillStopsItsHammer() async throws {
+    // The M4 `defer` spent round 1 sitting BELOW the `catch { … return }` it was written for, with
+    // a comment claiming it covered that case. Swift registers a `defer` when control reaches it,
+    // so it never ran on that path and the hammer thread spun at ~5 kHz for the life of the
+    // process. `database.connect()` cannot be made to fail on demand, hence `runStage`'s `connect`
+    // seam — the same reason `setStageDwellForTest` exists.
+    let session = try newSession()
+    let t = try await session.openPath(try makeSmallCSV())
+
+    let job = StageJob()
+    #expect(job.requestCancel() == true)      // a cancel racing the connection, before `attach`
+    #expect(job.isHammering, "the premise: a cancelled job hammers until its window closes")
+
+    await session.runStage(
+        name: t.name, spec: t.spec, jobID: "stage-unconnectable", job: job, openedAt: t.openedAt,
+        connect: { throw DuckDBError("could not open a DuckDB connection") }
+    )
+    #expect(!job.isHammering, "every exit from runStage must close the interrupt window")
+
+    let after = try await session.table(t.name)
+    #expect(after.stagingError?.hasPrefix("staging failed:") == true)
+}
+
+// MARK: - N2: closing a tab mid-copy must not leak the view
+
+@Test func closingATabMidCopyLeavesNoViewBehind() async throws {
+    // `closeTable` leaves the name alone while a job is in flight, because a copy may already have
+    // renamed a TABLE over it. Every pre-swap exit then lands in `finishStage`, which used to find
+    // no table and simply return — so nobody dropped the view. `~/.sift` is persistent and no
+    // purge can see an object with no catalog row, so they accumulate without bound. The new
+    // pre-swap `isStillOpen` check made this the COMMON path, not a rare race.
+    let session = try newSession()
+    await session.setStageDwellForTest(3600)
+    let probe = try await session.openPath(try makeSmallCSV(rows: 5))
+    let t = try await session.openPath(bigCSV)
+
+    _ = try await session.stageNow(t.name)     // 30 MB: the copy takes long enough to close under
+    try await session.closeTable(t.name)       // ← the tab goes while the CTAS is still running
+
+    // The job finishes, finds its table gone, and must collect the view it left behind.
+    let deadline = Date().addingTimeInterval(60)
+    var views = -1
+    while Date() < deadline {
+        let rows = try await introspect(
+            session, table: probe.name,
+            "SELECT count(*) FROM duckdb_views() WHERE view_name = '\(t.name)'")
+        views = cellInt(rows[0][0])
+        if views == 0 { break }
+        try await Task.sleep(nanoseconds: 100_000_000)
+    }
+    #expect(views == 0, "a cancelled/abandoned copy must not leave an orphan view in the store")
+    #expect(try await session.stagedEntries().isEmpty)
+}
+
+// MARK: - N3: the column check admits exactly one provenance column, not any number
+
+@Test func aCopyWithAnUnexpectedExtraColumnIsNotAdopted() async throws {
+    // `starts(with:)` fixed the folder case but admitted ANY number of extra trailing columns for
+    // ANY source kind. A plain CSV's copy must match its spec exactly.
+    let session = try newSession()
+    let path = try makeSmallCSV()
+    let t = try await session.openPath(path)
+    let con = try session.database.connect()
+
+    let columns = t.spec.columns.map { "NULL::\($0.type) AS \(q($0.name))" }.joined(separator: ", ")
+    try con.execute("DROP VIEW IF EXISTS \(q(t.name))")
+    try con.execute("CREATE TABLE \(q(t.name)) AS SELECT \(columns), 'extra' AS surprise")
+    _ = try con.query(
+        "INSERT INTO _sift_sources VALUES (?, ?, 0, 0, ?, 'csv', now(), now(), 1, 1)",
+        [.text(stagingToken(t.spec)), .text(path), .text(t.name)]
+    )
+    #expect(session.adoptStagedCopy(con, name: t.name, spec: t.spec) == nil,
+            "a copy carrying a column the source does not produce is not this source's copy")
+}
+
+// MARK: - N4: a rewrite that forges the mtime cannot forge the ctime
+
+@Test func aCopyIsNotAdoptedWhenTheFileWasRewrittenWithItsTimestampRestored() async throws {
+    // The realistic route is not an exotic restore: any toolchain that stamps a constant mtime on
+    // its outputs (SOURCE_DATE_EPOCH, Nix/Bazel, unzip of a fixed-timestamp archive) plus a
+    // fixed-width export gives an identical mtime AND size for different content — and identical
+    // columns, so the shape backstop cannot fire either. `utimensat` sets atime and mtime; ctime
+    // is maintained by the kernel and cannot be set from userspace at all, which is what makes it
+    // the field a forgery cannot reach.
+    let dir = try newTempDir()
+    let path = (dir as NSString).appendingPathComponent("fixed.csv")
+    try "order_id,amount\n1,00100\n2,00200\n".write(toFile: path, atomically: false, encoding: .utf8)
+    let original = try statInfo(path)
+
+    let session = try newSession()
+    let t = try await session.openPath(path)
+    _ = try await session.stageNow(t.name, force: true)
+    try await waitForStaged(session, t.name)
+    try await session.closeTable(t.name)
+
+    // Same length, different values, and the exact original mtime put back to the nanosecond.
+    try "order_id,amount\n1,99100\n2,99200\n".write(toFile: path, atomically: false, encoding: .utf8)
+    var times = [
+        timespec(tv_sec: original.mtimeNs / 1_000_000_000, tv_nsec: original.mtimeNs % 1_000_000_000),
+        timespec(tv_sec: original.mtimeNs / 1_000_000_000, tv_nsec: original.mtimeNs % 1_000_000_000),
+    ]
+    #expect(utimensat(AT_FDCWD, path, &times, 0) == 0)
+    let forged = try statInfo(path)
+    #expect(forged.mtimeNs == original.mtimeNs && forged.size == original.size,
+            "the premise: mtime and size are indistinguishable from the staged file's")
+
+    let again = try await session.openPath(path)
+    #expect(again.staged == false, "ctime moved, so this is not the file that was copied")
+    let page = try await session.page(again.name, offset: 0, limit: 10)
+    #expect(page.rows.map { $0[1].display } == ["99100", "99200"],
+            "the disk's contents, not the copy's")
+}
+
+// MARK: - M6: the purge cutoff read in the wrong timezone deletes the user's data
+
+@Test func thePurgeCutoffIsImmuneToTheSessionTimezone() throws {
+    // `stagedEntries` merely mislabels a string if the cast is dropped; THIS site deletes cached
+    // data. A row 13 h 21 m short of the 14-day cutoff is read 5 h older without the cast on a
+    // Chicago-zoned connection — over the line, and gone. The zone is pinned inside the test, so
+    // it says the same thing under TZ=UTC as it does here.
+    let con = try Database.inMemory().connect()
+    try con.execute("SET TimeZone='America/Chicago'")
+    try con.execute(catalogDDL)
+    try con.execute("CREATE TABLE nearly_aged AS SELECT 1 AS x")
+    _ = try con.query(
+        "INSERT INTO _sift_sources VALUES (?, '/nonexistent/x.csv', 0, 0, 'nearly_aged', 'csv', "
+            + "now(), now() - INTERVAL 14 DAY + INTERVAL 3 HOUR, 0, 1)",
+        [.text("\(stagingTokenVersion)|nearly-aged")])
+
+    let dropped = try Session.purgeStagedTables(con, open: [], tables: nil, all: false)
+    #expect(dropped.isEmpty,
+            "13 d 21 h is inside the 14-day window; only a timezone misread makes it 14 d 2 h")
+    #expect(try con.query("SELECT count(*) FROM _sift_sources").allRows()[0][0] == .int(1))
+}
+
+// MARK: - N5: two sheets of one workbook that only the identity can tell apart
+
+@Test(.enabled(if: extensionIsAvailable("excel"), "duckdb excel extension not installed"))
+func aCopyOfOneMonthsSheetIsNeverServedAsAnother() async throws {
+    // `book.xlsx`'s two sheets have different columns, so the shape backstop rejects the wrong
+    // copy even when the identity itself is broken — which left the sheet component with no
+    // end-to-end guard. `monthly.xlsx` is the real-world case: identically-shaped monthly sheets,
+    // same columns, different numbers, so ONLY the token can tell them apart.
+    let session = try newSession()
+    let book = siftCoreTestsFixture("monthly.xlsx")
+
+    let jan = try await session.openPath(book, name: "m", sheet: "Jan")
+    _ = try await session.stageNow(jan.name, force: true)
+    try await waitForStaged(session, "m")
+    try await session.closeTable("m")
+
+    let feb = try await session.openPath(book, name: "m", sheet: "Feb")
+    #expect(feb.staged == false, "January's copy is not February")
+    let page = try await session.page("m", offset: 0, limit: 10)
+    #expect(page.columns.map(\.name) == ["store", "sales"])
+    #expect(page.rows.map { $0[1].display } == ["901.0", "902.0", "903.0", "904.0", "905.0"],
+            "February's numbers, not January's")
+
+    // The right sheet still adopts its own copy.
+    _ = try await session.stageNow("m", force: true)
+    try await waitForStaged(session, "m")
+    try await session.closeTable("m")
+    let again = try await session.openPath(book, name: "m", sheet: "Feb")
+    #expect(again.staged == true)
+}
+
+@Test func aCopyWhoseTokenFormatPredatesThisBuildIsCollected() throws {
+    // `migrateCatalog` resets a store whose catalog KEY is also old. This is the lighter case: the
+    // schema is current but the token format bumped (v2 -> v3, when ctime joined the identity).
+    // Such a row can never be adopted again, so leaving it is disk nothing will ever reach.
+    let con = try Database.inMemory().connect()
+    try con.execute(catalogDDL)
+    try con.execute("CREATE TABLE old_format AS SELECT 1 AS x")
+    try con.execute("CREATE TABLE current AS SELECT 1 AS x")
+    let dir = try newTempDir()
+    let file = (dir as NSString).appendingPathComponent("src.csv")
+    try "x\n1\n".write(toFile: file, atomically: true, encoding: .utf8)
+    let real = try statInfo(file)
+
+    func plant(_ name: String, token: String) throws {
+        _ = try con.query(
+            "INSERT INTO _sift_sources VALUES (?, ?, ?, ?, ?, 'csv', now(), now(), 0, 1)",
+            [.text(token), .text(file), .int(Int64(real.mtimeNs)), .int(Int64(real.size)), .text(name)]
+        )
+    }
+    try plant("old_format", token: "v2|\(file)|\(real.mtimeNs)|\(real.size)")
+    try plant("current", token: "\(stagingTokenVersion)|whatever")
+
+    let dropped = try Session.purgeStagedTables(con, open: [], tables: nil, all: false)
+    #expect(dropped == ["old_format"])
+    #expect(try con.query("SELECT count(*) FROM _sift_sources").allRows()[0][0] == .int(1),
+            "the current-format row is left alone")
 }
