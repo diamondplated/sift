@@ -40,3 +40,10 @@ jobs:
 
       - name: Test
         run: swift test
+
+      # The end-to-end surface that replaced browser mode: real files on disk, through the real
+      # Session, with its own throwaway ~/.sift per check. Exits non-zero on any failure and
+      # names every one. A check that cannot run here (no delta/excel extension on the runner)
+      # reports `skip` and does not fail the build.
+      - name: Verify end to end
+        run: swift run sift --verify

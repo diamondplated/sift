@@ -22,6 +22,7 @@ let package = Package(
         .library(name: "DuckDBKit", targets: ["DuckDBKit"]),
         .library(name: "SiftCore", targets: ["SiftCore"]),
         .library(name: "SiftEngine", targets: ["SiftEngine"]),
+        .executable(name: "sift", targets: ["sift"]),
     ],
     targets: [
         .systemLibrary(name: "CDuckDB", path: "Sources/CDuckDB"),
@@ -61,6 +62,15 @@ let package = Package(
         .testTarget(
             name: "SiftEngineTests",
             dependencies: ["SiftEngine", "SiftCore", "DuckDBKit"]
+        ),
+        // The headless verification surface, and the reason browser mode could be deleted. Kept
+        // deliberately thin — a test target cannot import an `executableTarget`, so everything it
+        // does lives in SiftEngine/Verification.swift instead. No linkerSettings, for the same
+        // reason SiftEngine has none: DuckDBKit's rpath flags propagate transitively, and
+        // repeating them emits `ld: warning: duplicate -rpath`.
+        .executableTarget(
+            name: "sift",
+            dependencies: ["SiftEngine"]
         ),
     ]
 )
