@@ -112,3 +112,16 @@ Requires a Python with openpyxl. Every workbook's generating script is inlined a
 `book.xlsx`/`odd.xlsx`'s recipe lived in `engine/tests/fixtures.py` before that tree was
 deleted — `git log -- Tests/SiftCoreTests/Fixtures` will find the commit that added them,
 and its message carries the generating script.
+
+`monthly.xlsx` was added on 2026-08-09 during Task 6's round-2 review fixes, for a case none of
+the others cover: **two sheets with identical columns and different data** (`Jan` and `Feb`, both
+`store`/`sales`). Staging matches a copy against its source's identity, and a workbook is one path,
+one mtime and one size no matter how many sheets it holds — so the only end-to-end way to prove the
+sheet is part of that identity is a workbook whose sheets cannot be told apart by their shape. The
+existing `book.xlsx` cannot do it: `Summary` and `By Store` have different columns, so the column
+backstop rejects the wrong sheet's copy even when the identity itself is broken.
+
+Produced the same way as the others, by openpyxl 3.1.5 in a throwaway virtualenv — a real OOXML
+writer, not hand-written XML, for the reason stated above. Verified after writing by reading both
+sheets back through the `duckdb` CLI (1.5.2, a different build from the vendored 1.5.5 this package
+links), so the file is known to be readable by something other than the code under test.
