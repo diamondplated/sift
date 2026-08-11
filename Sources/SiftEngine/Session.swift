@@ -114,10 +114,25 @@ public actor Session {
     let pagingConnection: Connection
 
     var tables: [String: Table] = [:]
-    /// Per-table mutex a later task's staging swap-retry loop will lock from its own background
-    /// `Task`, mirroring Python's `with self._tlock(name):` called from a worker thread. Only this
-    /// dictionary's get-or-create needs actor isolation; the returned `NSLock` itself is meant to
-    /// be locked/unlocked from the caller's own (non-actor) context.
+    /// Per-table mutex, mirroring Python's `with self._tlock(name):`. Only this dictionary's
+    /// get-or-create needs actor isolation; the returned `NSLock` is locked/unlocked from the
+    /// caller's own (non-actor) context.
+    ///
+    /// 🔴 **RULED VESTIGIAL, 2026-08-11 (whole-plan review). The retry is the real mechanism.**
+    /// `tlock` has exactly ONE acquisition site — `swapStaged` — in Swift *and* in Python, and
+    /// `stageNow` refuses to start a second job for a table that already has one in flight
+    /// (`t.staged || t.staging != nil`). So nothing can ever contend for one of these locks: to
+    /// contend, two staging jobs would have to be swapping the same table name at the same
+    /// instant, and the catalog makes that unconstructible. Spec §11 lists the lock as a frozen
+    /// contract, so it stays — but a reader must not mistake it for the thing that makes the swap
+    /// safe.
+    ///
+    /// What ACTUALLY handles the write-write conflict is `swapStaged`'s three-attempt retry with a
+    /// `ROLLBACK` between, and that IS pinned: MEASURED, with a second CONNECTION (not a second
+    /// job) holding an open `BEGIN; CREATE OR REPLACE VIEW t AS …`, the swap fails immediately
+    /// with `TransactionContext Error: Catalog write-write conflict on alter`, and the retry is
+    /// what puts the copy in place. A lock cannot help there — the conflicting writer is a
+    /// different connection, not a different `Session` method.
     private var tableLocks: [String: NSLock] = [:]
     /// Source of `Table.openedAt` — see its doc comment. Incremented once per table this session
     /// puts into the catalog, never reused. Two writers: `openPath` and Joins.swift's `merge`,
@@ -393,6 +408,14 @@ public actor Session {
         tables[name] = t
     }
 
+    /// Test support: override whether `openPath` believes the `delta` extension loaded. `nil`
+    /// (the default) means "ask the database", which is what production always does — this exists
+    /// only so DeltaTests can reach `openPath`'s refusal, which on every machine this code runs on
+    /// is otherwise unreachable because `delta` always loads. See the refusal itself for why a
+    /// branch that prevents resurrecting deleted rows must not be pinned by luck.
+    var deltaLoadedForTest: Bool?
+    func setDeltaLoadedForTest(_ loaded: Bool?) { deltaLoadedForTest = loaded }
+
     /// Test support: swap an open table's `SourceSpec` — the size, format and sheet the cost
     /// policies read — without touching the relation underneath it. The only way to point a test
     /// at a 30 GB source without writing 30 GB: `profileIfCheap`'s gate reads `spec.key.size` and
@@ -487,7 +510,13 @@ public actor Session {
             throw SessionError("No such file or folder: \(resolved)")
         }
 
-        if isDeltaDir(resolved), database.loadedExtensions["delta"] != true {
+        // 🔴 The single most consequential refusal in the product, and until 2026-08-11 it was
+        // held up by an environmental accident: `delta` always loads on every machine this runs
+        // on, so the branch was unreachable and deleting it left 461 tests green. What it guards
+        // is reading a Delta table as a raw parquet glob, which RESURRECTS DELETED ROWS — the
+        // worst thing a tool whose entire premise is not lying about data could do. It deserves a
+        // seam, not luck: `deltaLoadedForTest` is that seam and its only purpose.
+        if isDeltaDir(resolved), !(deltaLoadedForTest ?? (database.loadedExtensions["delta"] == true)) {
             throw SessionError(
                 "\((resolved as NSString).lastPathComponent) is a Delta table, but the DuckDB "
                     + "delta extension is not available, so Sift cannot read it correctly. Reading "
@@ -811,7 +840,15 @@ public actor Session {
         // catalog looking healthy and throwing a raw catalog dump on every read. See
         // Joins.swift's `assertNoLiveMerge` for why this refuses rather than cascading.
         try assertNoLiveMerge(on: name)
-        defer { tables.removeValue(forKey: name) }
+        defer {
+            tables.removeValue(forKey: name)
+            // The lock goes with the table. It is vestigial (see `tableLocks`), but a dictionary
+            // that only ever grows is a leak whether or not anyone locks what is in it — a session
+            // that opens and closes a thousand tabs kept a thousand `NSLock`s alive. Safe here for
+            // the same reason the retire is: nothing can be holding it, since `stageNow` refuses a
+            // second job and a running job's `swapStaged` has the OBJECT, not the dictionary slot.
+            tableLocks.removeValue(forKey: name)
+        }
 
         let con = pagingConnection
         do {

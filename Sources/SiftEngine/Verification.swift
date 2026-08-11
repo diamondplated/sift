@@ -1386,7 +1386,9 @@ func waitForOpenScan(_ session: Session, _ name: String, timeout: TimeInterval =
 
 /// The whole `sift <path>` output: a headline, the schema, and the first rows as a grid.
 ///
-/// Row counts are thousands-grouped through `CellDisplay.groupDigits` — the same public rule the
+/// Row counts are thousands-grouped through `SiftCore.groupDigits` (`SiftCore/Stage.swift`; an
+/// earlier version of this comment said `CellDisplay.groupDigits`, which is not where it lives and
+/// not the module that owns it) — the same public rule the
 /// grid's cells go through, and the same one SiftUI will use. (An earlier version of this comment
 /// explained why they printed ungrouped: the two grouping helpers that already existed,
 /// `DuckDBKit.Cell.grouped` and `SiftCore.grouped(_:decimals:)`, are module-internal and cannot be

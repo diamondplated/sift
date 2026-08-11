@@ -408,6 +408,10 @@ public func buildSource(
     case .merge:
         // detectFormat never returns .merge for a real path — merge sources are constructed
         // directly by Session.merge (Task 7), never resolved from a path here.
-        throw UnsupportedSource("merge is not buildable from a path")
+        // A sentence, like every other user-facing string here. `UnsupportedSource` is a
+        // `SiftError`, so this reaches a banner and a terminal verbatim — the branch is
+        // unreachable today, but "merge is not buildable from a path" was written for whoever
+        // makes it reachable, not for whoever reads it.
+        throw UnsupportedSource("A merged table is built from two open tables, not from a file.")
     }
 }

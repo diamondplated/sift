@@ -76,6 +76,50 @@ func timeTravelUsesTheVersionArgument() throws {
     #expect(throws: TimeTravelUnsupported.self) { _ = try readExprAt(spec: spec, version: 0) }
 }
 
+// MARK: - the refusal (spec §11), and why it needs a seam rather than luck
+
+/// 🔴 **Deleting `openPath`'s Delta refusal left all 461 tests green**, because the `delta`
+/// extension loads on every machine this code runs on, so the branch was unreachable — the guard
+/// was pinned by an environmental accident rather than by a test.
+///
+/// What it guards is the worst thing this product could do. Without the delta extension the
+/// directory falls through to `detectFormat`'s parquet-glob branch, and a glob over a Delta table
+/// **resurrects every tombstoned row** — `tombstonedRowsAreExcluded` above measures the gap on
+/// this exact fixture: 100 rows through `delta_scan`, 150 through the glob. Sift would show 50
+/// deleted rows as live data, silently, under a healthy-looking table. That deserves a seam.
+///
+/// Needs no extension itself: `isDeltaDir` looks for `_delta_log`, and the refusal happens before
+/// anything tries to read the table.
+@Test func aDeltaTableIsRefusedRatherThanGloblledWhenTheExtensionIsMissing() async throws {
+    let session = try Session(
+        home: FileManager.default.temporaryDirectory
+            .appendingPathComponent("sift-delta-refusal-\(UUID().uuidString)").path
+    )
+    await session.setDeltaLoadedForTest(false)
+
+    do {
+        _ = try await session.openPath(sharedData.delta)
+        Issue.record("a Delta table was opened with no delta extension — it would have been globbed")
+    } catch let error as SessionError {
+        #expect(error.message.contains("is a Delta table"), "got: \(error.message)")
+        // The sentence has to say WHY, because "install an extension" alone reads as a nuisance
+        // rather than as the reason the numbers would be wrong.
+        #expect(error.message.contains("resurrect deleted rows"), "got: \(error.message)")
+        #expect(error.message.contains("INSTALL delta"), "the way out must be named: \(error.message)")
+    }
+
+    // Nothing was opened — a refusal must not leave a half-built table behind.
+    #expect(await session.state().tables.isEmpty)
+
+    // ...and with the extension really there (the seam cleared), the same path opens. Otherwise
+    // this test would pass just as well against an `openPath` that refuses every Delta table.
+    if extensionIsAvailable("delta") {
+        await session.setDeltaLoadedForTest(nil)
+        let t = try await session.openPath(sharedData.delta)
+        #expect(t.spec.fmt == .delta)
+    }
+}
+
 @Test func deltaIsNeverStaged() throws {
     // A flat copy of a Delta table silently pins it to one version, on top of being redundant.
     let d = shouldStage(fmt: .delta, sizeBytes: 50 * GB, freeBytes: 500 * GB)

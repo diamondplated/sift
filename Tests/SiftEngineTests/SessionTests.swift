@@ -218,6 +218,34 @@ private func gzip(_ sourcePath: String, to destPath: String) throws {
     #expect(Set(state.tables.map(\.name)) == ["clean", "clean_2"])
 }
 
+// MARK: - the two escape hatches are alternatives, and the engine says so
+
+/// Deleting `openPath`'s two-hatch guard left all 461 tests green. The only test of the pair is
+/// the CLI parser's, and its own comment says "Session.openPath throws on the same pair" — a
+/// confident comment over a guard no test reached, the same shape as a finding earlier in this
+/// plan.
+///
+/// The refusal is not pedantry: MEASURED, pinning `skip` is exactly what defeats `null_padding`
+/// (an explicit `skip=0` is the sniffer's own answer handed back, and restores the collapse), so
+/// asking for both silently gets neither — a user following a note that told them how to recover
+/// their columns would get the same broken read back with no indication why.
+@Test func openPathRefusesBothEscapeHatchesAtOnceRatherThanHonouringNeither() async throws {
+    let session = try newSession()
+    do {
+        _ = try await session.openPath(sharedData.cleanCSV, nullPadding: true, skipPreamble: false)
+        Issue.record("openPath accepted both escape hatches and would have honoured neither")
+    } catch let error as SessionError {
+        #expect(error.message.contains("cannot be combined"), "got: \(error.message)")
+        #expect(error.message.contains("Pick one."), "the sentence must say what to do: \(error.message)")
+    }
+    #expect(await session.state().tables.isEmpty, "a refused open must leave nothing behind")
+
+    // Either hatch ALONE is honoured — otherwise this would pass against an `openPath` that
+    // refused every use of them.
+    #expect(try await session.openPath(sharedData.cleanCSV, nullPadding: true).rowCount == 1000)
+    #expect(try await session.openPath(sharedData.cleanCSV, skipPreamble: false).name == "clean_2")
+}
+
 // MARK: - the engine hardens its own database (§11 frozen contract)
 
 /// 🔴 `db.harden()` could be deleted from `Session.init` and all 461 tests stayed green. The only

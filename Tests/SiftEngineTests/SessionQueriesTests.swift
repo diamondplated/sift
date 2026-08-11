@@ -284,6 +284,46 @@ private func hugeCSVSpec(like spec: SourceSpec) -> SourceSpec {
     )
 }
 
+/// The other direction, and the half that was missing: deleting `&& t.spec.fmt == .xlsx` from
+/// `applyProfile` left all 461 tests green, because nothing ever profiled a NON-xlsx source
+/// carrying a serial-date-shaped column.
+///
+/// The gate is real. `looksLikeExcelSerialDates` is a bounds check — 25,000-50,000 with more than
+/// one distinct value — and that window is full of perfectly ordinary numbers: order ids, part
+/// numbers, elevations in feet, prices in cents, the population of a mid-size town. Excel serial
+/// dates are an artefact of Excel, so the note is only ever true of a workbook; fired on a CSV it
+/// is a confident, wrong claim about someone's data, in the tool whose whole pitch is not making
+/// those.
+@Test func aSerialDateShapedColumnInACsvGetsNoExcelNote() async throws {
+    let dir = FileManager.default.temporaryDirectory
+        .appendingPathComponent("sift-serial-csv-\(UUID().uuidString)").path
+    try FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(atPath: dir) }
+
+    // Values sitting squarely inside the window, 100 distinct — so the PREDICATE says yes and the
+    // format gate is the only thing that can say no.
+    let path = (dir as NSString).appendingPathComponent("orders.csv")
+    var text = "order_ref,note\n"
+    for i in 0..<100 { text += "\(25_000 + i * 100),note \(i)\n" }
+    try text.write(toFile: path, atomically: true, encoding: .utf8)
+
+    let session = try newSession()
+    let t = try await session.openPath(path)
+    #expect(t.spec.fmt == .csv)
+
+    let profile = try await session.computeProfile(t.name)
+    let ref = try #require(profile.first { $0.name == "order_ref" })
+    // Fixture integrity: if the predicate ever stops matching this column, the silence below stops
+    // proving anything about the gate.
+    #expect(looksLikeExcelSerialDates(ref), "the fixture no longer looks like serial dates")
+
+    let after = try await session.table(t.name)
+    #expect(
+        !after.notes.contains { $0.contains("Excel serial dates") },
+        "a CSV was told its order refs are Excel dates; got: \(after.notes)"
+    )
+}
+
 // MARK: - bad_rows decodes the LIST of failing column names (brief gotcha #4)
 
 @Test func badRowsDecodesBadColumnsAsTheListOfFailingColumnNames() async throws {

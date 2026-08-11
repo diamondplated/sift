@@ -232,8 +232,11 @@ public final class Chunk {
     // type (LIST-of-LIST would make it infinitely sized) without `indirect`, which only
     // enums get. This is a read-only accessor bag built once and never mutated, so the
     // reference-vs-value distinction has no other consequence here.
+    //
+    // No `vector` field: the child vector is used only to DERIVE the four things below, all of
+    // which are resolved in `resolveListChild` and none of which needs it again. It was stored
+    // and never read.
     private final class ListChild {
-        let vector: duckdb_vector?
         let meta: ColumnMeta
         let validity: UnsafeMutablePointer<UInt64>?
         let data: UnsafeMutableRawPointer?
@@ -242,9 +245,8 @@ public final class Chunk {
         let size: UInt64
         let nestedListChild: ListChild?
 
-        init(vector: duckdb_vector?, meta: ColumnMeta, validity: UnsafeMutablePointer<UInt64>?,
+        init(meta: ColumnMeta, validity: UnsafeMutablePointer<UInt64>?,
              data: UnsafeMutableRawPointer?, size: UInt64, nestedListChild: ListChild?) {
-            self.vector = vector
             self.meta = meta
             self.validity = validity
             self.data = data
@@ -261,7 +263,7 @@ public final class Chunk {
         guard let child = duckdb_list_vector_get_child(parent) else { return nil }
         let meta = Self.meta(forChildOf: child)
         let nested = meta.typeID == DUCKDB_TYPE_LIST ? resolveListChild(child) : nil
-        return ListChild(vector: child, meta: meta, validity: duckdb_vector_get_validity(child),
+        return ListChild(meta: meta, validity: duckdb_vector_get_validity(child),
                          data: duckdb_vector_get_data(child),
                          size: duckdb_list_vector_get_size(parent), nestedListChild: nested)
     }
