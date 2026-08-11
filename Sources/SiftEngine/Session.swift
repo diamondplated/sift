@@ -15,10 +15,10 @@ import SiftCore
 // Concurrency, in three facts (replacing Python's own docstring, which described a single
 // DuckDBPyConnection guarded by cursors and a thread pool):
 //   1. One `DuckDBKit.Database` is opened at launch, against `~/.sift/stage.duckdb`.
-//   2. `openPath`'s initial work (build the spec, create the view) and `_after_open`'s background
-//      pipeline each take their own throwaway `Connection` — the direct analogue of Python's
-//      `con.cursor()` for one-shot work. `Connection` is deliberately not `Sendable` and never
-//      crosses a task boundary.
+//   2. `openPath`'s initial work (build the spec, create the view), `_after_open`'s background
+//      pipeline, and `runProfile` each take their own throwaway `Connection` — the direct analogue
+//      of Python's `con.cursor()` for one-shot work. `Connection` is deliberately not `Sendable`
+//      and never crosses a task boundary: profiling's is created *inside* its detached task.
 //   3. `page`, `sortedRelation` and `closeTable` share ONE long-lived `Connection`
 //      (`pagingConnection`), for as long as the `Session` exists, instead of opening a fresh one
 //      per call. This is not a stylistic choice — MEASURED (see `sortedRelation`'s doc comment):
@@ -43,7 +43,10 @@ import SiftCore
 // closed-and-reopened table's stale background work can never land on the new table sharing its
 // name. Profiling is the newest of these and the one with a public caller waiting on it: see
 // `SessionQueries.computeProfile`, which detaches the work and then awaits it, so the actor is free
-// for the duration while the caller still gets its profile.
+// for the duration while the caller still gets its profile. That waiting caller is why profiling
+// needs one guard the others do not: the `apply*` check protects the CATALOG, and a caller holding
+// the result in its hand is a second way for a dead generation's answer to reach the user — so
+// `computeProfile` returns only what `applyProfile` accepted, never the task's own return value.
 //
 // SSE (`attach_loop`/`subscribe`/`unsubscribe`/`emit`) is deleted, per the design spec: in-process,
 // a property change on an actor a SwiftUI-facing observer wraps IS the notification. Every call
@@ -106,18 +109,28 @@ public actor Session {
     /// open can collide with.
     var nextOpenGeneration = 0
 
-    /// The in-flight profile per table name, with the `openedAt` it was launched for
-    /// (SessionQueries.swift owns every method that touches it; it lives here because Swift
-    /// extensions cannot add stored properties).
+    /// The in-flight profile per table name — the job's own id, the `openedAt` it was launched
+    /// for, and the task (SessionQueries.swift owns every method that touches it; it lives here
+    /// because Swift extensions cannot add stored properties).
     ///
     /// Two jobs: it coalesces concurrent callers onto one `SUMMARIZE` — the UI kicks a profile
     /// speculatively after the first page and the panels ask for one the moment a column is
-    /// clicked, and on a wide table each of those is over a second of DuckDB work — and it is the
-    /// claim token `applyProfile` checks, so a result whose claim was dropped (the table closed,
-    /// or `applyStaged`/`unstage` invalidating the profile mid-flight) lands nowhere. Keyed by
-    /// name AND generation because a table closed and reopened under the same name is a different
-    /// table whose caller must not be handed the old one's profile.
-    var profileJobs: [String: (openedAt: Int, task: Task<[ColumnProfile], Error>)] = [:]
+    /// clicked, and on a wide table each of those is seconds of DuckDB work — and it is the claim
+    /// token `applyProfile` checks, so a result whose claim was dropped (`applyStaged`/`unstage`
+    /// revoking the job mid-flight) lands nowhere.
+    ///
+    /// **`id` is what `applyProfile` compares, not `openedAt`, and that is a fix rather than a
+    /// detail.** Revocation does not reopen the table, so the replacement job registers under the
+    /// SAME `openedAt` — a generation comparison therefore matched the *replacement's*
+    /// registration, accepted the revoked job's result, and deleted the replacement's claim, so the
+    /// correct profile that arrived moments later was itself thrown away and the stale one stayed
+    /// cached for the life of the table. `openedAt` stays in the tuple because it is what decides
+    /// COALESCING: a table closed and reopened under the same name is a different table, and a
+    /// caller for the new one must never be joined onto the old one's job.
+    var profileJobs: [String: (id: Int, openedAt: Int, task: Task<[ColumnProfile], Error>)] = [:]
+    /// Source of `profileJobs`' `id`. Monotonic, never reused — the `stageJobSeq` shape, for the
+    /// same reason: an identity that a later job cannot accidentally wear.
+    var nextProfileJobID = 0
 
     // Staging job state (Staging.swift owns every method that touches these; they live here
     // because Swift extensions cannot add stored properties).
@@ -678,6 +691,17 @@ public actor Session {
 
     // MARK: - close / shutdown
 
+    /// **Does not cancel an in-flight profile, on purpose (and it is waste, not incorrectness).**
+    /// Closing a tab on a wide file leaves its `SUMMARIZE` burning a connection and a thread for a
+    /// table nobody can see — seconds of it. Not fixed, because there is no cheap version: the job
+    /// is a synchronous `duckdb_query` inside a detached task, so `Task.cancel()` cannot touch it;
+    /// stopping it for real means `StageJob`'s interrupt hammer (a real `Thread` re-asserting
+    /// `duckdb_interrupt` at ~5 kHz around a non-`Sendable` `Connection`, plus a window that must
+    /// be closed on every exit path — review N1's bug) for a job with nothing to publish. Clearing
+    /// `profileJobs[name]` here without actually stopping the work would be worse than useless: it
+    /// would retire the claim `applyProfile`'s reopen guard exists to be checked against, so the
+    /// one thing standing between a stale profile and a reopened table would stop being reachable
+    /// — and stop being testable — while the SUMMARIZE kept running anyway.
     public func closeTable(_ name: String) async throws {
         let t = try table(name)
         // Before the `defer` below registers, so a refused close removes nothing: a merge view is

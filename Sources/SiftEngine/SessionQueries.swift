@@ -100,20 +100,53 @@ extension Session {
     /// What changed is that awaiting suspends, which releases the actor: paging, a second open,
     /// and every `apply*` callback now run *during* a profile instead of behind it.
     ///
-    /// MEASURED, and the whole reason for the detour: run on the actor, the two queries below hold
-    /// it for ~1.29 s on a 200-column × 200,000-row table (~0.12 s at 20 × 200k), because nothing
-    /// in them suspends. The UI kicks a profile as soon as the first page has rendered, so on a
-    /// wide file that was the user's first scroll stalling for over a second — spec §13a's
-    /// page-latency cliff in a second location. The numbers, before and after, are in
-    /// `.superpowers/sdd/2026-08-09-siftengine/profile-detach-report.md`.
+    /// MEASURED (`ProfileBenchTests.benchActorHoldDuringAProfile`, `SIFT_PROFILE_BENCH=1`), and the
+    /// whole reason for the detour: run on the actor, the two queries below hold it for **6.4-7.4 s
+    /// on a 200-column × 200,000-row table**, because nothing in them suspends — so the worst
+    /// `table()` call during a profile measured **7228 ms**. Detached, the same probe measures
+    /// 0.1 ms for `table()` and 181-266 ms for a real `page()`. (An earlier version of this comment
+    /// claimed ~1.29 s: that number came from the DuckDB CLI and excluded chunk decoding, which is
+    /// most of the cost. The bench is the number.) The UI kicks a profile as soon as the first page
+    /// has rendered, so on a wide file that was the user's first scroll stalling for seconds — spec
+    /// §13a's page-latency cliff in a second location.
     ///
     /// A caller that does NOT want to wait (the UI's speculative kick after the first page) wraps
     /// this in its own `Task` and never awaits it; the coalescing in `profileJob(for:)` means that
     /// kick and a panel's `profileOf` moments later share one `SUMMARIZE` rather than paying twice.
+    ///
+    /// **The loop is the awaited half of the generation guard, and it is not decoration.** `rel`
+    /// (below, in `profileJob`) is a bare quoted NAME for a plain table — so the job's SQL is
+    /// `SUMMARIZE "x"`, resolved when the query RUNS, not when it was launched. Detaching the work
+    /// made a `closeTable` able to interleave, so a job launched for one file can execute against
+    /// whatever was reopened under that name. `applyProfile` refuses such a result for the CACHE;
+    /// nothing refused it for the RETURN VALUE, and REPRODUCED before this loop existed: a
+    /// `profileOf` awaiting a 120 × 40,000 file's profile returned the 30-row file reopened under
+    /// the same name (`n=30`), while the cache correctly held nothing. So the task's return value
+    /// is never used here — `applyProfile` is the single authority on whether a result belongs to
+    /// the table now open under this name, and this reads back only what it accepted. A caller
+    /// whose table moved therefore gets the CURRENT table's profile (the panels ask by name; the
+    /// name is the identity the whole engine uses), or a clean "no open table" error if it is gone.
+    ///
+    /// Bounded rather than `while true`: a normal profile costs two passes (compute, then read the
+    /// cache), and every extra pass means a claim was revoked or the generation moved underneath
+    /// this call — each of which has exactly one producer per event (`applyStaged`/`unstage`
+    /// re-profile once, `openPath` bumps the generation once). Five is far past any real sequence
+    /// of those, and an error beats spinning for a table someone is churning.
     public func computeProfile(_ name: String) async throws -> [ColumnProfile] {
-        let t = try table(name)
-        if let profile = t.profile { return profile }
-        return try await profileJob(for: t).value
+        for _ in 0..<5 {
+            let t = try table(name)
+            if let profile = t.profile { return profile }
+            do {
+                _ = try await profileJob(for: t).value
+            } catch {
+                // A job that failed BECAUSE the table changed underneath it — its
+                // `profileExtraSQL` names columns the relation no longer has — must not become the
+                // caller's error: the table under this name is perfectly profilable, this job just
+                // was not about it. Only a failure for the table still open is the caller's.
+                guard tables[name]?.openedAt != t.openedAt else { throw error }
+            }
+        }
+        throw SessionError("'\(name)' kept changing while its profile was being computed.")
     }
 
     /// The in-flight profile for this exact open of this table, started if there isn't one.
@@ -140,6 +173,11 @@ extension Session {
         let spec = t.spec
         let rel = relation(t)
         let uncastable = t.uncastable ?? [:]
+        // This job's identity, and the only thing `applyProfile` accepts a result on. Issued here,
+        // before the task exists, so the claim it registers below cannot be confused with a
+        // replacement registered under the same `openedAt` after a revocation.
+        nextProfileJobID += 1
+        let jobID = nextProfileJobID
         // Everything the work needs is copied out here, as `Sendable` values. `Connection` is not
         // `Sendable` and is created inside the task, never handed to it — and emphatically not
         // `pagingConnection`, whose safety rests on every one of its users running to completion on
@@ -147,14 +185,14 @@ extension Session {
         let task = Task.detached { [self] in
             do {
                 let profile = try runProfile(spec: spec, rel: rel, uncastable: uncastable)
-                await applyProfile(name, profile, openedAt: openedAt)
+                await applyProfile(name, profile, jobID: jobID, openedAt: openedAt)
                 return profile
             } catch {
-                await applyProfile(name, nil, openedAt: openedAt)
+                await applyProfile(name, nil, jobID: jobID, openedAt: openedAt)
                 throw error
             }
         }
-        profileJobs[name] = (openedAt, task)
+        profileJobs[name] = (jobID, openedAt, task)
         return task
     }
 
@@ -196,19 +234,27 @@ extension Session {
     /// argument included, for the same reason they have it: a background result is applied by a
     /// small, fast, actor-isolated method, never by the background task itself.
     ///
-    /// **The registry check is a claim token, and the `openedAt` half of it is the fix for a real
-    /// bug shape this branch has already shipped once** (a background row count applied by table
-    /// NAME reported 3,000,000 rows for a 10-row file). A table closed and reopened under the same
-    /// name is a different table; a profile computed for the old one describes the wrong columns of
-    /// the wrong file. `applyStaged`/`unstage` drop the entry outright for the same reason — the
-    /// copy they just published means a profile computed against what the name USED to point at is
-    /// no longer about this table either. Both cases land here as "no claim, drop the result".
+    /// **Two independent guards, and they reject different things — see `Session.profileJobs`.**
     ///
-    /// `profiling` stays `true` on a dropped result on purpose: the only two things that drop a
-    /// claim from under a live table both re-profile immediately afterward, so the flag reads as
-    /// "a profile is still owed", and the replacement job clears it.
-    func applyProfile(_ name: String, _ profile: [ColumnProfile]?, openedAt: Int) {
-        guard profileJobs[name]?.openedAt == openedAt else { return }
+    /// 1. `profileJobs[name]?.id == jobID` — *this* job still holds the claim. `applyStaged` and
+    ///    `unstage` revoke a job by dropping the entry, because the copy they just published means
+    ///    a profile computed against what the name USED to point at is no longer about this table.
+    ///    Compared on the job's ID, never on its generation: revocation does not reopen the table,
+    ///    so the replacement registers under the same `openedAt` and a generation comparison
+    ///    accepted the revoked result AND deleted the replacement's claim, permanently caching the
+    ///    stale profile it was supposed to reject.
+    /// 2. `t.openedAt == openedAt` — the table has not been closed and reopened under this name.
+    ///    Reachable independently of (1) precisely because `closeTable` does NOT clear
+    ///    `profileJobs`: the old job is still the claim holder afterwards, so (1) waves it through
+    ///    and only this rejects it. This is the profile-shaped form of a bug this branch has
+    ///    already shipped once — a background row count applied by table NAME reported 3,000,000
+    ///    rows for a 10-row file.
+    ///
+    /// `profiling` stays `true` on a dropped result on purpose: every caller of `computeProfile`
+    /// retries against the current table when its result was dropped, so the flag reads as "a
+    /// profile is still owed", and the replacement job clears it.
+    func applyProfile(_ name: String, _ profile: [ColumnProfile]?, jobID: Int, openedAt: Int) {
+        guard profileJobs[name]?.id == jobID else { return }
         profileJobs.removeValue(forKey: name)
         guard var t = tables[name], t.openedAt == openedAt else { return }
 

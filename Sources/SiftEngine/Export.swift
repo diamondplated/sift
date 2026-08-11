@@ -46,8 +46,8 @@ import SiftCore
 // actor-isolated method making a synchronous C call, so a large COPY freezes paging for its full
 // duration either way. That is a branch-wide tradeoff, not something special about export — the
 // design spec's §13a page-latency cliff, which `page` and `runSQL` also accept by design.
-// `computeProfile` is the one case measured unacceptable (~1.29 s on a 200-column table) and is
-// being detached onto its own connection separately.
+// `computeProfile` is the one case measured unacceptable (6.4-7.4 s on a 200-column × 200,000-row
+// table, holding the actor for all of it) and has been detached onto its own connection.
 
 // MARK: - the format table
 

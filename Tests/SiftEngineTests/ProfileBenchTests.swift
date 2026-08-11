@@ -4,7 +4,13 @@ import DuckDBKit
 @testable import SiftCore
 @testable import SiftEngine
 
-// TEMPORARY measurement harness — folded into ProfileTests.swift before the commit.
+// The measurement harness behind `computeProfile`'s detach, kept as its own file and OFF by
+// default (`SIFT_PROFILE_BENCH=1` to run it). It builds a 200-column × 200,000-row fixture and
+// prints timings; it is not a unit test and must never join the ~30 s parallel suite.
+//
+// Reference numbers on this code: `computeProfile` alone 6.4-7.4 s, worst `table()` while
+// profiling 0.1 ms, worst `page()` 181-266 ms. Before the detach, worst `table()` was 7228 ms —
+// which is the whole point, and the number to re-measure before touching the detach.
 
 private func benchHome() -> String {
     FileManager.default.temporaryDirectory

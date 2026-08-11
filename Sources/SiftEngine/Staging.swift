@@ -337,9 +337,11 @@ extension Session {
         }
         t.profile = nil                  // re-profile against the native table
         // And revoke any profile already in flight: it is reading the VIEW this rename just
-        // replaced, so its answer is about what the name used to point at. `applyProfile` treats a
-        // missing registry entry as "no claim" and drops the result; `runStage` kicks a fresh
-        // profile against the copy immediately below.
+        // replaced, so its answer is about what the name used to point at. Dropping the entry
+        // drops the claim, and `applyProfile` accepts a result only from the job whose ID is still
+        // registered — which is why that guard compares IDs and not `openedAt`: this revocation
+        // does not reopen the table, so the replacement `runStage` kicks immediately below
+        // registers under the very same generation.
         profileJobs.removeValue(forKey: name)
         // After staging the table is materialized, so its own count is now authoritative and
         // already excludes the rows `ignore_errors` dropped at parse time.
