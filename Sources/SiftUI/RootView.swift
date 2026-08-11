@@ -59,10 +59,15 @@ private struct TableRows: View {
                     }
                 }
                 Divider()
-                ForEach(model.firstPage.indices, id: \.self) { row in
+                // One block, straight out of the cache. Task 6's `NSTableView` is what turns
+                // `scrollExtent` into a real scroll bar; until then this draws the rows that are
+                // there and nothing where they are not.
+                ForEach(0..<min(model.scrollExtent, pageRows), id: \.self) { row in
                     HStack(spacing: 16) {
-                        ForEach(model.columns.indices, id: \.self) { column in
-                            cell(model.firstPage[row][column], model.columns[column])
+                        if case .loaded(let cells) = model.rowSlot(at: row) {
+                            ForEach(model.columns.indices, id: \.self) { column in
+                                cell(cells[column], model.columns[column])
+                            }
                         }
                     }
                 }

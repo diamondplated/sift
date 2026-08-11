@@ -12,21 +12,16 @@ import Testing
 
 @MainActor
 @Test func openingACSVPutsItInTheCatalogAndReadsItsFirstPage() async throws {
-    let dir = tempDir()
-    let path = try makeCSV(in: dir, rows: 12)
-
-    let state = AppState(session: try Session(home: tempHome()))
-    await state.open(path: path)
+    let (state, model) = try await openedFixture(rows: 12)
 
     #expect(state.banner == nil)
     #expect(state.tables.count == 1)
     #expect(state.activeName == state.tables[0].name)
     #expect(state.active?.name == state.tables[0].name)
 
-    let model = try #require(state.model(for: state.tables[0].name))
-    try await model.loadFirstPage()
     #expect(model.columns.map(\.name) == ["id", "label", "note"])
-    #expect(model.firstPage.count == 12)
+    #expect(model.scrollExtent == 12)
+    #expect(model.rowSlot(at: 0) != .pending)
 }
 
 /// `Session.state()` sorts by `openedAt` (it used to return `Array(tables.values)`, i.e. Swift
@@ -155,24 +150,25 @@ import Testing
 /// (the ONE renderer, shared with the CLI) turns them into three distinct strings.
 @MainActor
 @Test func nullEmptyAndNAStayThreeDifferentThings() async throws {
-    let dir = tempDir()
-    let state = AppState(session: try Session(home: tempHome()))
-    await state.open(path: try makeCSV(in: dir, rows: 12))
-    let name = try #require(state.activeName)
-    let model = try #require(state.model(for: name))
-    try await model.loadFirstPage()
+    let (_, model) = try await openedFixture(rows: 12)
 
     let note = try #require(model.columns.firstIndex(where: { $0.name == "note" }))
-    #expect(model.firstPage[0][note] == .null)
-    #expect(model.firstPage[1][note] == .text(""))
-    #expect(model.firstPage[2][note] == .text("N/A"))
+    let rows: [[Cell]] = try (0..<3).map { row in
+        guard case .loaded(let cells) = model.rowSlot(at: row) else {
+            throw SessionError("row \(row) never loaded")
+        }
+        return cells
+    }
+    #expect(rows[0][note] == .null)
+    #expect(rows[1][note] == .text(""))
+    #expect(rows[2][note] == .text("N/A"))
 
     let kind = model.columns[note].kind
     // Module-qualified since Task 3: `SiftUI.glyph(for:kind:)` has the same argument labels and
     // returns a `CellGlyph`, so a bare call here is ambiguous. This one wants the ENGINE's strings —
     // the point of the assertion is that the shared renderer, the one the CLI also calls, keeps the
     // three states apart. `CellGlyphTests` covers the UI-side routing separately.
-    let glyphs = (0..<3).map { SiftEngine.glyph(for: model.firstPage[$0][note], kind: kind) }
+    let glyphs = (0..<3).map { SiftEngine.glyph(for: rows[$0][note], kind: kind) }
     #expect(glyphs == [nullGlyph, emptyStringGlyph, "N/A"])
     #expect(Set(glyphs).count == 3)
 }

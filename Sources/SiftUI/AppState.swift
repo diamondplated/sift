@@ -1,7 +1,4 @@
-import DuckDBKit
-import Foundation
 import Observation
-import SiftCore
 import SiftEngine
 import SwiftUI
 
@@ -109,39 +106,4 @@ public final class AppState {
     }
 
     public func stopPolling() { pollTask?.cancel(); pollTask = nil }
-}
-
-// TASK 5 replaces this.
-//
-// Everything one open table needs *for Task 1 only*: the columns and the first page, so the crude
-// grid in RootView has something to draw. Task 5 replaces it outright with the real thing (page
-// cache, extent, spec, panels) — do not grow it here, and do not leave two.
-@MainActor
-@Observable
-public final class TableViewModel {
-    public let name: String
-    /// The catalog's latest copy of this table, pushed in by `AppState.refresh()`. The single
-    /// authority for `profiling`, `counting`, `rowCount` and the rest — no mirrored copies.
-    public private(set) var table: SiftEngine.Table
-    public private(set) var columns: [Column] = []
-    public private(set) var firstPage: [[Cell]] = []
-
-    private let session: Session
-
-    public init(session: Session, table: SiftEngine.Table) {
-        self.session = session
-        self.name = table.name
-        self.table = table
-    }
-
-    public func apply(_ table: SiftEngine.Table) { self.table = table }
-
-    public func loadFirstPage() async throws {
-        let page = try await session.page(name, offset: 0, limit: pageRows)
-        // `TablePage.ColumnInfo`'s memberwise init is internal, so it cannot be stored or rebuilt
-        // out here; `SiftCore.Column` has a public one and recomputes `kind` through the same
-        // `kind(of:)` the engine used, so the value is identical.
-        columns = page.columns.map { Column(name: $0.name, type: $0.type) }
-        firstPage = page.rows
-    }
 }

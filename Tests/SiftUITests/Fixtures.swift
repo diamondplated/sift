@@ -1,5 +1,8 @@
 import Foundation
+import Testing
 import TestSupport
+import SiftEngine
+@testable import SiftUI
 
 // A test target cannot see another test target's files (SwiftPM test targets don't export to one
 // another — see Tests/SiftEngineTests/Fixtures.swift's header for the same trade-off made twice
@@ -53,4 +56,38 @@ func waitFor(
         try? await Task.sleep(nanoseconds: 20_000_000)
     }
     return await MainActor.run(body: condition)
+}
+
+/// The same wait, but *refreshing* between polls — for anything only the engine knows, which
+/// reaches the mirror through `AppState.refresh()`. Bounded, so a hang is a failure rather than a
+/// wedged suite. Not `startPolling()`: the poll loop's own cadence would put seconds into every
+/// test that waits on background work.
+@MainActor
+func waitForCatalog(
+    _ state: AppState, _ what: String, _ timeout: Double = 12, _ condition: @MainActor () -> Bool
+) async {
+    let deadline = Date().addingTimeInterval(timeout)
+    while Date() < deadline {
+        await state.refresh()
+        if condition() { return }
+        try? await Task.sleep(nanoseconds: 20_000_000)
+    }
+    Issue.record("timed out waiting for \(what)")
+}
+
+/// Opens a generated CSV and returns the state and its view model, with the exact count already in
+/// and the first page loaded. Every test that asserts on the extent uses this, so none of them race
+/// the detached post-open count.
+@MainActor
+func openedFixture(rows: Int, name: String = "t.csv") async throws -> (AppState, TableViewModel) {
+    let path = try makeCSV(in: tempDir(), name: name, rows: rows)
+    let state = AppState(session: try Session(home: tempHome()))
+    await state.open(path: path)
+    let opened = try #require(state.activeName)
+    await waitForCatalog(state, "\(opened)'s exact row count") {
+        state.tables.first { $0.name == opened }?.rowsAreExact == true
+    }
+    let model = try #require(state.model(for: opened))
+    try await model.loadFirstPage()
+    return (state, model)
 }
