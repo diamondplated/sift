@@ -13,7 +13,15 @@
 /// **Generic over `Payload`** so the tests can drive it with plain `[[Cell]]`. `TablePage` has no
 /// public initializer, so a test cannot build one; the app uses `PageLoader<TablePage>`.
 @MainActor
-public final class PageLoader<Payload> {
+// `Payload: Sendable` because the fetch's *result* crosses a task boundary — the pump awaits
+// `fetch(block)` and hands what comes back to `onDeliver`. This Mac's compiler accepts the
+// unconstrained form; the macOS 15 CI runner rejects it outright ("non-sendable result type
+// 'Payload' cannot be sent from nonisolated context in call to async function"), and the runner
+// is the oracle. Note this is the RESULT, not the closure: `Fetch` stays deliberately
+// non-`@Sendable` (see its own comment) because the closure itself never leaves the MainActor.
+// Both real payloads already qualify — `TablePage` comes back from an actor, and `[[Cell]]` is
+// what the suite drives it with.
+public final class PageLoader<Payload: Sendable> {
     /// Not `@Sendable`, deliberately. The closure is stored on a `@MainActor` type, called only
     /// from the MainActor, and never crosses an isolation boundary — so the annotation buys
     /// nothing, and it costs every caller that captures a `var` (which is every test here):
