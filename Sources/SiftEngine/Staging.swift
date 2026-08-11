@@ -15,12 +15,24 @@ import SiftCore
 //
 // CONNECTION STRATEGY: the CTAS runs on its OWN `Connection`, created inside the detached task
 // that runs it, and never on `pagingConnection`. That is not a preference — `pagingConnection` is
-// safe as a single long-lived non-`Sendable` connection only because every one of its users runs
-// to completion on the actor's serial executor without suspending (Session.swift's header, fact
-// 3), and a multi-second CTAS on it would both break that proof and freeze every page request
-// behind it. The two places below that DO touch `pagingConnection` (`applyStaged`, `unstage`)
-// only drop a materialized-sort TEMP TABLE, which is visible ONLY to the connection that created
-// it, and they do it synchronously with no `await` in between.
+// safe as a single long-lived non-`Sendable` connection only because no user ever SUSPENDS between
+// acquiring it and finishing with it (Session.swift's header, fact 3), and a multi-second CTAS on
+// it would both break that proof and freeze every page request behind it.
+//
+// THREE places in this file DO touch `pagingConnection` — half of its six users, which is why
+// fact 3 names them:
+//
+//   * `applyStaged` — drops the stale materialized-sort TEMP TABLE the swap orphaned;
+//   * `unstage` — drops the same thing, going the other way;
+//   * `finishStage` — drops the VIEW of a table closed while its job was in flight. **A VIEW, not
+//     a TEMP TABLE**, so it is on `pagingConnection` for a different reason from the other two:
+//     not visibility, but that it is a synchronous drop already running on the actor with a
+//     connection in hand. (An earlier version of this note listed two of the three and described
+//     all of them as TEMP-TABLE drops.)
+//
+// All three run their statement with no suspension point between acquiring the connection and
+// finishing with it. `unstage` is `async` and does `await` — but only after, on `computeProfile`,
+// which is the exact shape fact 3 now spells out as permitted.
 
 // MARK: - a staging job's cancel half
 

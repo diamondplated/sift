@@ -19,18 +19,34 @@ import SiftCore
 //      pipeline, and `runProfile` each take their own throwaway `Connection` — the direct analogue
 //      of Python's `con.cursor()` for one-shot work. `Connection` is deliberately not `Sendable`
 //      and never crosses a task boundary: profiling's is created *inside* its detached task.
-//   3. `page`, `sortedRelation` and `closeTable` share ONE long-lived `Connection`
-//      (`pagingConnection`), for as long as the `Session` exists, instead of opening a fresh one
-//      per call. This is not a stylistic choice — MEASURED (see `sortedRelation`'s doc comment):
-//      a `CREATE TEMP TABLE` created on one `duckdb_connect()` connection is invisible to a
-//      `SELECT` on a different one, even against the same file, so a materialized sort must be
-//      read back through the SAME connection that created it across however many `page()` calls
-//      follow. Safe to share despite `Connection` not being `Sendable`: none of `page`,
-//      `sortedRelation` or `closeTable` ever awaits anything (verified by reading them — every
-//      DuckDB call inside is synchronous), so the actor's serial executor guarantees exactly one
-//      of them runs at a time and `pagingConnection` never sees two callers at once. `openPath`'s
-//      initial half and `_after_open`'s background pipeline still open a fresh `Connection` each
-//      time (fact 2) — they never touch a materialized sort, so they have no reason to share one.
+//   3. SIX methods share ONE long-lived `Connection` (`pagingConnection`), for as long as the
+//      `Session` exists, instead of opening a fresh one per call. In this file: `page`,
+//      `sortedRelation`, `closeTable`. In Staging.swift: `applyStaged` (drops a stale
+//      materialized-sort TEMP TABLE), `finishStage` (drops the VIEW of a table closed mid-job),
+//      and `unstage` (drops a materialized-sort TEMP TABLE).
+//
+//      Sharing is not a stylistic choice — MEASURED (see `sortedRelation`'s doc comment): a
+//      `CREATE TEMP TABLE` created on one `duckdb_connect()` connection is invisible to a `SELECT`
+//      on a different one, even against the same file. So a materialized sort must be read back
+//      through the SAME connection that created it across however many `page()` calls follow, and
+//      a DROP of one must go through that connection too — which is why the three in Staging.swift
+//      are on this list at all.
+//
+//      🔴 **THE INVARIANT IS PER-USE, NOT PER-METHOD, AND ONE OF THE SIX IS `async`.** `Connection`
+//      is not `Sendable`; what makes sharing safe is that no user ever SUSPENDS between acquiring
+//      the connection and finishing with it, so the actor's serial executor guarantees exactly one
+//      caller is inside at a time. All six were re-checked line by line and all six hold. But
+//      `unstage` IS `async` and DOES `await` — `computeProfile`, immediately after it is done with
+//      the connection — so "none of these methods awaits anything" (what an earlier version of
+//      this fact said, about three methods it thought were all of them) is simply false, and a
+//      reader who believed it would not know what they were preserving. **The rule to preserve:
+//      you may `await` in one of these methods, but never between `pagingConnection.…` and the
+//      last statement that depends on it.** A new user of `pagingConnection` must be added to this
+//      list and checked against that rule.
+//
+//      `openPath`'s initial half and `_after_open`'s background pipeline still open a fresh
+//      `Connection` each time (fact 2) — they never touch a materialized sort, so they have no
+//      reason to share one.
 //
 // `Session` is an `actor`; it owns the catalog. `openPath`'s initial work and `page` run directly
 // on the actor — both are meant to be interactive-latency, matching Python running them in the

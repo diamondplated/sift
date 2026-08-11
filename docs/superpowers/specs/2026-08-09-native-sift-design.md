@@ -572,11 +572,16 @@ and `.decimal(1.5, scale: 3)` are **not** equal, while two spellings of the same
 value at the same scale are.
 
 **`Session.page` blocks the whole actor while it materializes a sort — Plan 4 (grid) needs
-to plan a spinner around it.** `page`, `sortedRelation` and `closeTable` deliberately
-share one long-lived `Connection` (`SiftEngine/Session.swift` fact 3) rather than one
-per call, because a materialized sort (`TEMP TABLE`) is visible only to the connection
-that created it. That sharing is safe only because those three methods never suspend —
-which also means the first sorted page over a large table (materializing up to
+to plan a spinner around it.** SIX methods deliberately share one long-lived `Connection`
+(`SiftEngine/Session.swift` fact 3) rather than one per call, because a materialized sort
+(`TEMP TABLE`) is visible only to the connection that created it: `page`, `sortedRelation`
+and `closeTable` in `Session.swift`, plus `applyStaged`, `finishStage` and `unstage` in
+`Staging.swift`. (Corrected 2026-08-11, engine whole-plan review finding 5: this entry, and
+`Session.swift`'s own fact 3, named only the first three.) That sharing is safe only because
+no user ever **suspends between acquiring the connection and finishing with it** — which is
+the real invariant, and not the same as "these methods never suspend": `unstage` is `async`
+and does `await`, after it is done with the connection. It also means the first sorted page
+over a large table (materializing up to
 `sortMaterializeMax`, 5,000,000 rows) blocks every other actor call for however long
 that takes: opening a second source, switching to another open table, and every
 in-flight background scan's result all wait. Python ran this in a threadpool, where only
