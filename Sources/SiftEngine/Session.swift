@@ -277,8 +277,24 @@ public actor Session {
         )
     }
 
+    /// 🔴 **LANDMINE, sorted rather than `Array(tables.values)`.** This list IS the tab bar's
+    /// order, the sources list's order, and the default selection: `web/index.html` renders it
+    /// into the tabs (:945) and the sources list (:974), and picks `tables[0]` (:526, :993).
+    /// Python iterates an insertion-ordered dict (`session.py:1187-1189`), so that order is the
+    /// order the user opened the files in, every launch.
+    ///
+    /// A Swift `Dictionary` has no iteration order at all. MEASURED across three processes opening
+    /// the same eight files in the same order: `delta_x bravo golf alpha echo…`, then
+    /// `foxtrot alpha charlie delta_x…`, then `bravo golf foxtrot echo…` — never open order, and
+    /// different every launch. This is the same silent order loss `joinCandidates` (Joins.swift)
+    /// and `exportFormats` (Export.swift) already carry LANDMINE comments about; this was the call
+    /// site nobody checked.
+    ///
+    /// `openedAt` is exactly the right key and it already existed: monotonic, never reused, and
+    /// stamped by both writers of the catalog (`openPath` and `merge`). A closed-and-reopened
+    /// table therefore sorts to the END, which is where the user just put it.
     public func state() -> SessionState {
-        SessionState(tables: Array(tables.values), engine: engineInfo())
+        SessionState(tables: tables.values.sorted { $0.openedAt < $1.openedAt }, engine: engineInfo())
     }
 
     /// Not `private`: Export.swift reports the bytes it just wrote with this, rather than a

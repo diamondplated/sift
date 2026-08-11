@@ -218,6 +218,51 @@ private func gzip(_ sourcePath: String, to destPath: String) throws {
     #expect(Set(state.tables.map(\.name)) == ["clean", "clean_2"])
 }
 
+// MARK: - state() is in OPEN order, not Dictionary order
+
+/// 🔴 The tab bar's order, the sources list's order, and which table is selected on launch all
+/// come straight off `state().tables` — `web/index.html` renders it into the tab bar (:945) and
+/// the sources list (:974), and picks `tables[0]` as the default selection (:526, :993). Python
+/// iterates an insertion-ordered dict (`session.py:1187`), so that is the file's own open order,
+/// every time.
+///
+/// `Array(tables.values)` is not. MEASURED across three processes opening the same eight files in
+/// the same order: `delta_x bravo golf alpha echo…`, then `foxtrot alpha charlie delta_x…`, then
+/// `bravo golf foxtrot echo…` — never open order, and different every launch. This engine already
+/// carries LANDMINE comments about exactly this hazard for `joinCandidates` (Joins.swift) and
+/// `exportFormats` (Export.swift); `state()` is the call site nobody checked.
+///
+/// `openedAt` is the fix and it already existed: a monotonic per-open counter, never reused, that
+/// `merge` also stamps. Eight tables, a close, and two more opens — so a sort that merely happened
+/// to agree with insertion order cannot pass, and neither can one keyed on the name.
+@Test func stateListsTablesInTheOrderTheyWereOpened() async throws {
+    let session = try newSession()
+    let names = ["alpha", "bravo", "charlie", "delta_x", "echo", "foxtrot", "golf", "hotel"]
+    for name in names { _ = try await session.openPath(sharedData.cleanCSV, name: name) }
+
+    // A close plus two later opens: `india` and `juliet` must land AFTER `hotel`, and the reopened
+    // `charlie` must move to the end rather than back to its original slot — which is what makes
+    // this a test of `openedAt` rather than of "some stable order".
+    try await session.closeTable("charlie")
+    _ = try await session.openPath(sharedData.cleanCSV, name: "india")
+    _ = try await session.openPath(sharedData.cleanCSV, name: "charlie")
+    _ = try await session.openPath(sharedData.cleanCSV, name: "juliet")
+
+    let listed = await session.state().tables
+    #expect(
+        listed.map(\.name) == [
+            "alpha", "bravo", "delta_x", "echo", "foxtrot", "golf", "hotel",
+            "india", "charlie", "juliet",
+        ],
+        "got \(listed.map(\.name))"
+    )
+    // The property behind the order, stated directly: whatever the names are, the generations rise.
+    #expect(
+        zip(listed, listed.dropFirst()).allSatisfy { $0.openedAt < $1.openedAt },
+        "openedAt must increase down the list: \(listed.map(\.openedAt))"
+    )
+}
+
 // MARK: - a fresh session's engine info
 
 @Test func aFreshSessionOwnsTheSharedStore() throws {
