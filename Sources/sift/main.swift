@@ -27,9 +27,12 @@ case .verify:
     print("\n" + renderSummary(report))
     exit(report.exitCode)
 
-case .open(let path, let sheet, let rows, let width):
+case .open(let path, let sheet, let rows, let width, let nullPadding, let skipPreamble):
     do {
-        let overview = try await openAndDescribe(path: path, sheet: sheet, rows: rows)
+        let overview = try await openAndDescribe(
+            path: path, sheet: sheet, rows: rows,
+            nullPadding: nullPadding, skipPreamble: skipPreamble
+        )
         print(renderOverview(overview, width: width))
     } catch {
         // Every engine error already spells one clean sentence (SiftCore's `SiftError`); printing

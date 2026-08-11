@@ -1257,11 +1257,14 @@ public struct FileOverview: Sendable {
 /// `home` defaults to the real `~/.sift` (or `$SIFT_HOME`), because this is a user-facing command
 /// and a staged copy it adopts or leaves behind is a feature. Tests pass an explicit one.
 public func openAndDescribe(
-    path: String, sheet: String? = nil, rows: Int = 10, home: String? = nil
+    path: String, sheet: String? = nil, rows: Int = 10, home: String? = nil,
+    nullPadding: Bool = false, skipPreamble: Bool = true
 ) async throws -> FileOverview {
     let started = DispatchTime.now()
     let session = try Session(home: home)
-    let t = try await session.openPath(path, sheet: sheet)
+    let t = try await session.openPath(
+        path, sheet: sheet, nullPadding: nullPadding, skipPreamble: skipPreamble
+    )
     let page = try await session.page(t.name, offset: 0, limit: max(0, rows))
     // 🔴 THE WAIT IS THE POINT. "Your file lost 12 rows" is this product's headline claim, and it
     // is produced by a detached background scan that had not run yet when `openPath` returned —
@@ -1482,7 +1485,10 @@ func trimTrailing(_ s: String) -> String {
 public enum SiftCommand: Sendable, Equatable {
     case help
     case verify
-    case open(path: String, sheet: String?, rows: Int, width: Int)
+    case open(
+        path: String, sheet: String?, rows: Int, width: Int,
+        nullPadding: Bool, skipPreamble: Bool
+    )
     /// The arguments made no sense. Carries the sentence to print before the usage text.
     case usageError(String)
 }
@@ -1492,12 +1498,21 @@ public let siftUsage = """
 
     Usage:
       sift <path> [--sheet NAME] [--rows N] [--width N]
+                  [--null-padding | --no-skip-preamble]
       sift --verify
       sift --help
 
       --sheet NAME   which sheet of a workbook to open (default: the first non-empty one)
       --rows N       rows to preview (default: 10)
       --width N      terminal width to lay the grid out for (default: 100)
+
+    When a note says the file lost its shape, these are the two ways back. They
+    cannot be combined \u{2014} pinning the skip is what defeats null padding:
+
+      --null-padding      read rows with more fields than the header, instead of
+                          collapsing the whole file into one column
+      --no-skip-preamble  keep the leading lines the sniffer wanted to discard,
+                          when discarding them left no rows at all
     """
 
 public func parseArguments(_ args: [String]) -> SiftCommand {
@@ -1514,6 +1529,8 @@ public func parseArguments(_ args: [String]) -> SiftCommand {
     var sheet: String?
     var rows = 10
     var width = 100
+    var nullPadding = false
+    var skipPreamble = true
 
     var i = 0
     while i < args.count {
@@ -1547,6 +1564,10 @@ public func parseArguments(_ args: [String]) -> SiftCommand {
                 return .usageError("--width needs a whole number of at least 20")
             }
             width = n
+        case "--null-padding":
+            nullPadding = true
+        case "--no-skip-preamble":
+            skipPreamble = false
         default:
             if name.hasPrefix("-") { return .usageError("unknown option \(name)") }
             guard path == nil else { return .usageError("sift opens one file at a time") }
@@ -1556,5 +1577,14 @@ public func parseArguments(_ args: [String]) -> SiftCommand {
     }
 
     guard let path else { return .usageError("no file to open") }
-    return .open(path: path, sheet: sheet, rows: rows, width: width)
+    // Rejected here rather than at the engine, so the user gets the usage text with it. The
+    // engine refuses the same pair too (Session.openPath): pinning `skip` is exactly what
+    // defeats `null_padding`, so accepting both would silently do neither.
+    guard !(nullPadding && !skipPreamble) else {
+        return .usageError("--null-padding and --no-skip-preamble cannot be combined")
+    }
+    return .open(
+        path: path, sheet: sheet, rows: rows, width: width,
+        nullPadding: nullPadding, skipPreamble: skipPreamble
+    )
 }

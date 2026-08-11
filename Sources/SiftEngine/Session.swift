@@ -404,7 +404,25 @@ public actor Session {
 
     // MARK: - open
 
-    public func openPath(_ path: String, name: String? = nil, sheet: String? = nil) async throws -> Table {
+    /// `nullPadding` and `skipPreamble` are the two escape hatches from a sniff that went wrong,
+    /// and each exists because a note tells the user to reach for it: `nullPadding` recovers the
+    /// columns of a file whose rows have inconsistent field counts, `skipPreamble: false` recovers
+    /// the rows of a file whose preamble ate it.
+    ///
+    /// They are ALTERNATIVES, not combinable, and asking for both silently gets neither: pinning
+    /// `skip` is exactly what defeats `null_padding` (measured — an explicit `skip=0` looks like a
+    /// no-op, because it is the sniffer's own answer handed back, and restores the collapse). The
+    /// combination throws rather than quietly doing half of what was asked.
+    public func openPath(
+        _ path: String, name: String? = nil, sheet: String? = nil,
+        nullPadding: Bool = false, skipPreamble: Bool = true
+    ) async throws -> Table {
+        guard !(nullPadding && !skipPreamble) else {
+            throw SessionError(
+                "Null padding and skipping no preamble cannot be combined — pinning the skip is "
+                    + "what defeats null padding. Pick one."
+            )
+        }
         let expanded = (path.trimmingCharacters(in: .whitespacesAndNewlines) as NSString).expandingTildeInPath
         let resolved = realPath(expanded)
         guard FileManager.default.fileExists(atPath: resolved) else {
@@ -424,7 +442,10 @@ public actor Session {
         let spec: SourceSpec
         do {
             let con = try database.connect()
-            spec = try buildSource(con, path: resolved, sheet: sheet)
+            spec = try buildSource(
+                con, path: resolved, sheet: sheet,
+                nullPadding: nullPadding, skipPreamble: skipPreamble
+            )
         } catch let error as UnsupportedSource {
             throw SessionError(error.message)
         } catch let error as LegacyXls {

@@ -334,20 +334,49 @@ private func newHome() -> String {
 // MARK: - 2c. argument parsing
 
 @Test func parseArgumentsReadsAPathAndItsOptionsInBothSpellings() {
-    #expect(parseArguments(["data.csv"]) == .open(path: "data.csv", sheet: nil, rows: 10, width: 100))
+    #expect(parseArguments(["data.csv"]) == .open(path: "data.csv", sheet: nil, rows: 10, width: 100, nullPadding: false, skipPreamble: true))
     #expect(
         parseArguments(["--rows", "3", "data.csv", "--sheet", "Q1 2024", "--width", "60"])
-            == .open(path: "data.csv", sheet: "Q1 2024", rows: 3, width: 60)
+            == .open(path: "data.csv", sheet: "Q1 2024", rows: 3, width: 60, nullPadding: false, skipPreamble: true)
     )
     #expect(
         parseArguments(["--rows=3", "--width=60", "--sheet=Q1", "data.csv"])
-            == .open(path: "data.csv", sheet: "Q1", rows: 3, width: 60)
+            == .open(path: "data.csv", sheet: "Q1", rows: 3, width: 60, nullPadding: false, skipPreamble: true)
     )
     // A path that starts with a dash is not a thing here, but one containing "=" is fine.
     #expect(
         parseArguments(["/tmp/a=b/data.csv"])
-            == .open(path: "/tmp/a=b/data.csv", sheet: nil, rows: 10, width: 100)
+            == .open(path: "/tmp/a=b/data.csv", sheet: nil, rows: 10, width: 100, nullPadding: false, skipPreamble: true)
     )
+}
+
+/// The two escape hatches the sniffer notes tell the user to reach for. Each note names one, so
+/// a flag that parsed and did nothing would be the same defect the note exists to report.
+@Test func parseArgumentsCarriesTheTwoWaysBackFromABadSniff() {
+    #expect(
+        parseArguments(["ragged.csv", "--null-padding"])
+            == .open(
+                path: "ragged.csv", sheet: nil, rows: 10, width: 100,
+                nullPadding: true, skipPreamble: true
+            )
+    )
+    #expect(
+        parseArguments(["prose.csv", "--no-skip-preamble"])
+            == .open(
+                path: "prose.csv", sheet: nil, rows: 10, width: 100,
+                nullPadding: false, skipPreamble: false
+            )
+    )
+    // Refused here rather than at the engine so the usage text comes with it — and refused at
+    // all because pinning the skip is exactly what defeats null padding, so honouring both
+    // would silently honour neither. Session.openPath throws on the same pair.
+    if case .usageError(let message) = parseArguments(
+        ["f.csv", "--null-padding", "--no-skip-preamble"]
+    ) {
+        #expect(message.contains("cannot be combined"))
+    } else {
+        Issue.record("the two escape hatches must not be combinable")
+    }
 }
 
 @Test func parseArgumentsRecognisesHelpAndVerify() {
