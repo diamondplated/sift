@@ -22,6 +22,7 @@ let package = Package(
         .library(name: "DuckDBKit", targets: ["DuckDBKit"]),
         .library(name: "SiftCore", targets: ["SiftCore"]),
         .library(name: "SiftEngine", targets: ["SiftEngine"]),
+        .library(name: "SiftUI", targets: ["SiftUI"]),
         .executable(name: "sift", targets: ["sift"]),
     ],
     targets: [
@@ -68,6 +69,24 @@ let package = Package(
         .testTarget(
             name: "SiftEngineTests",
             dependencies: ["SiftEngine", "SiftCore", "DuckDBKit", "TestSupport"]
+        ),
+        // The whole view layer, and every decision in it. No linkerSettings, for the same reason
+        // SiftEngine has none: DuckDBKit's rpath flags propagate transitively, and repeating them
+        // emits `ld: warning: duplicate -rpath`.
+        .target(
+            name: "SiftUI",
+            dependencies: ["SiftEngine", "SiftCore", "DuckDBKit"]
+        ),
+        .testTarget(
+            name: "SiftUITests",
+            dependencies: ["SiftUI", "SiftEngine", "SiftCore", "DuckDBKit", "TestSupport"]
+        ),
+        // Thin by construction: a test target cannot import an executableTarget, so this holds
+        // @main, the menu bar, the toolbar and LaunchServices plumbing — nothing with a decision
+        // in it. Everything else is in SiftUI.
+        .executableTarget(
+            name: "SiftApp",
+            dependencies: ["SiftUI", "SiftEngine", "SiftCore"]
         ),
         // The headless verification surface, and the reason browser mode could be deleted. Kept
         // deliberately thin — a test target cannot import an `executableTarget`, so everything it
