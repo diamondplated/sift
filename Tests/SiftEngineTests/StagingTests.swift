@@ -937,6 +937,12 @@ private struct ConnectionBox: @unchecked Sendable {
         try await waitForStaged(first, t.name)
         try await waitForCatalog(first, count: 1)
         try await first.closeTable(t.name)
+        // REQUIRED, not incidental (Plan 4 Task 2): since `Session.init` refuses a second live
+        // session on one home, the second open below succeeds only if the first has released its
+        // claim — and scope exit alone does not guarantee that. `openPath` spawns a `Task.detached`
+        // that retains the actor, so the closing brace may not be where `first` is deallocated.
+        // This is the "quit" this test is about, made explicit.
+        await first.shutdown()
     }   // released: the store is now just a file on disk, as it would be after a quit
 
     try "order_id,region,amount,note\n1,West,1.50,note 1\n".write(

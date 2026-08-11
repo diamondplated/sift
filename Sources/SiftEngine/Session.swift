@@ -98,6 +98,12 @@ public struct SessionError: SiftError, Equatable {
 // MARK: - Session
 
 public actor Session {
+    /// Every `SIFT_HOME` a live `Session` in this process is holding. See `OpenHomes` for what two
+    /// of them on one home actually do to each other, and `init`'s refusal below.
+    static let openHomes = OpenHomes()
+    /// This session's identity in `openHomes`. `nonisolated let` so `deinit` can read it.
+    nonisolated let claimToken = UUID()
+
     public nonisolated let siftHome: String
     public nonisolated let dbPath: String
     /// `false` once a second engine has been found holding the shared store's lock — see `init`.
@@ -180,65 +186,95 @@ public actor Session {
 
     public init(home: String? = nil) throws {
         let resolvedHome = Self.resolveHome(home)
-        try Self.ensureHomeDirectory(resolvedHome)
-        Self.sweepPrivateStores(in: resolvedHome)
-
-        // DuckDB takes an exclusive lock on the database file, so only one engine can own the
-        // shared staged-data store — usually right, it is one user's cache. Browser mode (the
-        // reason a second engine used to show up routinely) is gone, but `open -n` can still
-        // start a second instance, and that must not turn into an opaque lock error at launch:
-        // fall back to a private, per-PID store this instance deletes on exit (`dropPrivateStore`).
-        let sharedPath = (resolvedHome as NSString).appendingPathComponent("stage.duckdb")
-        var path = sharedPath
-        var shared = true
-        let db: Database
+        // Read once into a local: the failure path below needs it while `self` is still only
+        // partly initialized, and it must be the SAME value `deinit` will release with.
+        let token = claimToken
+        // 🔴 Spec §13a. Two `Database` handles on one file in this process are two independent
+        // DuckDB instances with no shared catalog, and the second one's flush overwrites the
+        // first one's — silently, with no lock error anywhere (which is why `sharedStore` below
+        // reports `true` for both and protects nothing). Refusing is the only thing that stops it.
+        guard Self.openHomes.claim(resolvedHome, token: token) else {
+            throw SessionError(
+                "Another Sift session in this process is already using \(resolvedHome). Two "
+                    + "engines on one home are two independent DuckDB instances that cannot see "
+                    + "each other's catalog, so the second one's writes would silently overwrite "
+                    + "the first one's — refusing rather than corrupting the staged-data store."
+            )
+        }
+        // A throwing initializer runs no `deinit` — nothing here is fully initialized when it
+        // throws — so every failure path past the claim has to hand the home back explicitly.
         do {
-            db = try Database(path: sharedPath)
-        } catch let error as DuckDBError where error.message.lowercased().contains("lock") {
-            let pid = ProcessInfo.processInfo.processIdentifier
-            path = (resolvedHome as NSString).appendingPathComponent("stage-\(pid).duckdb")
-            shared = false
+            try Self.ensureHomeDirectory(resolvedHome)
+            Self.sweepPrivateStores(in: resolvedHome)
+
+            // DuckDB takes an exclusive lock on the database file, so only one engine can own the
+            // shared staged-data store — usually right, it is one user's cache. Browser mode (the
+            // reason a second engine used to show up routinely) is gone, but `open -n` can still
+            // start a second instance, and that must not turn into an opaque lock error at launch:
+            // fall back to a private, per-PID store this instance deletes on exit
+            // (`dropPrivateStore`). Cross-process only: the in-process case never reaches here,
+            // because the claim above already refused it.
+            let sharedPath = (resolvedHome as NSString).appendingPathComponent("stage.duckdb")
+            var path = sharedPath
+            var shared = true
+            let db: Database
             do {
-                db = try Database(path: path)
+                db = try Database(path: sharedPath)
+            } catch let error as DuckDBError where error.message.lowercased().contains("lock") {
+                let pid = ProcessInfo.processInfo.processIdentifier
+                path = (resolvedHome as NSString).appendingPathComponent("stage-\(pid).duckdb")
+                shared = false
+                do {
+                    db = try Database(path: path)
+                } catch let error as DuckDBError {
+                    throw SessionError(error.firstLine)
+                }
+                FileHandle.standardError.write(Data((
+                    "sift: another Sift engine holds \(sharedPath), so this one is using a private "
+                        + "store at \(path) (staged data will not persist)\n"
+                ).utf8))
+            } catch let error as DuckDBError {
+                // Anything that is NOT the lock — a store that is a directory, a corrupt file, a
+                // permission refusal. This is the very first thing the CLI and the app call, and
+                // the app's `presentFatal` puts `localizedDescription` straight into an alert body.
+                throw SessionError(error.firstLine)
+            }
+
+            self.siftHome = resolvedHome
+            self.dbPath = path
+            self.sharedStore = shared
+            self.database = db
+
+            db.harden()
+            db.loadExtensions(sessionExtensions)
+
+            let con: Connection
+            do {
+                con = try db.connect()
+                try con.execute(catalogDDL)
             } catch let error as DuckDBError {
                 throw SessionError(error.firstLine)
             }
-            FileHandle.standardError.write(Data((
-                "sift: another Sift engine holds \(sharedPath), so this one is using a private "
-                    + "store at \(path) (staged data will not persist)\n"
-            ).utf8))
-        } catch let error as DuckDBError {
-            // Anything that is NOT the lock — a store that is a directory, a corrupt file, a
-            // permission refusal. This is the very first thing the CLI and the app call, and the
-            // app's `presentFatal` puts `localizedDescription` straight into an alert body.
-            throw SessionError(error.firstLine)
+            // Before anything reads the catalog: a store written by an older build has a
+            // differently keyed catalog holding tokens this build cannot interpret. See
+            // `migrateCatalog`.
+            Self.migrateCatalog(con)
+            // Python's `self.purge_staged(reason="startup")`. Nothing is open yet, so the "never
+            // yank a table out from under an open tab" rule is trivially satisfied — this is where
+            // a copy that aged out, blew the budget, or no longer matches its source gets
+            // collected. `try?`: a store that cannot be purged must not stop the engine starting.
+            _ = try? Self.purgeStagedTables(con, open: [], tables: nil, all: false)
+            self.pagingConnection = con
+        } catch {
+            Self.openHomes.release(resolvedHome, token: token)
+            throw error
         }
-
-        self.siftHome = resolvedHome
-        self.dbPath = path
-        self.sharedStore = shared
-        self.database = db
-
-        db.harden()
-        db.loadExtensions(sessionExtensions)
-
-        let con: Connection
-        do {
-            con = try db.connect()
-            try con.execute(catalogDDL)
-        } catch let error as DuckDBError {
-            throw SessionError(error.firstLine)
-        }
-        // Before anything reads the catalog: a store written by an older build has a differently
-        // keyed catalog holding tokens this build cannot interpret. See `migrateCatalog`.
-        Self.migrateCatalog(con)
-        // Python's `self.purge_staged(reason="startup")`. Nothing is open yet, so the "never yank
-        // a table out from under an open tab" rule is trivially satisfied — this is where a copy
-        // that aged out, blew the budget, or no longer matches its source gets collected.
-        // `try?`: a store that cannot be purged must not stop the engine from starting.
-        _ = try? Self.purgeStagedTables(con, open: [], tables: nil, all: false)
-        self.pagingConnection = con
     }
+
+    /// The other half of `init`'s claim. Runs whether or not `shutdown()` was called, and is a
+    /// no-op if it was — `release` compares the token, so a session that already handed its home
+    /// over cannot take it back off whoever holds it now.
+    deinit { Self.openHomes.release(siftHome, token: claimToken) }
 
     // MARK: - setup helpers
 
@@ -871,7 +907,11 @@ public actor Session {
         // waiting: the job's own `.stale` repair drops whatever it finds under the name.
     }
 
+    /// Hands the home back before anything else: after this call another `Session` may legitimately
+    /// open it, and this one's later `deinit` must not take it away again (`release` compares the
+    /// token, so it cannot).
     public func shutdown() {
+        Self.openHomes.release(siftHome, token: claimToken)
         dropPrivateStore()
     }
 

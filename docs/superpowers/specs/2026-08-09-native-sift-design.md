@@ -514,26 +514,46 @@ once. Covered by `DecodeTests.swift`'s `jsonColumnReportsTypeNameJSON` (paired w
 `plainVarcharColumnStillReportsTypeNameVARCHAR` so the alias read can't just always
 return `"JSON"`).
 
-**Two `Session`s on one home silently corrupt each other — Plan 4 (the UI is what would
-construct the second).** Measured 2026-08-09 during Plan 3 Task 6's review, independently by
-two reviewers. Two `DuckDBKit.Database` handles opened on the same file *in one process* are
-two independent DuckDB instances that cannot see each other's catalog: A inserts and
-checkpoints, A sees 2, **B still sees 1**; B then inserts and has written its version over A's
-file. Not a shared store with a coordination problem — two uncoordinated writers on one file,
-last flush wins. Observed directly: `sharedStore a=true b=true; b sees a's table=0; a sees b's
-table=0`.
+**Two `Session`s on one home silently corrupt each other — CLOSED 2026-08-09, Plan 4 Task 2.**
+Measured 2026-08-09 during Plan 3 Task 6's review, independently by two reviewers. Two
+`DuckDBKit.Database` handles opened on the same file *in one process* are two independent DuckDB
+instances that cannot see each other's catalog: A inserts and checkpoints, A sees 2, **B still
+sees 1**; B then inserts and has written its version over A's file. Not a shared store with a
+coordination problem — two uncoordinated writers on one file, last flush wins. Observed
+directly: `sharedStore a=true b=true; b sees a's table=0; a sees b's table=0`.
 
-The `sharedStore` fallback does **not** protect against this. It fires only on a DuckDB *lock*
+The `sharedStore` fallback did **not** protect against this. It fires only on a DuckDB *lock*
 error, and there is no lock error in-process — which is precisely why both sessions above
-report `sharedStore=true`. The guard written for the cross-process case is silently inert for
+report `sharedStore=true`. The guard written for the cross-process case was silently inert for
 the in-process one, and the per-PID `stage-<pid>.duckdb` fallback is consequently only ever
 reachable across processes.
 
-Nothing constructs two `Session`s today — the app builds exactly one. It becomes live the
-moment a second exists on the same home: a multi-window or "new session" path, a preferences
-change that rebuilds the engine, or a test suite that opens two on one home. **Plan 4 must not
-add a second window without closing this first.** The fix is small — a process-wide set of open
-home paths in `Session.init` that either throws or hands back the existing `Database`.
+Fixed by refusing the second open. `Sources/SiftEngine/OpenHomes.swift` is a process-wide
+registry of the `SIFT_HOME` paths a live `Session` holds; `Session.init` claims the resolved
+home immediately after resolving it and throws a `SessionError` naming the store if the claim
+fails. Nothing hands back the existing `Database` — a shared handle would need the whole catalog
+and paging-connection contract to become re-entrant, and refusing is what actually cannot
+corrupt anything.
+
+**The registry stores a UUID per path, not a bool, and that is the load-bearing part.** `release`
+is called from BOTH `shutdown()` and `deinit`, and those straddle a legitimate hand-over: A shuts
+down, B claims the same home, then A deallocates. A path-keyed release cannot tell that the entry
+it is about to remove now belongs to B, so A's `deinit` would free B's home and let a third
+session in alongside it — the corruption the guard exists to stop, reintroduced by the normal
+lifecycle. `Session` carries a `nonisolated let claimToken = UUID()` and `release(_:token:)`
+removes an entry only when the token matches. `init`'s failure path releases explicitly, because
+a throwing initializer runs no `deinit`.
+
+Covered by `Tests/SiftEngineTests/OpenHomesTests.swift`: the second live session is refused; a
+home is claimable again after `shutdown()`; two different homes both open; a deallocated
+session's `deinit` cannot release the claim it handed over (the token test — deleting the
+comparison turns it red); a session dropped *without* `shutdown()` still hands its home back (the
+control that stops the token test passing for the wrong reason); and a failed open leaves no
+claim behind for the next attempt to trip over. `StagingTests.aFreshSessionCollectsWhatTheLast`
+`OneLeftStale` — the one existing test that deliberately opens two sessions on one home, across a
+simulated restart — keeps its shared home and gained an explicit `await first.shutdown()`:
+`openPath` spawns a `Task.detached` that retains the actor, so scope exit alone never guaranteed
+the release.
 
 **`loadedExtensions[name] == false` conflates two failures — Plan 4 (reassigned 2026-08-11).** A legal name with
 no such extension installed, and a name rejected by the injection guard, both record
