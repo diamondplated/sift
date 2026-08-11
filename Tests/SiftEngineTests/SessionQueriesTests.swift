@@ -138,6 +138,7 @@ private func makeUniqueIntCSV(dir: String, count: Int) throws -> String {
     // against the real table below and can still genuinely overshoot.
     let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString).path
     try FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(atPath: dir) }
     let path = try makeUniqueIntCSV(dir: dir, count: 300)
 
     let session = try newSession()
@@ -335,6 +336,7 @@ private func hugeCSVSpec(like spec: SourceSpec) -> SourceSpec {
     // the sample, and the later row does not fit it.
     let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString).path
     try FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(atPath: dir) }
     let plain = try makeCSV(dir: dir, name: "dirty.csv", rows: 25_000, badIntRow: 21_000)
     let gz = (dir as NSString).appendingPathComponent("dirty.csv.gz")
     try gzip(plain, to: gz)

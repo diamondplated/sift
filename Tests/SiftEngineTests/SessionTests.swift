@@ -131,6 +131,10 @@ private func gzip(_ sourcePath: String, to destPath: String) throws {
     // and `ignore_errors` silently drops the one later row that does not fit it.
     let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString).path
     try FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+    // Removed afterwards, per ProfileGenerationTests' own measured rule: the two 25,000-row
+    // dirty-CSV tests leaked ~1 MB per run each into the user's temp directory and were
+    // MEASURED at 74,683 orphaned directories / 24 GB, which filled the disk on 2026-08-11.
+    defer { try? FileManager.default.removeItem(atPath: dir) }
     let plain = try makeCSV(dir: dir, name: "dirty.csv", rows: 25_000, badIntRow: 21_000)
     let gz = (dir as NSString).appendingPathComponent("dirty.csv.gz")
     try gzip(plain, to: gz)
