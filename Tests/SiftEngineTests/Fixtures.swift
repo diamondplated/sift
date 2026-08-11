@@ -42,14 +42,19 @@ func siftCoreTestsFixture(_ name: String) -> String {
 
 // MARK: - CSV
 
-/// Write a CSV and return its path. Trimmed from SiftCoreTests' `makeCSV`: only the knobs
-/// SourceProbeTests actually uses (rows, delim, crlf, bom, preamble, badIntRow, quotedNewlineRow)
-/// — always headered, never ragged, no null/empty/nullish sentinels, matching the Python
-/// fixtures those tests read (clean_csv, semi_csv, weird_csv, dirty_csv, qnl_csv).
+/// Write a CSV and return its path. Trimmed from SiftCoreTests' `makeCSV`: only the knobs the
+/// tests in this target actually use — always headered, never ragged, matching the Python fixtures
+/// they read (clean_csv, semi_csv, weird_csv, dirty_csv, qnl_csv, nulls_csv).
+///
+/// `nullsEvery`/`emptiesEvery`/`nullishEvery` were absent until Task 9, which needs `nulls_csv` for
+/// the ported `test_null_and_empty_are_separate_rows`. They are copied verbatim from SiftCoreTests'
+/// version, including the order in which the three can overwrite one another on the same row and
+/// the `!= 0` guards (Python's `n and i % n == 0` treats 0 as "disabled"; `i % 0` traps in Swift).
 func makeCSV(
     dir: String, name: String = "sales.csv", rows: Int = 1000, delim: String = ",",
     crlf: Bool = false, bom: Bool = false, preamble: Int = 0,
-    badIntRow: Int? = nil, quotedNewlineRow: Int? = nil
+    badIntRow: Int? = nil, quotedNewlineRow: Int? = nil,
+    nullsEvery: Int? = nil, emptiesEvery: Int? = nil, nullishEvery: Int? = nil
 ) throws -> String {
     let path = join(dir, name)
     let eol = crlf ? "\r\n" : "\n"
@@ -62,10 +67,13 @@ func makeCSV(
     }
     out += ["order_id", "region", "amount", "note"].joined(separator: delim) + eol
     for i in 0..<rows {
-        let region = regions[i % regions.count]
+        var region = regions[i % regions.count]
+        if let ne = nullsEvery, ne != 0, i % ne == 0 { region = "" }   // unquoted empty reads as NULL
         var amount = "\(i).50"
         if let bir = badIntRow, i == bir { amount = "N/A" }
         var note = "note \(i)"
+        if let ee = emptiesEvery, ee != 0, i % ee == 0 { note = "\"\"" }   // quoted empty, not NULL
+        if let nie = nullishEvery, nie != 0, i % nie == 0 { note = "N/A" }
         if let qnr = quotedNewlineRow, i == qnr { note = "\"line one\(eol)line two\"" }
         let fields = [String(i), region, amount, note]
         out += fields.joined(separator: delim) + eol
@@ -221,6 +229,9 @@ struct FixtureCorpus: Sendable {
     let dir: String
     let cleanCSV: String
     let dirtyCSV: String
+    /// conftest.py's `nulls_csv`: NULLs in `region`, quoted empty strings and "N/A" sentinels in
+    /// `note` — the three flavours of missing, kept apart. DistinctTests needs all three.
+    let nullsCSV: String
     let semiCSV: String
     let weirdCSV: String
     let quotedNLCSV: String
@@ -243,6 +254,10 @@ func corpus() throws -> FixtureCorpus {
         dir: dir,
         cleanCSV: try makeCSV(dir: dir, name: "clean.csv", rows: 1000),
         dirtyCSV: try makeCSV(dir: dir, name: "dirty.csv", rows: 1000, badIntRow: 500),
+        nullsCSV: try makeCSV(
+            dir: dir, name: "nulls.csv", rows: 600,
+            nullsEvery: 7, emptiesEvery: 11, nullishEvery: 13
+        ),
         semiCSV: try makeCSV(dir: dir, name: "semi.csv", rows: 200, delim: ";"),
         weirdCSV: try makeCSV(dir: dir, name: "weird.csv", rows: 300, crlf: true, bom: true, preamble: 3),
         quotedNLCSV: try makeCSV(dir: dir, name: "qnl.csv", rows: 400, quotedNewlineRow: 100),
