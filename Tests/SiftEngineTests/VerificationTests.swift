@@ -159,8 +159,9 @@ private func newHome() -> String {
     let names = Set(verificationChecks.map(\.name))
     for required in [
         "open csv", "open parquet", "open json", "open ndjson", "open xlsx", "open delta",
-        "open folder", "profile", "distinct panel", "SELECT-only gate", "staging and unstaging",
-        "merge", "export",
+        "open folder", "profile", "distinct panel", "histogram panel",
+        "sample and length panels", "dropped rows", "snippet and rendered SQL",
+        "SELECT-only gate", "staging and unstaging", "merge", "export",
     ] {
         #expect(names.contains(required), "the \u{201C}\(required)\u{201D} check has gone missing")
     }
@@ -275,7 +276,8 @@ private func newHome() -> String {
     let columns = [column("id", "BIGINT")]
     let exact = renderOverview(FileOverview(
         path: "/tmp/a.csv", table: "a", format: "csv", rows: 1200, rowsExact: true,
-        rowsBasis: nil, notes: [], columns: columns, preview: [[.int(1)]], milliseconds: 1
+        rowsBasis: nil, droppedRows: 0, droppedCells: 0, notes: [], columns: columns,
+        preview: [[.int(1)]], milliseconds: 1
     ))
     // Thousands-grouped through the same public rule the cells go through — the third consumer
     // of a rule that used to exist privately twice.
@@ -285,8 +287,8 @@ private func newHome() -> String {
 
     let estimated = renderOverview(FileOverview(
         path: "/tmp/a.csv", table: "a", format: "csv", rows: 1200, rowsExact: false,
-        rowsBasis: "3x256KiB sample, no quote characters seen", notes: ["a note"],
-        columns: columns, preview: [[.int(1)]], milliseconds: 1
+        rowsBasis: "3x256KiB sample, no quote characters seen", droppedRows: 0, droppedCells: 0,
+        notes: ["a note"], columns: columns, preview: [[.int(1)]], milliseconds: 1
     ))
     #expect(estimated.contains("~1,200 rows"))
     #expect(estimated.contains("estimate: 3x256KiB sample, no quote characters seen"))
@@ -294,10 +296,33 @@ private func newHome() -> String {
 
     let counting = renderOverview(FileOverview(
         path: "/tmp/a.csv", table: "a", format: "csv", rows: nil, rowsExact: false,
-        rowsBasis: nil, notes: [], columns: columns, preview: [], milliseconds: 1
+        rowsBasis: nil, droppedRows: 0, droppedCells: 0, notes: [], columns: columns,
+        preview: [], milliseconds: 1
     ))
     #expect(counting.contains("counting rows\u{2026}"))
     #expect(counting.contains("(no rows)"))
+}
+
+/// The dropped-row line is printed on EVERY open, including the clean case, and a scan that did
+/// not finish must not be reported as a clean one. Before this, a file that lost 12 rows showed
+/// the survivors and said nothing — the product's headline claim going silent.
+@Test func everyOverviewSaysWhetherRowsWereDropped() {
+    func overview(_ dropped: Int?, _ cells: Int) -> String {
+        renderOverview(FileOverview(
+            path: "/tmp/a.csv", table: "a", format: "csv", rows: 1200, rowsExact: true,
+            rowsBasis: nil, droppedRows: dropped, droppedCells: cells, notes: [],
+            columns: [column("id", "BIGINT")], preview: [[.int(1)]], milliseconds: 1
+        ))
+    }
+    #expect(overview(0, 0).contains("no rows dropped"))
+    #expect(overview(1, 1).contains("1 row dropped \u{2014} 1 cell would not cast"))
+    #expect(overview(12, 30).contains("12 rows dropped \u{2014} 30 cells would not cast"))
+    // Thousands-grouped through the same rule as everything else, and never through a Double.
+    #expect(overview(1_234_567, 2_000).contains("1,234,567 rows dropped \u{2014} 2,000 cells"))
+    // The third state, and the one that must never be spelled as either of the other two.
+    let unknown = overview(nil, 0)
+    #expect(unknown.contains("dropped rows: not known"))
+    #expect(!unknown.contains("no rows dropped"))
 }
 
 @Test func renderSchemaListsNameTypeAndKindPerColumn() {
@@ -438,8 +463,14 @@ private func newHome() -> String {
     #expect(overview.preview.count == 4)
     #expect(overview.preview.map { $0[0].display } == ["0", "1", "2", "3"])
 
+    // The dropped-row accounting is waited for, not skipped: 0 here, and printed as a sentence
+    // rather than left as silence a reader cannot distinguish from "never checked".
+    #expect(overview.droppedRows == 0)
+    #expect(overview.droppedCells == 0)
+
     let rendered = renderOverview(overview)
     #expect(rendered.contains("sales \u{2014} csv \u{2014} 40 rows"))
+    #expect(rendered.contains("no rows dropped"))
     #expect(rendered.contains("showing 4 of 40 rows"))
 }
 
@@ -457,7 +488,12 @@ private func newHome() -> String {
 
     // A folder source has NO row count when `openPath` returns — `buildSource` has nothing free to
     // read (unlike a parquet footer) and the exact count runs in the detached background pipeline.
-    // Deterministic, not a race: `openAndDescribe` reads the snapshot `openPath` returned.
+    // Since Task 9 `openAndDescribe` WAITS for that pipeline (it has to, to report dropped rows),
+    // so the count normally arrives from it. The short-page fallback this test is named for is now
+    // the backstop for the two cases where it does not: the scan times out, or `exactCount` itself
+    // throws and `applyCount` lands a `nil`. Either way a page that came back short of the 50 rows
+    // asked for IS the whole file, and printing "counting rows…" over a preview that already shows
+    // every row reads as broken. Both paths produce the same answer here, which is the point.
     let overview = try await openAndDescribe(path: folder, rows: 50, home: home)
     #expect(overview.format == "glob_csv")
     #expect(overview.preview.count == 10)
@@ -519,6 +555,18 @@ func deltaOpensAndHonoursTombstones() async throws { try await withWorkspace(che
 }
 @Test func theDistinctPanelCountsAndFacets() async throws {
     try await withWorkspace(checkDistinctPanel)
+}
+@Test func theHistogramPanelCoversEveryRowAndNamesTheDegenerateCase() async throws {
+    try await withWorkspace(checkHistogramPanel)
+}
+@Test func theSampleAndLengthPanelsReportRealValues() async throws {
+    try await withWorkspace(checkSmallPanels)
+}
+@Test func droppedRowsAreCountedAndSaidOutLoud() async throws {
+    try await withWorkspace(checkDroppedRows)
+}
+@Test func theRenderedSQLAndEverySnippetDialectAreProduced() async throws {
+    try await withWorkspace(checkSnippetAndRenderedSQL)
 }
 @Test func theSelectOnlyGateRefusesEverythingItShould() async throws {
     try await withWorkspace(checkSelectOnlyGate)

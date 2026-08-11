@@ -240,6 +240,10 @@ let verificationChecks: [VerificationCheck] = [
     VerificationCheck(name: "open folder", run: checkOpenFolder),
     VerificationCheck(name: "profile", run: checkProfile),
     VerificationCheck(name: "distinct panel", run: checkDistinctPanel),
+    VerificationCheck(name: "histogram panel", run: checkHistogramPanel),
+    VerificationCheck(name: "sample and length panels", run: checkSmallPanels),
+    VerificationCheck(name: "dropped rows", run: checkDroppedRows),
+    VerificationCheck(name: "snippet and rendered SQL", run: checkSnippetAndRenderedSQL),
     VerificationCheck(name: "SELECT-only gate", run: checkSelectOnlyGate),
     VerificationCheck(name: "staging and unstaging", run: checkStagingRoundTrip),
     VerificationCheck(name: "merge", run: checkMerge),
@@ -460,6 +464,178 @@ let verificationChecks: [VerificationCheck] = [
     let page = try await session.page(t.name, offset: 0, limit: 500)
     try requireEqual(page.rows.count, 125, "filtered rows in the grid")
     try requireEqual(page.total.value, 125, "filtered total")
+}
+
+@Sendable func checkHistogramPanel(_ ws: Workspace) async throws {
+    let path = try writeSalesCSV(ws.path("sales.csv"), rows: 500)
+    let session = try ws.session()
+    let t = try await session.openPath(path)
+
+    let h = try await session.histogram(t.name, col: "order_id", bins: 10)
+    try require(!h.degenerate, "a 0..499 column read as degenerate: \(h.reason ?? "")")
+    try requireEqual(h.bins, 10, "bins")
+    try requireEqual(h.nNull, 0, "nulls reported alongside the histogram")
+    try requireEqual(h.buckets.reduce(0) { $0 + $1.n }, 500, "rows covered by the buckets")
+    try require(
+        h.buckets.allSatisfy { (0..<10).contains($0.b) },
+        "a bucket index escaped 0..<10: \(h.buckets.map(\.b))"
+    )
+    // `least(bins - 1, ...)` exists so max(value) lands in the last bucket and not a phantom
+    // bucket N. Without it the top row falls off the chart.
+    try requireEqual(h.buckets.map(\.b).max(), 9, "highest bucket index")
+    // Bucket edges are derived from lo/step, so bucket 0 starts at the bottom of the range.
+    try require(h.buckets.first?.lo == h.lo, "the first bucket does not start at lo")
+
+    // A single-valued column has no range to bin, and the panel has to SAY so rather than draw
+    // one enormous bar or an empty chart the user reads as "no data".
+    let flat = try writeConstantCSV(ws.path("flat.csv"), rows: 50)
+    let ft = try await session.openPath(flat)
+    let degenerate = try await session.histogram(ft.name, col: "v")
+    try require(degenerate.degenerate, "a single-valued column did not report degenerate")
+    try require(degenerate.reason != nil, "a degenerate histogram must say why")
+    try require(degenerate.buckets.isEmpty, "a degenerate histogram invented \(degenerate.buckets.count) buckets")
+}
+
+@Sendable func checkSmallPanels(_ ws: Workspace) async throws {
+    let path = try writeSalesCSV(ws.path("sales.csv"), rows: 500)
+    let session = try ws.session()
+    let t = try await session.openPath(path)
+
+    let sample = try await session.sampleValues(t.name, col: "note", limit: 20)
+    try requireEqual(sample.count, 20, "sampled values")
+    try require(!sample.contains { $0.isNull }, "the sample invented a NULL")
+    try require(
+        sample.allSatisfy { $0.display.hasPrefix("note ") },
+        "a sampled value did not come from the note column: \(sample.map(\.display))"
+    )
+    // A panel nobody asked for failing is not an error the user must see — Python swallows it and
+    // so does this, which is a deliberate contract and therefore worth pinning.
+    try requireEqual(try await session.sampleValues(t.name, col: "nope").count, 0, "sample of an unknown column")
+
+    let lengths = try await session.lengthHistogram(t.name, col: "note")
+    try requireEqual(lengths.reduce(0) { $0 + $1.n }, 500, "rows covered by the length histogram")
+    // "note 0" .. "note 499" is 6, 7 and 8 characters, and the buckets come back in length order.
+    try requireEqual(lengths.map(\.len), [6, 7, 8], "note lengths, in order")
+    try requireEqual(try await session.lengthHistogram(t.name, col: "nope").count, 0, "lengths of an unknown column")
+}
+
+// MARK: the rows your file lost
+
+/// The product's headline claim, end to end: a file whose rows really are being dropped must say
+/// so — through the engine's own accounting, through the bad-rows panel, and out of `sift <path>`.
+@Sendable func checkDroppedRows(_ ws: Workspace) async throws {
+    // 25,000 rows with one uncastable `amount` at row 21,000, gzipped. The compression is
+    // load-bearing, not incidental: an UNcompressed CSV under 50 MB is sniffed in full, so DuckDB
+    // widens `amount` to VARCHAR the moment it sees "N/A" and nothing is ever dropped. A compressed
+    // one always samples only the first 20,480 rows, which is the real scenario — the type is
+    // fixed from a sample that never saw the bad value, and `ignore_errors` silently drops the row.
+    let path = try writeDirtyGzipCSV(ws.path("dirty.csv.gz"), rows: 25_000, badRow: 21_000)
+    let session = try ws.session()
+    let t = try await session.openPath(path)
+
+    guard let settled = await waitForOpenScan(session, t.name) else {
+        throw VerifyFailure(message: "the background bad-row scan did not finish within 30s")
+    }
+    try requireEqual(settled.rowCount, 25_000, "physical rows in the file")
+    try requireEqual(settled.badRows, 1, "rows that would not cast")
+    try requireEqual(settled.badCells, 1, "cells that would not cast")
+    try requireEqual(settled.gridRows, 24_999, "rows the grid can actually page")
+
+    let panel = try await session.badRows(t.name)
+    try requireEqual(panel.rows, 1, "rows reported by the bad-rows panel")
+    try requireEqual(panel.cells, 1, "cells reported by the bad-rows panel")
+    try requireEqual(panel.data.count, 1, "bad rows returned")
+    // `bad_columns` names the offending column so the UI can highlight the CELL, not just the row.
+    try requireEqual(panel.data[0][0], Cell.list([.text("amount")]), "bad_columns")
+
+    // And the CLI says it out loud. A second `Session` on the same home would violate this file's
+    // rule 2, so `openAndDescribe` gets its own home inside this workspace's scratch directory —
+    // still removed with everything else when the check ends.
+    let overview = try await openAndDescribe(path: path, rows: 3, home: ws.path("cli-home"))
+    try requireEqual(overview.droppedRows, 1, "dropped rows reported by `sift <path>`")
+    try requireEqual(overview.droppedCells, 1, "dropped cells reported by `sift <path>`")
+    let rendered = renderOverview(overview)
+    try require(
+        rendered.contains("1 row dropped"),
+        "`sift <path>` did not report the dropped row:\n\(rendered)"
+    )
+
+    // The other half of the ruling: a CLEAN file must say "no rows dropped" rather than going
+    // quiet, because silence is indistinguishable from never having checked.
+    let clean = try writeSalesCSV(ws.path("sales.csv"), rows: 200)
+    let cleanOverview = try await openAndDescribe(path: clean, rows: 3, home: ws.path("cli-home-2"))
+    try requireEqual(cleanOverview.droppedRows, 0, "dropped rows on a clean file")
+    try require(
+        renderOverview(cleanOverview).contains("no rows dropped"),
+        "a clean file said nothing about dropped rows:\n\(renderOverview(cleanOverview))"
+    )
+}
+
+// MARK: what the user copies out
+
+@Sendable func checkSnippetAndRenderedSQL(_ ws: Workspace) async throws {
+    let path = try writeSalesCSV(ws.path("sales.csv"), rows: 500)
+    let session = try ws.session()
+    let t = try await session.openPath(path)
+
+    _ = try await session.setSpec(
+        t.name,
+        filters: [Filter(col: "region", op: .inList, values: [.text("West"), .text("South")])],
+        sort: [.init(column: "order_id", direction: .desc)]
+    )
+
+    let sql = try await session.renderedSQL(t.name)
+    for fragment in [
+        "SELECT *", "FROM \"sales\"", "\"region\" IN ('West', 'South')", "ORDER BY \"order_id\" DESC",
+    ] {
+        try require(sql.contains(fragment), "rendered SQL is missing \u{201C}\(fragment)\u{201D}:\n\(sql)")
+    }
+
+    // Every snippet dialect produces something, and the "sql" one is the rendered SQL itself.
+    var snippets: [String: String] = [:]
+    for dialect in ["sql", "duckdb", "pandas", "polars"] {
+        let text = try await session.snippet(t.name, dialect: dialect)
+        try require(!text.isEmpty, "the \(dialect) snippet is empty")
+        snippets[dialect] = text
+    }
+    try requireEqual(snippets["sql"], sql, "the sql snippet and the rendered SQL")
+    // Each library snippet must reach the real file, not the in-engine table name — a snippet the
+    // user pastes into a notebook has no `sales` view to read from.
+    for dialect in ["duckdb", "pandas", "polars"] {
+        try require(
+            snippets[dialect]?.contains(path) == true,
+            "the \(dialect) snippet does not name the source file:\n\(snippets[dialect] ?? "")"
+        )
+    }
+    try require(snippets["pandas"]?.contains("pd.read_csv") == true, "pandas snippet is not a read_csv")
+    try require(snippets["polars"]?.contains("pl.scan_csv") == true, "polars snippet is not a scan_csv")
+
+    // An unknown dialect is a sentence, never a half-written snippet.
+    var rejected = false
+    do {
+        _ = try await session.snippet(t.name, dialect: "excel")
+    } catch is UnknownDialect {
+        rejected = true
+    }
+    try require(rejected, "snippet accepted an unknown dialect")
+
+    // 🔴 The assertion that makes the rest of this worth having: the rendered SQL is display text,
+    // but it must still be SQL that RUNS and returns the same rows the grid is showing. A copy
+    // button that hands the user a query DuckDB rejects is worse than no copy button.
+    let filtered = try await session.page(t.name, offset: 0, limit: 1000)
+    let rerun = try await session.runSQL(t.name, sql: sql, offset: 0, limit: 1000)
+    try requireEqual(rerun.rows.count, 250, "rows from the rendered SQL run back through the engine")
+    try requireEqual(rerun.rows.count, filtered.rows.count, "rendered SQL vs the grid it describes")
+    try requireEqual(
+        rerun.rows.map { $0[0].display }, filtered.rows.map { $0[0].display },
+        "rendered SQL returned different rows, or a different order, than the grid"
+    )
+    _ = try await session.exitSQLMode(t.name)
+    // In SQL mode the snippet must carry the user's own query verbatim rather than a
+    // reconstruction of filters they are no longer looking at.
+    _ = try await session.runSQL(t.name, sql: "SELECT 1 AS one", offset: 0, limit: 1)
+    try requireEqual(try await session.snippet(t.name, dialect: "sql"), "SELECT 1 AS one", "snippet in SQL mode")
+    _ = try await session.exitSQLMode(t.name)
 }
 
 // MARK: the gate
@@ -691,6 +867,36 @@ func writeSalesCSV(_ path: String, rows: Int = 500) throws -> String {
     return path
 }
 
+/// One column, one value, repeated — the degenerate histogram case.
+@discardableResult
+func writeConstantCSV(_ path: String, rows: Int) throws -> String {
+    try ("v\n" + String(repeating: "7\n", count: rows)).write(
+        toFile: path, atomically: true, encoding: .utf8
+    )
+    return path
+}
+
+/// A GZIPPED sales CSV with exactly one uncastable `amount`, placed past the 20,480-row window a
+/// compressed CSV is sniffed from. See `checkDroppedRows` for why the compression is the whole
+/// trick.
+///
+/// Written by DuckDB's own CSV writer rather than by hand: 25,000 rows of Swift string
+/// concatenation plus a gzip is a fixture that costs more than the check, and shelling out to
+/// `/usr/bin/gzip` would put a PATH dependency inside a shipped binary. `amount` is built as
+/// VARCHAR so the one bad row is genuinely text in the file, exactly as a real dirty export has it.
+@discardableResult
+func writeDirtyGzipCSV(_ path: String, rows: Int, badRow: Int) throws -> String {
+    let con = try scratchDatabase().connect()
+    try con.execute(
+        "COPY (SELECT range AS order_id, "
+            + "['West','Midwest','South','Northeast'][(range % 4) + 1] AS region, "
+            + "CASE WHEN range = \(badRow) THEN 'N/A' ELSE range || '.50' END AS amount, "
+            + "'note ' || range AS note "
+            + "FROM range(\(rows))) TO \(qlit(path)) (FORMAT csv, HEADER true, COMPRESSION gzip)"
+    )
+    return path
+}
+
 /// Two columns, ids starting at `from` — one member of a folder read.
 @discardableResult
 func writeSmallCSV(_ path: String, rows: Int, from: Int) throws -> String {
@@ -849,6 +1055,12 @@ public struct FileOverview: Sendable {
     public let rowsExact: Bool
     /// How an inexact count was arrived at ("3x256KiB sample, no quote characters seen").
     public let rowsBasis: String?
+    /// Rows the file lost because a cell would not cast to its sniffed type. `0` means the scan
+    /// ran and found nothing; **`nil` means the scan did not finish in time and nothing is known**
+    /// — the two must never be collapsed, which is the whole reason this is optional.
+    public let droppedRows: Int?
+    /// Cells behind `droppedRows`. One bad row can carry several.
+    public let droppedCells: Int
     public let notes: [String]
     public let columns: [TablePage.ColumnInfo]
     public let preview: [[Cell]]
@@ -866,15 +1078,19 @@ public func openAndDescribe(
     let session = try Session(home: home)
     let t = try await session.openPath(path, sheet: sheet)
     let page = try await session.page(t.name, offset: 0, limit: max(0, rows))
+    // 🔴 THE WAIT IS THE POINT. "Your file lost 12 rows" is this product's headline claim, and it
+    // is produced by a detached background scan that had not run yet when `openPath` returned —
+    // so before this, `sift <path>` printed the surviving rows and said nothing at all about the
+    // missing ones. See `waitForOpenScan` for why it polls rather than reading the flag once.
+    let settled = await waitForOpenScan(session, t.name)
     await session.shutdown()
 
     // A short page at offset 0 IS the end of the table, so the count is exact even though the
-    // background scan has not landed yet. That matters here: `openPath` returns no count at all
-    // for a folder or a Delta table, and printing "counting rows…" above a preview that already
-    // shows the whole file is the kind of thing that reads as broken. This never waits — a file
-    // that filled the page keeps whatever `openPath` knew.
-    var rowCount = t.rowCount
-    var exact = t.rowCount != nil
+    // background scan may have produced nothing. That matters here: `openPath` returns no count at
+    // all for a folder or a Delta table, and printing "counting rows…" above a preview that already
+    // shows the whole file is the kind of thing that reads as broken.
+    var rowCount = settled?.rowCount ?? t.rowCount
+    var exact = rowCount != nil
     if rowCount == nil, rows > 0, page.rows.count < rows {
         rowCount = page.rows.count
         exact = true
@@ -887,11 +1103,36 @@ public func openAndDescribe(
         rows: rowCount ?? t.spec.rowEstimate?.rows,
         rowsExact: exact,
         rowsBasis: exact ? nil : t.spec.rowEstimate?.basis,
-        notes: t.notes,
+        droppedRows: settled.map(\.badRows),
+        droppedCells: settled?.badCells ?? 0,
+        notes: settled?.notes ?? t.notes,
         columns: page.columns,
         preview: page.rows,
         milliseconds: millisecondsSince(started)
     )
+}
+
+/// Poll until this open's background pipeline has landed, and hand back the settled `Table`.
+/// `nil` means it did not finish inside `timeout` — which the caller must report as "not known",
+/// never as "nothing was dropped".
+///
+/// `runAfterOpen` runs exact count -> bad-row detection -> staging decision, in that order, and the
+/// staging decision is always its last step, so `stageDecision != nil` is the observable "it has
+/// landed" signal. There is no completion handle to await: the pipeline is a detached `Task` and
+/// the state change IS the notification (SSE is gone) — the same shape, and the same reason, as
+/// `waitForStaging` above.
+///
+/// 🔴 POLLED, not read once. A `Task {}` is not guaranteed to have STARTED by the time the next
+/// line runs, so a single read of `badRows` right after `openPath` returns 0 on every file,
+/// including the ones that really did lose rows — a green, silent, entirely wrong answer.
+func waitForOpenScan(_ session: Session, _ name: String, timeout: TimeInterval = 30) async -> Table? {
+    let deadline = Date().addingTimeInterval(timeout)
+    while true {
+        guard let t = try? await session.table(name) else { return nil }
+        if t.stageDecision != nil { return t }
+        if Date() > deadline { return nil }
+        try? await Task.sleep(nanoseconds: 20_000_000)
+    }
 }
 
 /// The whole `sift <path>` output: a headline, the schema, and the first rows as a grid.
@@ -915,6 +1156,7 @@ public func renderOverview(_ overview: FileOverview, width: Int = 100) -> String
     lines.append("\(overview.table) \u{2014} \(overview.format) \u{2014} \(count)")
     lines.append(overview.path)
     if let basis = overview.rowsBasis { lines.append("estimate: \(basis)") }
+    lines.append(renderDropped(rows: overview.droppedRows, cells: overview.droppedCells))
     for note in overview.notes { lines.append("note: \(note)") }
 
     lines.append("")
@@ -934,6 +1176,22 @@ public func renderOverview(_ overview: FileOverview, width: Int = 100) -> String
         }
     }
     return lines.joined(separator: "\n")
+}
+
+/// The dropped-row line, printed on EVERY open.
+///
+/// "no rows dropped" is information. Silence is indistinguishable from never having looked, and
+/// this tool's entire pitch is that it does not quietly hand you the rows that survived. The
+/// unknown case gets its own sentence for the same reason: reporting a timed-out scan as zero
+/// would be the exact failure this line exists to prevent, with a reassuring face on it.
+func renderDropped(rows: Int?, cells: Int) -> String {
+    guard let rows else {
+        return "dropped rows: not known \u{2014} the background scan did not finish in time"
+    }
+    guard rows > 0 else { return "no rows dropped" }
+    return "\(groupDigits(String(rows))) row\(rows == 1 ? "" : "s") dropped \u{2014} "
+        + "\(groupDigits(String(cells))) cell\(cells == 1 ? "" : "s") would not cast to the "
+        + "sniffed column type"
 }
 
 /// name / type / kind, one column per line.
