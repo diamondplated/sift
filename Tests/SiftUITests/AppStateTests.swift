@@ -168,7 +168,11 @@ import Testing
     #expect(model.firstPage[2][note] == .text("N/A"))
 
     let kind = model.columns[note].kind
-    let glyphs = (0..<3).map { glyph(for: model.firstPage[$0][note], kind: kind) }
+    // Module-qualified since Task 3: `SiftUI.glyph(for:kind:)` has the same argument labels and
+    // returns a `CellGlyph`, so a bare call here is ambiguous. This one wants the ENGINE's strings —
+    // the point of the assertion is that the shared renderer, the one the CLI also calls, keeps the
+    // three states apart. `CellGlyphTests` covers the UI-side routing separately.
+    let glyphs = (0..<3).map { SiftEngine.glyph(for: model.firstPage[$0][note], kind: kind) }
     #expect(glyphs == [nullGlyph, emptyStringGlyph, "N/A"])
     #expect(Set(glyphs).count == 3)
 }
