@@ -31,7 +31,11 @@ public struct StagingProgress: Sendable, Equatable {
 
 public struct Table: Sendable {
     public let name: String
-    public let spec: SourceSpec
+    /// `internal(set)`, not `let`: read-only to every consumer outside this module (`Table` is a
+    /// struct, so nothing outside can mutate the catalog's copy anyway), while `Session`'s test
+    /// seam `setSourceSpecForTest` can point a real, tiny table at a spec that claims to be 30 GB
+    /// — the only way to exercise `profileIfCheap`'s cost gate without writing 30 GB.
+    public internal(set) var spec: SourceSpec
     public var qspec: QuerySpec
     public var sqlMode: Bool = false
     public var sqlText: String?

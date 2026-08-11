@@ -178,6 +178,53 @@ private func makeUniqueIntCSV(dir: String, count: Int) throws -> String {
     #expect(panel.nDistinct.value < rawApprox, "the clamp must have actually reduced the raw estimate")
 }
 
+// MARK: - the speculative profile pays the cost gate; a direct ask does not
+
+/// 🔴 The gate on `session.py:454` — `size <= PROFILE_EAGER_MAX_BYTES or staged or columnar` —
+/// was the one step of `_after_open` the port never carried, and `PROFILE_EAGER_MAX_BYTES` did not
+/// exist in Swift at all. With the kick left to the UI and the policy left nowhere, the UI plan's
+/// Task 5c kicks a profile after the first page with no gate, so the native app would `SUMMARIZE`
+/// a 30 GB CSV that Python deliberately skips.
+///
+/// The table below is a real 1,000-row CSV wearing a 30 GB spec, which is what makes the refusal
+/// visible: the profile is perfectly computable, so if the gate goes the job runs and
+/// `nextProfileJobID` moves. A fixture that genuinely could not be profiled would prove nothing.
+@Test func aSpeculativeProfileRefusesASourceTooBigToProfileUnasked() async throws {
+    let session = try newSession()
+
+    // Cheap: a 12 KB CSV. The speculative kick takes it.
+    let small = try await session.openPath(sharedData.cleanCSV)
+    #expect(try await session.profileIfCheap(small.name) == true)
+    #expect(await session.nextProfileJobID == 1, "the cheap case must actually profile")
+    #expect(try await session.table(small.name).profile != nil)
+
+    // The same file again, wearing a spec that claims 30 GB of CSV.
+    let huge = try await session.openPath(sharedData.cleanCSV)
+    await session.setSourceSpecForTest(huge.name, hugeCSVSpec(like: huge.spec))
+    #expect(try await session.profileIfCheap(huge.name) == false)
+    #expect(await session.nextProfileJobID == 1, "no SUMMARIZE may have been started")
+    #expect(try await session.table(huge.name).profile == nil, "nothing may have been cached")
+
+    // ...and a DIRECT ask is still answered, which is the other half of the contract and the
+    // reason the gate is not inside `computeProfile`. Python does not gate `profile_of` either:
+    // a user clicking a column on a 30 GB file is asking.
+    let asked = try await session.profileOf(huge.name, col: "order_id")
+    #expect(asked.n == 1000)
+    #expect(await session.nextProfileJobID == 2, "the direct ask must have run its own job")
+}
+
+/// The same source spec with a 30 GB size. Every other field is carried over verbatim so the
+/// relation underneath still reads the real file.
+private func hugeCSVSpec(like spec: SourceSpec) -> SourceSpec {
+    SourceSpec(
+        key: SourceKey(path: spec.key.path, mtimeNs: spec.key.mtimeNs, size: 30 * 1024 * 1024 * 1024),
+        fmt: spec.fmt, readFn: spec.readFn, readArgs: spec.readArgs, columns: spec.columns,
+        rowCount: spec.rowCount, rowEstimate: spec.rowEstimate, compressed: spec.compressed,
+        sheet: spec.sheet, sheets: spec.sheets, deltaVersion: spec.deltaVersion,
+        sniffPrompt: spec.sniffPrompt, glob: spec.glob, raggedColumns: spec.raggedColumns
+    )
+}
+
 // MARK: - compute_profile reuses the cached bad-cell scan (brief gotcha #2)
 
 @Test func computeProfileReusesTheCachedUncastableScanInsteadOfRescanning() async throws {

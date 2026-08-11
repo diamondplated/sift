@@ -28,6 +28,36 @@ let neverStage: Set<Fmt> = [.parquet, .globParquet, .delta]
 
 let stageSuffix = "__stage"
 
+/// Python's `PROFILE_EAGER_MAX_BYTES` (session.py:54), and it lives here rather than in SiftEngine
+/// for the same reason `defaultBudgetBytes` does: it is cost policy, and cost policy that only one
+/// consumer can see is cost policy the other consumer re-derives — or, as the UI plan's Task 5c
+/// did, forgets entirely.
+public let profileEagerMaxBytes = 200 * MB
+
+/// Is a profile nobody asked for cheap enough to run on this source? Ported from the gate on
+/// `session.py:454`: `size <= PROFILE_EAGER_MAX_BYTES or staged or fmt in NEVER_STAGE`.
+///
+/// 🔴 **This is the profiling path's version of `shouldStage`'s dwell, and it was the one piece of
+/// `_after_open` that never got ported.** A `SUMMARIZE` reads every column of every row; over a
+/// 30 GB CSV view that is minutes of work for a panel the user has not opened. Staging.swift's
+/// header states the principle for the copy — "a drive-by 'let me peek at the header' must never
+/// pay for a 20 s copy" — and it is exactly as true of an unasked-for profile.
+///
+/// The three ways through are not arbitrary:
+/// * **under the threshold** — a full scan of 200 MB is sub-second, and the panels want it;
+/// * **staged** — the copy is already native columnar storage in the local store;
+/// * **`neverStage`** — parquet, a parquet glob, and Delta carry per-column statistics and support
+///   row-group skipping, so profiling is cheap at any size. (Which is also why they are never
+///   staged: the same property, read twice.)
+///
+/// Deliberately NOT applied inside `computeProfile`/`profileOf`. Python does not gate those either,
+/// and it would be wrong to: a user clicking a column on a 30 GB file is asking, and answering
+/// "no" to a direct request is a different product. This gates the SPECULATIVE kick only — see
+/// `Session.profileIfCheap`, which is the entry point a speculative caller is meant to use.
+public func shouldProfileEagerly(fmt: Fmt, sizeBytes: Int, staged: Bool) -> Bool {
+    sizeBytes <= profileEagerMaxBytes || staged || neverStage.contains(fmt)
+}
+
 /// Decide whether this source earns a native DuckDB copy.
 ///
 /// The payoff is not just aggregate speed: `LIMIT/OFFSET` on a CSV view is O(offset), while a

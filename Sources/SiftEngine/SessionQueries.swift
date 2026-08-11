@@ -149,6 +149,40 @@ extension Session {
         throw SessionError("'\(name)' kept changing while its profile was being computed.")
     }
 
+    /// The SPECULATIVE profile: compute one only if it is cheap enough to be worth doing unasked.
+    /// Returns `false`, having done nothing, when it is not.
+    ///
+    /// 🔴 **This is the eager trigger from Python's `_after_open` (session.py:454), and it is the
+    /// one step of that pipeline the port never carried over.** `runAfterOpen` stops at the
+    /// staging decision, so nothing in the engine profiles on open — which left the kick, and with
+    /// it the COST DECISION, to whoever called next. The UI plan's Task 5c kicks a profile after
+    /// the first page **with no gate at all**, so the native app would `SUMMARIZE` a 30 GB CSV
+    /// that Python deliberately skips: minutes of scan for a panel nobody has opened, on the same
+    /// "a drive-by peek must not pay for the copy" principle `shouldStage`'s dwell enforces.
+    ///
+    /// **Why this is a public entry point rather than a line in `runAfterOpen`.** The engine has
+    /// two consumers now, and Python had one. `sift <path>` never renders a profile — it prints a
+    /// schema and a preview and shuts the session down — so an engine-side kick would make every
+    /// CLI open pay for a `SUMMARIZE` whose result is discarded milliseconds later. And unlike the
+    /// exact count and the bad-row scan, an eager profile is not a correctness step: it is latency
+    /// work done on behalf of a UI that is about to ask. So the KICK stays with the caller that
+    /// benefits, and the GATE comes here, where both consumers read the same policy
+    /// (`SiftCore.shouldProfileEagerly`) instead of re-deriving it.
+    ///
+    /// **And a caller cannot get the gate wrong by forgetting it**, which is the part that
+    /// mattered: the speculative path IS the gated one. A UI kick is
+    /// `Task { try? await session.profileIfCheap(name) }` — there is no ungated speculative call
+    /// to reach for. `computeProfile`/`profileOf` stay ungated on purpose, exactly as Python
+    /// leaves `profile_of`: a user clicking a column on a 30 GB file is asking.
+    @discardableResult
+    public func profileIfCheap(_ name: String) async throws -> Bool {
+        let t = try table(name)
+        guard shouldProfileEagerly(fmt: t.spec.fmt, sizeBytes: t.spec.key.size, staged: t.staged)
+        else { return false }
+        _ = try await computeProfile(name)
+        return true
+    }
+
     /// The in-flight profile for this exact open of this table, started if there isn't one.
     ///
     /// Synchronous and actor-isolated on purpose: it publishes `profiling = true` and registers the

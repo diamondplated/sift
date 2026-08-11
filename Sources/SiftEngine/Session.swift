@@ -377,6 +377,18 @@ public actor Session {
         tables[name] = t
     }
 
+    /// Test support: swap an open table's `SourceSpec` — the size, format and sheet the cost
+    /// policies read — without touching the relation underneath it. The only way to point a test
+    /// at a 30 GB source without writing 30 GB: `profileIfCheap`'s gate reads `spec.key.size` and
+    /// `spec.fmt`, so a real 12 KB CSV wearing a 30 GB spec exercises the refusal exactly, while
+    /// still being a table the profile COULD be computed for if the gate were deleted — which is
+    /// what makes the deletion visible. Same internal-seam trick as `setFilteredCountForTest`.
+    func setSourceSpecForTest(_ name: String, _ spec: SourceSpec) {
+        guard var t = tables[name] else { return }
+        t.spec = spec
+        tables[name] = t
+    }
+
     /// Test support: shorten (or lengthen) the staging dwell. The same internal-seam trick as
     /// `setFilteredCountForTest`/`setProfileForTest` above, applied to a clock: a test that
     /// really slept `stageDwellSeconds` would add three seconds to a parallel suite to prove a
@@ -558,11 +570,23 @@ public actor Session {
     /// paging on another table or a second `openPath` in flight; each stage calls back with a
     /// small, fast, actor-isolated "apply" method rather than mutating shared state directly.
     ///
-    /// `compute_profile`'s eager-profile trigger (gated on the size threshold, staged-ness, or a
-    /// columnar format) is the one step of Python's `_after_open` still missing here: Task 5
-    /// ported `compute_profile` itself, but wiring it in would have it race Task 5's own
-    /// `setProfileForTest` seam, so it is left for the plan's own accounting. Background staging
-    /// (`_maybe_stage_after_dwell`) IS wired, below the staging decision, where Python has it.
+    /// **`compute_profile`'s eager trigger is deliberately NOT here, and its cost gate now is —
+    /// see `SessionQueries.profileIfCheap`.** Python calls `self.compute_profile(name)` at this
+    /// point in `_after_open`, behind `size <= PROFILE_EAGER_MAX_BYTES or staged or columnar`
+    /// (session.py:454). The port carried neither, which left the kick to whoever called next and
+    /// the COST POLICY nowhere at all — so the UI plan's speculative kick had no gate to consult
+    /// and would have `SUMMARIZE`d a 30 GB CSV that Python skips.
+    ///
+    /// The gate is now `SiftCore.shouldProfileEagerly`, sitting beside `shouldStage` where both
+    /// consumers read it, and `profileIfCheap` is the gated entry point a speculative caller uses.
+    /// The kick stays with the caller because the engine has two consumers and Python had one:
+    /// `sift <path>` never renders a profile, so a kick here would make every CLI open pay for a
+    /// `SUMMARIZE` it discards. Unlike the exact count and the bad-row scan below, an eager profile
+    /// is not a correctness step — it is latency work for a UI that is about to ask.
+    ///
+    /// Background staging (`_maybe_stage_after_dwell`) IS wired, below the staging decision, where
+    /// Python has it — that one IS the engine's, because the dwell it enforces is a cost decision
+    /// with no caller to make it.
     ///
     /// `openedAt` is the opened table's identity, carried through to every `apply*` call below so
     /// each one can confirm it is still writing to the SAME open table it was launched for. Python

@@ -45,6 +45,48 @@ func columnarFormatsAreNeverStaged(fmt: Fmt) {
     #expect(shouldStage(fmt: .csv, sizeBytes: 25 * MB, freeBytes: free).stage == true)
 }
 
+// MARK: - should_profile_eagerly (session.py:454's gate, ported)
+
+// The profiling path's version of the dwell. A `SUMMARIZE` reads every column of every row, so an
+// UNASKED-FOR profile of a 30 GB CSV view is minutes of scan for a panel nobody opened. Python
+// gates it three ways and the port had none of them — see `Session.profileIfCheap`.
+
+@Test func aSmallTextSourceIsProfiledEagerly() {
+    #expect(shouldProfileEagerly(fmt: .csv, sizeBytes: 5 * MB, staged: false))
+}
+
+@Test func aHugeTextSourceIsNotProfiledUntilSomeoneAsks() {
+    #expect(!shouldProfileEagerly(fmt: .csv, sizeBytes: 30 * GB, staged: false))
+    #expect(!shouldProfileEagerly(fmt: .json, sizeBytes: 30 * GB, staged: false))
+    #expect(!shouldProfileEagerly(fmt: .ndjson, sizeBytes: 1 * GB, staged: false))
+    #expect(!shouldProfileEagerly(fmt: .xlsx, sizeBytes: 1 * GB, staged: false))
+}
+
+@Test func profileEagerThresholdBoundary() {
+    #expect(shouldProfileEagerly(fmt: .csv, sizeBytes: 200 * MB, staged: false))
+    #expect(!shouldProfileEagerly(fmt: .csv, sizeBytes: 200 * MB + 1, staged: false))
+}
+
+/// Once the copy is in the local store the scan is native columnar work, whatever the source
+/// weighed — the same reason `stagedRowCount` becomes authoritative at the swap.
+@Test func aStagedSourceIsProfiledEagerlyAtAnySize() {
+    #expect(shouldProfileEagerly(fmt: .csv, sizeBytes: 30 * GB, staged: true))
+}
+
+/// The formats `shouldStage` refuses to copy are exactly the formats that are cheap to profile —
+/// per-column statistics and row-group skipping, the same property read twice. Reads
+/// `neverStage` itself rather than a second list, so a format joining one set joins both.
+@Test(arguments: [Fmt.parquet, .globParquet, .delta])
+func columnarFormatsAreProfiledEagerlyAtAnySize(fmt: Fmt) {
+    #expect(shouldProfileEagerly(fmt: fmt, sizeBytes: 100 * GB, staged: false))
+    #expect(neverStage.contains(fmt), "the two policies must read the same set")
+}
+
+/// A glob of CSVs is NOT columnar, and it is the one folder shape that can be arbitrarily large.
+@Test func aHugeCsvFolderIsNotProfiledEagerly() {
+    #expect(!shouldProfileEagerly(fmt: .globCsv, sizeBytes: 30 * GB, staged: false))
+}
+
 // MARK: - human() — the locale trap
 //
 // `human()` is the module's only number formatter and its output is read by a user in every
