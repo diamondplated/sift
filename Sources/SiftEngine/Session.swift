@@ -74,11 +74,20 @@ public let pageRows = 500
 
 /// The materialized copy `sortedRelation` builds is capped at this many rows — ported verbatim
 /// from Python's identical `LIMIT` in `_sorted_relation`, which has the same cap and the same
-/// consequence: a sort over more rows than this silently truncates the materialized copy, so
-/// pages past row `sortMaterializeMax` come back empty and `visibleRows` still reports the full
-/// (untruncated) count. Not fixed here — inherited as-is; see task-4-report.md's Minor-review
-/// notes for the call on whether it needs its own fix.
-let sortMaterializeMax = 5_000_000
+/// consequence: a sort over more rows than this truncates the materialized copy, so pages past row
+/// `sortMaterializeMax` come back empty.
+///
+/// **No longer silent (spec §13a, CLOSED Plan 4 Task 5).** `Table.scrollableRows` caps the scroll
+/// extent at this number whenever a sort is active, so everything the thumb can reach returns rows,
+/// and `Table.sortTruncated` is what the UI puts a banner on — a named missing tail, with "clear
+/// the sort" as the way to reach it. The other §13a option — re-materializing a window per scroll —
+/// was rejected: `sortedRelation`'s own measurement shows tie order is not reproducible across
+/// separate materializations, so two windows duplicate or drop rows at their seam.
+///
+/// `public` for the same reason: the UI needs the number to say how many rows the sort can reach.
+/// Deliberately not raised — it is Python's number, and 5M rows of materialized copy is already the
+/// memory ceiling the engine chose.
+public let sortMaterializeMax = 5_000_000
 
 /// Extensions Sift loads at startup. Mirrors Python's module-level `_EXTENSIONS`.
 private let sessionExtensions = ["delta", "excel"]

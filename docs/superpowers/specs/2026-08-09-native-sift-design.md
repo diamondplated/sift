@@ -460,15 +460,39 @@ fired. Hammering the interrupt in a loop cancels reliably (5/5 runs, 0.000–0.0
 the interrupt for as long as the job is meant to be cancelled**, not call it once. The
 Python engine's single `con.interrupt()` does not port across.
 
-**A sorted table over 5,000,000 rows silently drops its tail — Plan 4 (grid).**
+**A sorted table over 5,000,000 rows silently drops its tail — CLOSED 2026-08-09, Plan 4 Task 5.**
 `Session.sortedRelation` always materializes, and materializes at most `sortMaterializeMax`
-(5,000,000) rows. Pages past that come back **empty**, while `visibleRows` still reports the
-full row count — so the grid sizes its scroll extent for 100M rows and 95M of them return
-nothing. Ported faithfully from `engine/session.py`, which has the identical gap, so this is
-not a regression; it is a pre-existing limit that the native grid will make far more visible
-than a paged web view did. Recorded 2026-08-09 during Plan 3 Task 4's review. The fix is
-either to cap `visibleRows` at the materialized count so the extent tells the truth, or to
-re-materialize a window as the user scrolls past it.
+(5,000,000) rows. Pages past that come back **empty**, while `visibleRows` still reported the
+full row count — so the grid sized its scroll extent for 100M rows and 95M of them returned
+nothing. Ported faithfully from `engine/session.py`, which has the identical gap, so it was
+never a regression; it is a pre-existing limit the native grid makes far more visible than a
+paged web view did. Recorded 2026-08-09 during Plan 3 Task 4's review.
+
+**Fixed by option one — cap the extent, and name the tail.** `Table.scrollableRows` is
+`displayRows` capped at `sortMaterializeMax` whenever a sort is active, and `Table.sortTruncated`
+says a tail exists; the grid sizes itself from the former and banners the latter, with "clear the
+sort" as the way to reach the rest. Everything the thumb can reach now returns rows.
+
+The other option — re-materializing a window as the user scrolls past it — was rejected, and not
+on taste: `sortedRelation`'s own MEASURED note records that re-sorting the same static,
+tie-bearing table at different `LIMIT`/`OFFSET` pairs does not reproduce the same tie order (4
+rows out of 1000 landed on two pages and 4 on none). Two separately materialized windows carry
+that same seam, so windowing trades a named missing tail for silently duplicated and dropped rows
+— the worse failure for a tool whose premise is not lying about data. Making it correct would need
+a total order (every column appended as a tiebreak), which changes what the user asked to sort by
+and still pays a full sort per window. `sortMaterializeMax` is deliberately not raised: it is
+Python's number, and 5M rows of materialized copy is already the memory ceiling the engine chose.
+
+**A large CSV showed an EMPTY grid until its background count landed — CLOSED 2026-08-09, Plan 4
+Task 5.** Found while fixing the above, same failure in the other direction. `visibleRows` is nil
+until `rowCount` is set, and `buildSource` fills `spec.rowCount` only under `exactCountMaxBytes`
+(64 MB) — so a grid sized from `visibleRows` was empty on open for exactly the large text files
+the product exists to open instantly. Python's `Table.summary()` falls back to
+`spec.row_estimate.rows` and the web set `state.total` from it (`web/index.html:551`); the port
+dropped the fallback. `Table.displayRows` restores it, with `rowsAreExact`/`rowsBasis` for the
+"330,602 rows (3x256KiB sample)" line. MEASURED after the fix: a 70 MB CSV opened through
+`AppState` is sized to 330,602 rows with its first page drawn 313 ms after the open, with no exact
+count anywhere.
 
 **A first-party generated query returns a `LIST`, and the decoder cannot read it — CLOSED
 2026-08-09, Plan 3 Task 1.** Plan 1 deferred nested-type decoding on the premise that

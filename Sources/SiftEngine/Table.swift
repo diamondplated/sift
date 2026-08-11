@@ -129,4 +129,57 @@ public struct Table: Sendable {
         }
         return gridRows
     }
+
+    /// Rows to show, and to size the grid from: the exact/filtered count once known, otherwise
+    /// the cheap byte-sample estimate. Ports `Table.summary()`'s `rows.value`
+    /// (`visible_rows if visible_rows is not None else est.rows`).
+    ///
+    /// The fallback is not cosmetic. `openPath` sets `rowCount` only from `spec.rowCount`, which
+    /// `buildSource` leaves nil for any CSV above `exactCountMaxBytes` — so without this a
+    /// multi-GB CSV shows an EMPTY grid from open until a detached background count finishes,
+    /// which is precisely the case the product is sold on.
+    public var displayRows: Int? { visibleRows ?? spec.rowEstimate?.rows }
+
+    /// Whether `displayRows` is counted or estimated. `summary()`'s `rows.exact`.
+    public var rowsAreExact: Bool { rowCount != nil }
+
+    /// How `displayRows` was arrived at. `summary()`'s `rows.basis`, all three branches — but as
+    /// a value, not a sentence.
+    ///
+    /// Python returned the literal string because its engine served exactly one consumer. This
+    /// engine has two (`SiftUI` and the `sift` CLI), which want different phrasing, and keeping
+    /// user-facing sentences out of `SiftEngine` means a wording change never touches the engine.
+    public enum RowsBasis: Sendable, Equatable {
+        case counted
+        /// The byte-sample estimator's own description, e.g. "3x256KiB sample, no quotes seen".
+        case estimated(String)
+        case pending
+    }
+
+    public var rowsBasis: RowsBasis {
+        if rowCount != nil { return .counted }
+        if let basis = spec.rowEstimate?.basis { return .estimated(basis) }
+        return .pending
+    }
+
+    /// Rows the grid can actually reach right now — `displayRows`, capped at what
+    /// `Session.sortedRelation` will have materialized.
+    ///
+    /// Spec §13a: a sorted result set is materialized once, at most `sortMaterializeMax` rows, and
+    /// pages past that come back EMPTY while the count still reports the full total. Sizing the
+    /// extent from the count would promise 100M rows and deliver 5M followed by 95M blank ones.
+    /// Capping makes the extent true; `sortTruncated` is how the UI says the tail exists and how
+    /// to reach it. The alternative §13a names — re-materializing a window per scroll — was
+    /// rejected: `sortedRelation`'s own measurement shows tie order is not reproducible across
+    /// separate materializations, so two windows can duplicate or drop rows at their seam.
+    public var scrollableRows: Int? {
+        guard let rows = displayRows else { return nil }
+        return qspec.sort.isEmpty ? rows : min(rows, sortMaterializeMax)
+    }
+
+    /// `true` when a sort is active and there are more rows than the materialized copy holds.
+    public var sortTruncated: Bool {
+        guard !qspec.sort.isEmpty, let rows = displayRows else { return false }
+        return rows > sortMaterializeMax
+    }
 }
