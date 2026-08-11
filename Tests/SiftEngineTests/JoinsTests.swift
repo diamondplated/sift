@@ -181,6 +181,20 @@ private func sessionWithBothSides() async throws -> Session {
     await #expect(throws: expected) { try await session.merge("lhs", "rhs", on: []) }
 }
 
+/// Both sides naming one table is reachable the moment a join panel lets the user pick the same
+/// name twice, and DuckDB answers it with `Binder Error: Ambiguous reference to table
+/// "stage.main.lhs" (duplicate alias …)` — a parser dump where every other refusal in this file
+/// contracts for one sentence. Same class as the empty-key case above: original Task 7 behaviour
+/// that the port inherited, not a regression, and missed by both the implementer and the reviewer
+/// in round 1.
+@Test func allThreeRefuseATableMergedWithItselfInsteadOfLeakingABinderDump() async throws {
+    let session = try await sessionWithBothSides()
+    let expected = SessionError("Pick two different tables to merge — lhs is on both sides.")
+    await #expect(throws: expected) { try await session.joinProbe("lhs", "lhs", on: ["k"]) }
+    await #expect(throws: expected) { try await session.unmatchedKeys("lhs", "lhs", on: ["k"]) }
+    await #expect(throws: expected) { try await session.merge("lhs", "lhs", on: ["k"]) }
+}
+
 // MARK: - unmatched_keys
 
 @Test func unmatchedKeysListsExactlyTheKeysJoinProbeCounted() async throws {

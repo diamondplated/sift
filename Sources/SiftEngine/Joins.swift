@@ -287,6 +287,14 @@ extension Session {
 /// and the sentence is the one `merge` already spells.
 private func checkJoinKeys(_ on: [String], _ lt: Table, _ rt: Table) throws {
     guard !on.isEmpty else { throw SessionError("Pick at least one key column to join on.") }
+    // Both sides being the same table is reachable the moment a join panel lets the user pick one
+    // name twice, and DuckDB answers it with a parser dump rather than a sentence: `Binder Error:
+    // Ambiguous reference to table "stage.main.b" (duplicate alias "stage.main.b", explicitly
+    // alias one of the tables using "AS my_alias")`. Every other failure in this file contracts
+    // for one clean line, which is the whole reason `merge` wraps DuckDB's errors at all.
+    guard lt.name != rt.name else {
+        throw SessionError("Pick two different tables to merge — \(lt.name) is on both sides.")
+    }
     let lcols = lt.cols
     let rcols = rt.cols
     for c in on {
