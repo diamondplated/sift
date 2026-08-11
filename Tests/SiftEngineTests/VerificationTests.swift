@@ -159,7 +159,7 @@ private func newHome() -> String {
     let names = Set(verificationChecks.map(\.name))
     for required in [
         "open csv", "open parquet", "open json", "open ndjson", "open xlsx", "open delta",
-        "open folder", "profile", "distinct panel", "histogram panel",
+        "open folder", "malformed file", "profile", "distinct panel", "histogram panel",
         "sample and length panels", "dropped rows", "ragged csv", "skipped preamble",
         "snippet and rendered SQL",
         "SELECT-only gate", "staging and unstaging", "merge", "export",
@@ -647,6 +647,9 @@ func xlsxOpensThroughTheSheetPicker() async throws { try await withWorkspace(che
 func deltaOpensAndHonoursTombstones() async throws { try await withWorkspace(checkOpenDelta) }
 @Test func aFolderOpensAsOneTableWithFilenameProvenance() async throws {
     try await withWorkspace(checkOpenFolder)
+}
+@Test func aFileThatIsNotWhatItsNameSaysGetsASentence() async throws {
+    try await withWorkspace(checkMalformedFile)
 }
 @Test func profilingProducesOneProfilePerColumnInFileOrder() async throws {
     try await withWorkspace(checkProfile)

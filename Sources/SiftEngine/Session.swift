@@ -167,11 +167,20 @@ public actor Session {
             let pid = ProcessInfo.processInfo.processIdentifier
             path = (resolvedHome as NSString).appendingPathComponent("stage-\(pid).duckdb")
             shared = false
-            db = try Database(path: path)
+            do {
+                db = try Database(path: path)
+            } catch let error as DuckDBError {
+                throw SessionError(error.firstLine)
+            }
             FileHandle.standardError.write(Data((
                 "sift: another Sift engine holds \(sharedPath), so this one is using a private "
                     + "store at \(path) (staged data will not persist)\n"
             ).utf8))
+        } catch let error as DuckDBError {
+            // Anything that is NOT the lock — a store that is a directory, a corrupt file, a
+            // permission refusal. This is the very first thing the CLI and the app call, and the
+            // app's `presentFatal` puts `localizedDescription` straight into an alert body.
+            throw SessionError(error.firstLine)
         }
 
         self.siftHome = resolvedHome
@@ -182,8 +191,13 @@ public actor Session {
         db.harden()
         db.loadExtensions(sessionExtensions)
 
-        let con = try db.connect()
-        try con.execute(catalogDDL)
+        let con: Connection
+        do {
+            con = try db.connect()
+            try con.execute(catalogDDL)
+        } catch let error as DuckDBError {
+            throw SessionError(error.firstLine)
+        }
         // Before anything reads the catalog: a store written by an older build has a differently
         // keyed catalog holding tokens this build cannot interpret. See `migrateCatalog`.
         Self.migrateCatalog(con)
@@ -450,6 +464,13 @@ public actor Session {
             throw SessionError(error.message)
         } catch let error as LegacyXls {
             throw SessionError(error.message)
+        } catch let error as DuckDBError {
+            // 🔴 THE most common user error in the product, and it shipped as a Foundation dump.
+            // A corrupt/empty parquet, a truncated JSON, a half-written NDJSON — DuckDB says
+            // `Invalid Input Error: No magic bytes found at end of file '…'` and that sentence is
+            // the entire answer. Every other public method here has had this wrap since it was
+            // written; this one, the one a user hits first, did not.
+            throw SessionError(error.firstLine)
         }
 
         let taken = Set(tables.keys)
@@ -489,12 +510,16 @@ public actor Session {
         // than rebuilt — and a copy of a file that has since changed is dropped. Both matter for
         // correctness, not just speed: a staged copy is a real table in a persistent store, and
         // `CREATE OR REPLACE VIEW` over one is a hard `Catalog Error`. See `adoptStagedCopy`.
-        let viewCon = try database.connect()
-        if let adoptedRows = adoptStagedCopy(viewCon, name: tname, spec: spec) {
-            t.staged = true
-            t.rowCount = adoptedRows
-        } else {
-            try viewCon.execute(createViewSQL(name: tname, spec: spec))
+        do {
+            let viewCon = try database.connect()
+            if let adoptedRows = adoptStagedCopy(viewCon, name: tname, spec: spec) {
+                t.staged = true
+                t.rowCount = adoptedRows
+            } else {
+                try viewCon.execute(createViewSQL(name: tname, spec: spec))
+            }
+        } catch let error as DuckDBError {
+            throw SessionError(error.firstLine)
         }
 
         tables[tname] = t
@@ -733,13 +758,17 @@ public actor Session {
         defer { tables.removeValue(forKey: name) }
 
         let con = pagingConnection
-        if let key = t.sortKey {
-            try con.execute("DROP TABLE IF EXISTS \(q(key))")
-        }
-        if t.staged {
-            _ = try con.query("UPDATE _sift_sources SET last_used = now() WHERE table_name = ?", [.text(name)])
-        } else if t.staging == nil {
-            try con.execute("DROP VIEW IF EXISTS \(q(name))")
+        do {
+            if let key = t.sortKey {
+                try con.execute("DROP TABLE IF EXISTS \(q(key))")
+            }
+            if t.staged {
+                _ = try con.query("UPDATE _sift_sources SET last_used = now() WHERE table_name = ?", [.text(name)])
+            } else if t.staging == nil {
+                try con.execute("DROP VIEW IF EXISTS \(q(name))")
+            }
+        } catch let error as DuckDBError {
+            throw SessionError(error.firstLine)
         }
         // `t.staging != nil` falls through both branches on purpose. A staging job turns this name
         // into a real TABLE at the swap, seconds before `applyStaged` sets `staged = true`, and

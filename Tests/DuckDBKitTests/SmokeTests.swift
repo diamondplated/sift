@@ -23,6 +23,22 @@ import Foundation
     #expect(e.firstLine.count == 400)
 }
 
+// 🔴 `firstLine` reaches `localizedDescription`, not just `"\(error)"`.
+//
+// Without `LocalizedError`, Foundation bridges this to `NSError` and synthesizes "The operation
+// couldn't be completed. (DuckDBKit.DuckDBError error 1.)" — MEASURED, and shipped: `sift
+// bad.parquet` printed exactly that, throwing away
+// `Invalid Input Error: No magic bytes found at end of file '…'`. The conformance is what covers
+// the throw sites nobody has enumerated; SiftEngine additionally wraps its own public methods.
+@Test func aDuckDBErrorReadsAsItsFirstLineThroughEveryStringPath() {
+    let e = DuckDBError("Invalid Input Error: No magic bytes found at end of file 'bad.parquet'\nstack: …")
+    #expect(e.localizedDescription == "Invalid Input Error: No magic bytes found at end of file 'bad.parquet'")
+    #expect((e as NSError).localizedDescription == e.firstLine)
+    #expect(!e.localizedDescription.contains("The operation couldn"))
+    // The parser dump below the first line stays out of every user-facing path.
+    #expect(!e.localizedDescription.contains("stack:"))
+}
+
 @Test func opensAnInMemoryDatabaseAndConnects() throws {
     let db = try Database.inMemory()
     let con = try db.connect()

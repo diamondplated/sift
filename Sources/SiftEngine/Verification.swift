@@ -238,6 +238,7 @@ let verificationChecks: [VerificationCheck] = [
     VerificationCheck(name: "open xlsx", run: checkOpenXLSX),
     VerificationCheck(name: "open delta", run: checkOpenDelta),
     VerificationCheck(name: "open folder", run: checkOpenFolder),
+    VerificationCheck(name: "malformed file", run: checkMalformedFile),
     VerificationCheck(name: "profile", run: checkProfile),
     VerificationCheck(name: "distinct panel", run: checkDistinctPanel),
     VerificationCheck(name: "histogram panel", run: checkHistogramPanel),
@@ -398,6 +399,66 @@ let verificationChecks: [VerificationCheck] = [
     // The provenance column is what makes a folder read auditable — which file did this row
     // come from — and it is appended last.
     try requireEqual(page.columns.map(\.name), ["id", "region", "filename"], "columns")
+}
+
+// MARK: the file that is not what its name says
+
+/// 🔴 **The nineteen checks above this one never opened a file that could not be read**, and that
+/// is why 461 tests and a green `--verify` sat on top of the single most common user error in the
+/// product rendering as `The operation couldn't be completed. (DuckDBKit.DuckDBError error 1.)`.
+/// Every check here is a *successful* open of a *valid* fixture; a verifier made only of those
+/// proves the happy path and nothing about the sentence a user actually reads first.
+///
+/// So this one opens four files that are genuinely broken and asserts on the MESSAGE, not merely
+/// that something was thrown: DuckDB's own first line has to survive to `localizedDescription`,
+/// which is what `main.swift` prints and what the app's banner will show.
+@Sendable func checkMalformedFile(_ ws: Workspace) async throws {
+    let session = try ws.session()
+    let broken: [(String, String, String)] = [
+        // (what, filename, bytes)
+        ("a corrupt parquet", "corrupt.parquet", "this is not a parquet file"),
+        ("an empty parquet", "empty.parquet", ""),
+        ("a truncated json", "corrupt.json", "{\"a\": "),
+        ("a half-written ndjson", "corrupt.ndjson", "{\"a\": 1}\n{not json at all\n"),
+    ]
+
+    for (what, name, bytes) in broken {
+        let path = ws.path(name)
+        try bytes.write(toFile: path, atomically: true, encoding: .utf8)
+
+        var reported: String?
+        do {
+            _ = try await session.openPath(path)
+        } catch let error as SessionError {
+            // BOTH string paths, because they are different code paths in Swift and only one of
+            // them was ever wrong: `"\(error)"` was always the sentence, `localizedDescription`
+            // was the Foundation dump.
+            try requireEqual(error.localizedDescription, error.message, "\(what): the two string paths")
+            reported = error.message
+        } catch {
+            throw VerifyFailure(
+                message: "opening \(what) threw \(type(of: error)) instead of SessionError: "
+                    + "\(error.localizedDescription)"
+            )
+        }
+        guard let message = reported else {
+            throw VerifyFailure(message: "opening \(what) did not fail at all")
+        }
+        try require(
+            !message.contains("The operation couldn"),
+            "opening \(what) reported a Foundation dump instead of DuckDB's message: \(message)"
+        )
+        try require(
+            message.count > 12 && !message.hasPrefix("Query failed."),
+            "opening \(what) reported nothing a user can act on: \(message)"
+        )
+    }
+
+    // ...and the engine is still usable afterwards: a refused open must leave no half-built table
+    // in the catalog and must not have poisoned the session.
+    try requireEqual(await session.state().tables.count, 0, "tables left behind by four failed opens")
+    let good = try await session.openPath(try writeSalesCSV(ws.path("sales.csv"), rows: 20))
+    try requireEqual(try await session.page(good.name, offset: 0, limit: 50).rows.count, 20, "rows after the failures")
 }
 
 // MARK: profiling and panels

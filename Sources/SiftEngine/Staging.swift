@@ -517,12 +517,17 @@ extension Session {
 
     /// Every staged copy this store knows about, newest use first. Ported from `staged_entries`.
     public func stagedEntries() throws -> [StagedSource] {
-        let con = try database.connect()
-        let rows = try con.query(
-            "SELECT table_name, path, fmt, epoch_ms(staged_at::TIMESTAMPTZ), "
-                + "epoch_ms(last_used::TIMESTAMPTZ), row_count, bytes, mtime_ns, size "
-                + "FROM _sift_sources ORDER BY last_used DESC"
-        ).allRows()
+        let rows: [[Cell]]
+        do {
+            let con = try database.connect()
+            rows = try con.query(
+                "SELECT table_name, path, fmt, epoch_ms(staged_at::TIMESTAMPTZ), "
+                    + "epoch_ms(last_used::TIMESTAMPTZ), row_count, bytes, mtime_ns, size "
+                    + "FROM _sift_sources ORDER BY last_used DESC"
+            ).allRows()
+        } catch let error as DuckDBError {
+            throw SessionError(error.firstLine)
+        }
 
         return rows.map { row in
             let path = cellText(row[1])
@@ -547,11 +552,15 @@ extension Session {
     /// exists here, so it is not ported.
     @discardableResult
     public func purgeStaged(tables names: [String]? = nil, all: Bool = false) throws -> PurgeResult {
-        let con = try database.connect()
-        let dropped = try Self.purgeStagedTables(
-            con, open: Set(tables.keys), tables: names, all: all
-        )
-        return PurgeResult(dropped: dropped, stagedBytes: dbBytes())
+        do {
+            let con = try database.connect()
+            let dropped = try Self.purgeStagedTables(
+                con, open: Set(tables.keys), tables: names, all: all
+            )
+            return PurgeResult(dropped: dropped, stagedBytes: dbBytes())
+        } catch let error as DuckDBError {
+            throw SessionError(error.firstLine)
+        }
     }
 
     /// The purge itself, against a bare connection.
@@ -659,10 +668,14 @@ extension Session {
         var t = try table(name)
         guard t.staged else { return t }
 
-        let con = try database.connect()
-        try con.execute("DROP TABLE IF EXISTS \(q(t.name))")
-        try con.execute(createViewSQL(name: t.name, spec: t.spec))
-        _ = try con.query("DELETE FROM _sift_sources WHERE table_name = ?", [.text(t.name)])
+        do {
+            let con = try database.connect()
+            try con.execute("DROP TABLE IF EXISTS \(q(t.name))")
+            try con.execute(createViewSQL(name: t.name, spec: t.spec))
+            _ = try con.query("DELETE FROM _sift_sources WHERE table_name = ?", [.text(t.name)])
+        } catch let error as DuckDBError {
+            throw SessionError(error.firstLine)
+        }
 
         t.staged = false
         if let key = t.sortKey {

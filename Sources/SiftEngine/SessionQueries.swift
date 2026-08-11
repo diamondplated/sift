@@ -467,24 +467,33 @@ extension Session {
     /// string) is the entire reason that gap was closed: the UI highlights individual cells, not
     /// just the row.
     ///
-    /// Unlike every other function in this file, query failures here are NOT converted to
-    /// `SessionError` — Python's `bad_rows` has no `try/except duckdb.Error` around this call
-    /// either, so a `badRowsSQL` or query failure propagates as a raw `DuckDBError` (or
-    /// `UnsafeTypeName`/`UnknownColumn`) unchanged. Preserved rather than "fixed": this is a
-    /// behavioral port, not a correctness upgrade Python itself never made.
+    /// **Reversed in the whole-plan review, and the reversal is the interesting part.** An earlier
+    /// comment here said query failures were deliberately NOT converted to `SessionError`, because
+    /// Python's `bad_rows` has no `try/except duckdb.Error` either — "a behavioral port, not a
+    /// correctness upgrade Python itself never made". That reasoning loses: this panel reads the
+    /// file through its all-varchar expression rather than through the view, so a source deleted
+    /// while its tab is open (anyone with `rm`, or a synced folder) fails right here, and the user
+    /// got `IO Error: No files found that match the pattern …` with a Foundation dump around it.
+    /// The "one clean sentence" contract is a product rule, not a Python behavior to preserve, and
+    /// every other public method in this file already holds it. `UnsafeTypeName`/`UnknownColumn`
+    /// from `badRowsSQL` still propagate as themselves — they are already `SiftError`s.
     public func badRows(_ name: String, limit: Int = 200) async throws -> BadRowsPanel {
         let t = try table(name)
         guard let raw = rawRelation(t), t.badCells > 0 else {
             return BadRowsPanel(cells: t.badCells, rows: t.badRows, columns: [], data: [])
         }
         let (sql, params) = try badRowsSQL(raw, t.spec.columns, limit: limit)
-        let con = try database.connect()
-        let rs = try con.query(sql, params.map(toDBValue))
-        let fetched = try rs.allRows()
-        let columns = rs.columns.map {
-            TablePage.ColumnInfo(name: $0.name, type: $0.typeName, kind: kind(of: $0.typeName))
+        do {
+            let con = try database.connect()
+            let rs = try con.query(sql, params.map(toDBValue))
+            let fetched = try rs.allRows()
+            let columns = rs.columns.map {
+                TablePage.ColumnInfo(name: $0.name, type: $0.typeName, kind: kind(of: $0.typeName))
+            }
+            return BadRowsPanel(cells: t.badCells, rows: t.badRows, columns: columns, data: fetched)
+        } catch let error as DuckDBError {
+            throw SessionError(error.firstLine)
         }
-        return BadRowsPanel(cells: t.badCells, rows: t.badRows, columns: columns, data: fetched)
     }
 
     // MARK: - filters / sort
