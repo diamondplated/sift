@@ -1,5 +1,6 @@
 import Testing
 import Foundation
+import TestSupport
 import DuckDBKit
 @testable import SiftCore
 @testable import SiftEngine
@@ -15,18 +16,10 @@ import DuckDBKit
 // the store file. Nothing here is `.serialized`.
 
 private func newSession() throws -> Session {
-    try Session(
-        home: FileManager.default.temporaryDirectory
-            .appendingPathComponent("sift-staging-tests-\(UUID().uuidString)").path
-    )
+    try Session(home: TestTemp.path("staging-tests"))
 }
 
-private func newTempDir() throws -> String {
-    let dir = FileManager.default.temporaryDirectory
-        .appendingPathComponent("sift-staging-\(UUID().uuidString)").path
-    try FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
-    return dir
-}
+private func newTempDir() throws -> String { TestTemp.dir("staging") }
 
 // MARK: - fixtures
 
@@ -934,8 +927,7 @@ private struct ConnectionBox: @unchecked Sendable {
     // only. (What two live in-process Sessions actually are is worse than sharing and is written
     // up in the report; this test deliberately does NOT rely on it. The first session is released
     // before the second opens, which is the real "next launch" this is about.)
-    let home = FileManager.default.temporaryDirectory
-        .appendingPathComponent("sift-staging-startup-\(UUID().uuidString)").path
+    let home = TestTemp.path("staging-startup")
     let path = try makeSmallCSV()
 
     do {
@@ -962,9 +954,7 @@ private struct ConnectionBox: @unchecked Sendable {
     // The catalog's key moved (I5) and the token format changed (C1). Neither can be patched in
     // place, so a legacy store is reset: its copies are DROPPED — not left stranded where nothing
     // can reach them — and the catalog is recreated with the current schema.
-    let home = FileManager.default.temporaryDirectory
-        .appendingPathComponent("sift-staging-legacy-\(UUID().uuidString)").path
-    try FileManager.default.createDirectory(atPath: home, withIntermediateDirectories: true)
+    let home = TestTemp.dir("staging-legacy")
     let store = (home as NSString).appendingPathComponent("stage.duckdb")
     let path = try makeSmallCSV()
 

@@ -1,5 +1,6 @@
 import Testing
 import Foundation
+import TestSupport
 import DuckDBKit
 @testable import SiftCore
 @testable import SiftEngine
@@ -19,10 +20,7 @@ import DuckDBKit
 
 private let sharedData = try! corpus()
 
-private func newSessionHome() -> String {
-    FileManager.default.temporaryDirectory
-        .appendingPathComponent("sift-session-tests-\(UUID().uuidString)").path
-}
+private func newSessionHome() -> String { TestTemp.path("session-tests") }
 
 private func newSession() throws -> Session {
     try Session(home: newSessionHome())
@@ -129,12 +127,7 @@ private func gzip(_ sourcePath: String, to destPath: String) throws {
     // so placing the bad row well past that window reproduces the real scenario
     // `_detect_bad_rows` exists for: the sniffer keeps "amount" numeric from the sample it saw,
     // and `ignore_errors` silently drops the one later row that does not fit it.
-    let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString).path
-    try FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
-    // Removed afterwards, per ProfileGenerationTests' own measured rule: the two 25,000-row
-    // dirty-CSV tests leaked ~1 MB per run each into the user's temp directory and were
-    // MEASURED at 74,683 orphaned directories / 24 GB, which filled the disk on 2026-08-11.
-    defer { try? FileManager.default.removeItem(atPath: dir) }
+    let dir = TestTemp.dir("dirty-gz")
     let plain = try makeCSV(dir: dir, name: "dirty.csv", rows: 25_000, badIntRow: 21_000)
     let gz = (dir as NSString).appendingPathComponent("dirty.csv.gz")
     try gzip(plain, to: gz)

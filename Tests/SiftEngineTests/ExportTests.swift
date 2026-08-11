@@ -1,5 +1,6 @@
 import Testing
 import Foundation
+import TestSupport
 import DuckDBKit
 @testable import SiftCore
 @testable import SiftEngine
@@ -18,18 +19,12 @@ import DuckDBKit
 private let sharedData = try! corpus()
 
 private func newSession() throws -> Session {
-    try Session(
-        home: FileManager.default.temporaryDirectory
-            .appendingPathComponent("sift-export-tests-\(UUID().uuidString)").path
-    )
+    try Session(home: TestTemp.path("export-tests"))
 }
 
-private func newOutputDir() throws -> String {
-    let dir = FileManager.default.temporaryDirectory
-        .appendingPathComponent("sift-export-out-\(UUID().uuidString)").path
-    try FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
-    return dir
-}
+/// Where the exports actually land. Under the same per-process root as everything else — an
+/// export test writes a real file, and the artifact leaks exactly like a session home does.
+private func newOutputDir() throws -> String { TestTemp.dir("export-out") }
 
 private func out(_ dir: String, _ name: String) -> String {
     (dir as NSString).appendingPathComponent(name)

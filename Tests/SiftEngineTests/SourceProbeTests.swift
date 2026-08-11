@@ -1,5 +1,6 @@
 import Testing
 import Foundation
+import TestSupport
 import DuckDBKit
 @testable import SiftCore
 @testable import SiftEngine
@@ -215,10 +216,7 @@ func sheetNamesWithQuotesDoNotBreakTheExpression() throws {
 /// A CSV written into its own temp directory. These fixtures are deliberately NOT in the shared
 /// corpus: each one exists to be handed to the sniffer whole, and they are six lines apiece.
 private func writeCSVFixture(_ name: String, _ text: String) throws -> String {
-    let dir = FileManager.default.temporaryDirectory
-        .appendingPathComponent("sift-ragged-\(UUID().uuidString)")
-    try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-    let path = dir.appendingPathComponent(name).path
+    let path = (TestTemp.dir("ragged") as NSString).appendingPathComponent(name)
     try text.write(toFile: path, atomically: true, encoding: .utf8)
     return path
 }

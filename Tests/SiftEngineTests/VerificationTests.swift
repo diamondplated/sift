@@ -1,5 +1,6 @@
 import Testing
 import Foundation
+import TestSupport
 import DuckDBKit
 @testable import SiftCore
 @testable import SiftEngine
@@ -53,10 +54,7 @@ private func column(_ name: String, _ type: String) -> TablePage.ColumnInfo {
     TablePage.ColumnInfo(name: name, type: type, kind: kind(of: type))
 }
 
-private func newHome() -> String {
-    FileManager.default.temporaryDirectory
-        .appendingPathComponent("sift-verification-tests-\(UUID().uuidString)").path
-}
+private func newHome() -> String { TestTemp.path("verification-tests") }
 
 // MARK: - 1. the runner
 
@@ -413,7 +411,6 @@ private func newHome() -> String {
 @Test func writeSalesCSVWritesTheHeaderAndExactlyTheRowsAsked() throws {
     let home = newHome()
     try FileManager.default.createDirectory(atPath: home, withIntermediateDirectories: true)
-    defer { try? FileManager.default.removeItem(atPath: home) }
     let path = (home as NSString).appendingPathComponent("sales.csv")
 
     try writeSalesCSV(path, rows: 7)
@@ -430,7 +427,6 @@ private func newHome() -> String {
 @Test func theParquetFixtureReallyCarriesADecimalColumn() throws {
     let home = newHome()
     try FileManager.default.createDirectory(atPath: home, withIntermediateDirectories: true)
-    defer { try? FileManager.default.removeItem(atPath: home) }
     let path = (home as NSString).appendingPathComponent("t.parquet")
 
     try writeParquet(path, rows: 10)
@@ -445,7 +441,6 @@ private func newHome() -> String {
 @Test func theDeltaFixtureTombstonesAFileThatIsStillPhysicallyPresent() throws {
     let home = newHome()
     try FileManager.default.createDirectory(atPath: home, withIntermediateDirectories: true)
-    defer { try? FileManager.default.removeItem(atPath: home) }
     let root = (home as NSString).appendingPathComponent("dtable")
 
     try writeDeltaTable(root, kept: 10, tombstoned: 5)
@@ -477,10 +472,6 @@ private func newHome() -> String {
     let home = newHome()
     let scratch = newHome()
     try FileManager.default.createDirectory(atPath: scratch, withIntermediateDirectories: true)
-    defer {
-        try? FileManager.default.removeItem(atPath: home)
-        try? FileManager.default.removeItem(atPath: scratch)
-    }
     let path = try writeSalesCSV((scratch as NSString).appendingPathComponent("sales.csv"), rows: 40)
 
     let overview = try await openAndDescribe(path: path, rows: 4, home: home)
@@ -524,10 +515,6 @@ private func newHome() -> String {
     let home = newHome()
     let scratch = newHome()
     try FileManager.default.createDirectory(atPath: scratch, withIntermediateDirectories: true)
-    defer {
-        try? FileManager.default.removeItem(atPath: home)
-        try? FileManager.default.removeItem(atPath: scratch)
-    }
     let path = try writeProseCSV((scratch as NSString).appendingPathComponent("prose.csv"))
 
     let overview = try await openAndDescribe(path: path, rows: 10, home: home)
@@ -549,10 +536,6 @@ private func newHome() -> String {
     let home = newHome()
     let scratch = newHome()
     try FileManager.default.createDirectory(atPath: scratch, withIntermediateDirectories: true)
-    defer {
-        try? FileManager.default.removeItem(atPath: home)
-        try? FileManager.default.removeItem(atPath: scratch)
-    }
     let path = try writeRaggedCSV((scratch as NSString).appendingPathComponent("ragged.csv"))
 
     let overview = try await openAndDescribe(path: path, rows: 10, home: home)
@@ -577,10 +560,6 @@ private func newHome() -> String {
     let scratch = newHome()
     let folder = (scratch as NSString).appendingPathComponent("daily")
     try FileManager.default.createDirectory(atPath: folder, withIntermediateDirectories: true)
-    defer {
-        try? FileManager.default.removeItem(atPath: home)
-        try? FileManager.default.removeItem(atPath: scratch)
-    }
     try writeSmallCSV((folder as NSString).appendingPathComponent("a.csv"), rows: 6, from: 0)
     try writeSmallCSV((folder as NSString).appendingPathComponent("b.csv"), rows: 4, from: 6)
 
@@ -608,10 +587,6 @@ private func newHome() -> String {
     let home = newHome()
     let scratch = newHome()
     try FileManager.default.createDirectory(atPath: scratch, withIntermediateDirectories: true)
-    defer {
-        try? FileManager.default.removeItem(atPath: home)
-        try? FileManager.default.removeItem(atPath: scratch)
-    }
     let path = try writeSalesCSV((scratch as NSString).appendingPathComponent("sales.csv"), rows: 5)
 
     let session = try Session(home: home)

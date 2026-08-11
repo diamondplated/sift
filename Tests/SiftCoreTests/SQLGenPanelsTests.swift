@@ -1,6 +1,7 @@
 import Testing
 import DuckDBKit
 import Foundation
+import TestSupport
 @testable import SiftCore
 
 // SQL generation for the panels: top-N, distinct stats, histogram, the extra profiling scan,
@@ -165,18 +166,8 @@ private let cols: [String: Column] = Dictionary(uniqueKeysWithValues: colsList.m
 // 24⟩") for that column — the per-cell highlighting in the "rows your file lost" panel
 // could not work end to end. This runs the generated SQL through a live DuckDB connection
 // against a genuinely dirty CSV and decodes the result the way SiftEngine will.
-// `tempDir()` in Fixtures.swift is file-private, so this file gets its own — same pattern
-// SnippetTests.swift already uses, one temp-dir helper is not worth sharing across files.
-private func badRowsTempDir() throws -> String {
-    let dir = FileManager.default.temporaryDirectory
-        .appendingPathComponent("sift-badrows-\(UUID().uuidString)")
-    try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-    return dir.path
-}
-
 @Test func badRowsSQLDecodesBadColumnsAsTheFailingColumnNames() throws {
-    let dir = try badRowsTempDir()
-    let path = try makeCSV(dir: dir, rows: 20, badIntRow: 5)   // row 5's amount becomes "N/A"
+    let path = try makeCSV(dir: TestTemp.dir("badrows"), rows: 20, badIntRow: 5)   // row 5's amount becomes "N/A"
     let con = try Database.inMemory().connect()
 
     // The "all-varchar relation" badRowsSQL expects: every column read as VARCHAR so its

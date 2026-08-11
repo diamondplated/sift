@@ -1,6 +1,7 @@
 import Testing
 import DuckDBKit
 import Foundation
+import TestSupport
 @testable import SiftCore
 
 // Fixture builders, ported from engine/tests/fixtures.py and engine/tests/conftest.py.
@@ -22,12 +23,9 @@ private func join(_ dir: String, _ name: String) -> String {
     URL(fileURLWithPath: dir).appendingPathComponent(name).path
 }
 
-private func tempDir() throws -> String {
-    let dir = FileManager.default.temporaryDirectory
-        .appendingPathComponent("sift-fixtures-\(UUID().uuidString)")
-    try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-    return dir.path
-}
+/// Still `throws` so the ~20 `try tempDir()` call sites below stay untouched — `TestTemp.dir`
+/// treats a temp directory it cannot create as fatal, not as one test's failure.
+private func tempDir() throws -> String { TestTemp.dir("fixtures") }
 
 /// Opens a throwaway in-memory database and tries to load `name`, tolerating failure exactly
 /// like conftest.py's session `con` fixture: a machine without network access on first run

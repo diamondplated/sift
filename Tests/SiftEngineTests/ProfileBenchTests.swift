@@ -1,5 +1,6 @@
 import Testing
 import Foundation
+import TestSupport
 import DuckDBKit
 @testable import SiftCore
 @testable import SiftEngine
@@ -12,13 +13,12 @@ import DuckDBKit
 // profiling 0.1 ms, worst `page()` 181-266 ms. Before the detach, worst `table()` was 7228 ms —
 // which is the whole point, and the number to re-measure before touching the detach.
 
-private func benchHome() -> String {
-    FileManager.default.temporaryDirectory
-        .appendingPathComponent("sift-profile-bench-\(UUID().uuidString)").path
-}
+private func benchHome() -> String { TestTemp.path("profile-bench") }
 
 /// Written once and cached in the temp dir across runs — building it takes longer than the
-/// measurement does.
+/// measurement does. Deliberately NOT under `TestTemp.root`, which is deleted at process exit:
+/// caching across runs is this fixture's whole point. One file, only ever written when
+/// `SIFT_PROFILE_BENCH=1` asks for it.
 private func wideFixture(cols: Int, rows: Int) throws -> String {
     let path = FileManager.default.temporaryDirectory
         .appendingPathComponent("sift-bench-\(cols)x\(rows).parquet").path

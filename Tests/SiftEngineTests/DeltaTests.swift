@@ -1,5 +1,6 @@
 import Testing
 import Foundation
+import TestSupport
 import DuckDBKit
 @testable import SiftCore
 @testable import SiftEngine
@@ -91,10 +92,7 @@ func timeTravelUsesTheVersionArgument() throws {
 /// Needs no extension itself: `isDeltaDir` looks for `_delta_log`, and the refusal happens before
 /// anything tries to read the table.
 @Test func aDeltaTableIsRefusedRatherThanGloblledWhenTheExtensionIsMissing() async throws {
-    let session = try Session(
-        home: FileManager.default.temporaryDirectory
-            .appendingPathComponent("sift-delta-refusal-\(UUID().uuidString)").path
-    )
+    let session = try Session(home: TestTemp.path("delta-refusal"))
     await session.setDeltaLoadedForTest(false)
 
     do {

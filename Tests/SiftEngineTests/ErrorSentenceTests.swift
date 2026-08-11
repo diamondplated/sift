@@ -1,5 +1,6 @@
 import Testing
 import Foundation
+import TestSupport
 import DuckDBKit
 @testable import SiftCore
 @testable import SiftEngine
@@ -29,17 +30,9 @@ import DuckDBKit
 // `Session.database` is internal, so a `@testable` test can put the store into those states the
 // same way a crash, a concurrent writer or a user with `rm` would.
 
-private func newSessionHome() -> String {
-    FileManager.default.temporaryDirectory
-        .appendingPathComponent("sift-error-sentence-tests-\(UUID().uuidString)").path
-}
+private func newSessionHome() -> String { TestTemp.path("error-sentence-tests") }
 
-private func tempDir() throws -> String {
-    let dir = FileManager.default.temporaryDirectory
-        .appendingPathComponent("sift-error-sentence-\(UUID().uuidString)").path
-    try FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
-    return dir
-}
+private func tempDir() throws -> String { TestTemp.dir("error-sentence") }
 
 /// The shape a Foundation dump has. Nothing the engine throws may ever match it.
 private func isAFoundationDump(_ text: String) -> Bool {
@@ -79,7 +72,6 @@ private func expectSentence(
 /// `sift: The operation couldn’t be completed. (DuckDBKit.DuckDBError error 1.)`.
 @Test func everyMalformedOpenReportsDuckDBsOwnSentence() async throws {
     let dir = try tempDir()
-    defer { try? FileManager.default.removeItem(atPath: dir) }
     func write(_ name: String, _ bytes: String) throws -> String {
         let path = (dir as NSString).appendingPathComponent(name)
         try bytes.write(toFile: path, atomically: true, encoding: .utf8)
@@ -104,7 +96,6 @@ private func expectSentence(
     // A staging swap turns the name into a real TABLE, and `DROP VIEW` on a table is a hard
     // `Catalog Error` — the review-I6 window, reconstructed exactly rather than raced.
     let dir = try tempDir()
-    defer { try? FileManager.default.removeItem(atPath: dir) }
     let path = try makeCSV(dir: dir, name: "x.csv", rows: 5)
     let session = try Session(home: newSessionHome())
     let t = try await session.openPath(path, name: "x")
@@ -122,7 +113,6 @@ private func expectSentence(
     // The mirror image: `unstage` drops the staged TABLE, and a VIEW under that name makes
     // `DROP TABLE` the hard error instead.
     let dir = try tempDir()
-    defer { try? FileManager.default.removeItem(atPath: dir) }
     let path = try makeCSV(dir: dir, name: "x.csv", rows: 5)
     let session = try Session(home: newSessionHome())
     let t = try await session.openPath(path, name: "x")
@@ -149,7 +139,6 @@ private func expectSentence(
     // with `rm`, and it used to arrive as a raw DuckDB dump because this one method deliberately
     // did not wrap — a Python-parity decision that the "one clean sentence" contract outranks.
     let dir = try tempDir()
-    defer { try? FileManager.default.removeItem(atPath: dir) }
     let path = try makeCSV(dir: dir, name: "dirty.csv", rows: 50)
 
     let session = try Session(home: newSessionHome())

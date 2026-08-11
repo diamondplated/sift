@@ -1,6 +1,7 @@
 import Testing
 import DuckDBKit
 import Foundation
+import TestSupport
 @testable import SiftCore
 
 // Profiling: what SUMMARIZE gives, and which panel each column earns. Ported from the 8 test
@@ -31,8 +32,7 @@ import Foundation
 /// empty).
 private func openNullsView(_ viewName: String) throws -> (con: Connection, cols: [Column]) {
     let con = try Database.inMemory().connect()
-    let path = try makeCSV(dir: FileManager.default.temporaryDirectory.path,
-                            name: "sift-profile-nulls-\(UUID().uuidString).csv",
+    let path = try makeCSV(dir: TestTemp.dir("profile-nulls"), name: "nulls.csv",
                             rows: 600, nullsEvery: 7, emptiesEvery: 11, nullishEvery: 13)
     try con.execute(
         "CREATE OR REPLACE VIEW \(viewName) AS SELECT * FROM "

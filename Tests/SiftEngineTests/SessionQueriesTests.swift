@@ -1,5 +1,6 @@
 import Testing
 import Foundation
+import TestSupport
 import DuckDBKit
 @testable import SiftCore
 @testable import SiftEngine
@@ -19,10 +20,7 @@ import DuckDBKit
 
 private let sharedData = try! corpus()
 
-private func newSessionHome() -> String {
-    FileManager.default.temporaryDirectory
-        .appendingPathComponent("sift-session-queries-tests-\(UUID().uuidString)").path
-}
+private func newSessionHome() -> String { TestTemp.path("session-queries-tests") }
 
 private func newSession() throws -> Session {
     try Session(home: newSessionHome())
@@ -136,10 +134,7 @@ private func makeUniqueIntCSV(dir: String, count: Int) throws -> String {
     // test. So the cached profile is overridden directly (the same sentinel-trick shape as
     // `setUncastableForTest`) while the REAL `distinctStatsSQL` query underneath still runs
     // against the real table below and can still genuinely overshoot.
-    let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString).path
-    try FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
-    defer { try? FileManager.default.removeItem(atPath: dir) }
-    let path = try makeUniqueIntCSV(dir: dir, count: 300)
+    let path = try makeUniqueIntCSV(dir: TestTemp.dir("unique-int"), count: 300)
 
     let session = try newSession()
     let t = try await session.openPath(path)
@@ -296,10 +291,7 @@ private func hugeCSVSpec(like spec: SourceSpec) -> SourceSpec {
 /// is a confident, wrong claim about someone's data, in the tool whose whole pitch is not making
 /// those.
 @Test func aSerialDateShapedColumnInACsvGetsNoExcelNote() async throws {
-    let dir = FileManager.default.temporaryDirectory
-        .appendingPathComponent("sift-serial-csv-\(UUID().uuidString)").path
-    try FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
-    defer { try? FileManager.default.removeItem(atPath: dir) }
+    let dir = TestTemp.dir("serial-csv")
 
     // Values sitting squarely inside the window, 100 distinct — so the PREDICATE says yes and the
     // format gate is the only thing that can say no.
@@ -334,9 +326,7 @@ private func hugeCSVSpec(like spec: SourceSpec) -> SourceSpec {
     // *compressed* CSV samples only the first 20,480 rows regardless of size, so a bad row placed
     // well past that window reproduces the real scenario: the sniffer keeps "amount" numeric from
     // the sample, and the later row does not fit it.
-    let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString).path
-    try FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
-    defer { try? FileManager.default.removeItem(atPath: dir) }
+    let dir = TestTemp.dir("dirty-gz")
     let plain = try makeCSV(dir: dir, name: "dirty.csv", rows: 25_000, badIntRow: 21_000)
     let gz = (dir as NSString).appendingPathComponent("dirty.csv.gz")
     try gzip(plain, to: gz)

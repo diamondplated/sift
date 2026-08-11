@@ -26,6 +26,12 @@ let package = Package(
     ],
     targets: [
         .systemLibrary(name: "CDuckDB", path: "Sources/CDuckDB"),
+        // Test-only, and deliberately NOT a test target: SwiftPM test targets cannot import one
+        // another (the reason Tests/SiftEngineTests/Fixtures.swift is a second copy of
+        // Tests/SiftCoreTests/Fixtures.swift), and all three of them need the same temp-directory
+        // root. Lives under Tests/ so it cannot be mistaken for shipping code, and is depended on
+        // by nothing else, so it never reaches Sift.app.
+        .target(name: "TestSupport", path: "Tests/TestSupport"),
         .target(
             name: "DuckDBKit",
             dependencies: ["CDuckDB"],
@@ -33,13 +39,13 @@ let package = Package(
         ),
         .testTarget(
             name: "DuckDBKitTests",
-            dependencies: ["DuckDBKit"]
+            dependencies: ["DuckDBKit", "TestSupport"]
         ),
         // Pure value types only — no dependencies, imports Foundation and nothing else.
         .target(name: "SiftCore"),
         .testTarget(
             name: "SiftCoreTests",
-            dependencies: ["SiftCore", "DuckDBKit"],
+            dependencies: ["SiftCore", "DuckDBKit", "TestSupport"],
             resources: [.copy("Fixtures")]
         ),
         // The connection-needing half of core/source.py (and, later in this plan, session.py).
@@ -61,7 +67,7 @@ let package = Package(
         ),
         .testTarget(
             name: "SiftEngineTests",
-            dependencies: ["SiftEngine", "SiftCore", "DuckDBKit"]
+            dependencies: ["SiftEngine", "SiftCore", "DuckDBKit", "TestSupport"]
         ),
         // The headless verification surface, and the reason browser mode could be deleted. Kept
         // deliberately thin — a test target cannot import an `executableTarget`, so everything it

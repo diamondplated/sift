@@ -1,5 +1,6 @@
 import Testing
 import Foundation
+import TestSupport
 import DuckDBKit
 @testable import SiftCore
 
@@ -32,12 +33,7 @@ import DuckDBKit
 // non-Sendable and Swift Testing runs in parallel by default), matching every other file in this
 // suite; no shared corpus needed since these fixtures are small and cheap to build per test.
 
-private func tempDir() throws -> String {
-    let dir = FileManager.default.temporaryDirectory
-        .appendingPathComponent("sift-snippet-\(UUID().uuidString)")
-    try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-    return dir.path
-}
+private func tempDir() throws -> String { TestTemp.dir("snippet") }
 
 /// Mirrors source.py's `_describe`: `DESCRIBE SELECT * FROM <relation expr>`, decoded into the
 /// same `Column` shape `build_source` would have produced.

@@ -1,5 +1,6 @@
 import Testing
 import Foundation
+import TestSupport
 import DuckDBKit
 @testable import SiftCore
 @testable import SiftEngine
@@ -15,10 +16,7 @@ import DuckDBKit
 // exclusive file lock.
 
 private func newSession() throws -> Session {
-    try Session(
-        home: FileManager.default.temporaryDirectory
-            .appendingPathComponent("sift-joins-tests-\(UUID().uuidString)").path
-    )
+    try Session(home: TestTemp.path("joins-tests"))
 }
 
 // MARK: - the join fixture
@@ -47,9 +45,7 @@ struct JoinCorpus: Sendable {
 }
 
 private func makeJoinCorpus() throws -> JoinCorpus {
-    let dir = FileManager.default.temporaryDirectory
-        .appendingPathComponent("sift-joins-fixtures-\(UUID().uuidString)").path
-    try FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+    let dir = TestTemp.dir("joins-fixtures")
 
     let lhs = (dir as NSString).appendingPathComponent("lhs.csv")
     try """

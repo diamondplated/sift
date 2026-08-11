@@ -1,5 +1,6 @@
 import Testing
 import Foundation
+import TestSupport
 import DuckDBKit
 @testable import SiftCore
 
@@ -36,11 +37,7 @@ import DuckDBKit
 
 private let sharedData = try! corpus()
 
-private func freshTempDir() throws -> String {
-    let dir = FileManager.default.temporaryDirectory.appendingPathComponent("sift-source-\(UUID().uuidString)")
-    try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-    return dir.path
-}
+private func freshTempDir() throws -> String { TestTemp.dir("source") }
 
 // MARK: - detect_format
 

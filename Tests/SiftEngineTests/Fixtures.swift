@@ -1,6 +1,7 @@
 import Testing
 import DuckDBKit
 import Foundation
+import TestSupport
 @testable import SiftCore
 @testable import SiftEngine
 
@@ -16,12 +17,7 @@ private func join(_ dir: String, _ name: String) -> String {
     URL(fileURLWithPath: dir).appendingPathComponent(name).path
 }
 
-private func tempDir() throws -> String {
-    let dir = FileManager.default.temporaryDirectory
-        .appendingPathComponent("sift-engine-fixtures-\(UUID().uuidString)")
-    try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-    return dir.path
-}
+private func tempDir() throws -> String { TestTemp.dir("engine-fixtures") }
 
 func extensionIsAvailable(_ name: String) -> Bool {
     guard let db = try? Database.inMemory() else { return false }

@@ -1,5 +1,6 @@
 import Testing
 import Foundation
+import TestSupport
 import DuckDBKit
 @testable import SiftCore
 @testable import SiftEngine
@@ -32,10 +33,7 @@ private func newConnection() throws -> Connection {
 }
 
 private func newSession() throws -> Session {
-    try Session(
-        home: FileManager.default.temporaryDirectory
-            .appendingPathComponent("sift-paging-tests-\(UUID().uuidString)").path
-    )
+    try Session(home: TestTemp.path("paging-tests"))
 }
 
 /// `test_paging.py`'s own `_view`: build the source spec, expose it as a view, and hand back the

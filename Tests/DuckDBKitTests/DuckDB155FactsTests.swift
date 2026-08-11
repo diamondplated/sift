@@ -1,5 +1,6 @@
 import Foundation
 import Testing
+import TestSupport
 @testable import DuckDBKit
 
 /// Re-verification of the nine DuckDB 1.5.5 behaviors AGENTS.md pins, measured against
@@ -12,10 +13,9 @@ private func con() throws -> Connection {
 }
 
 private func tempCSV(_ contents: String) throws -> String {
-    let url = FileManager.default.temporaryDirectory
-        .appendingPathComponent("sift-fact-\(UUID().uuidString).csv")
-    try contents.write(to: url, atomically: true, encoding: .utf8)
-    return url.path
+    let path = TestTemp.path("fact", ".csv")
+    try contents.write(toFile: path, atomically: true, encoding: .utf8)
+    return path
 }
 
 @Test func fact1_theSniffEmptySentinelCannotBeFedBackIntoReadCsv() throws {
@@ -188,9 +188,7 @@ func fact6_deltaTimeTravelUsesVersionArrowNotAtVersion() throws {
     // `delta_scan(path, AT (VERSION => n))` — the syntax DuckDB's own SQL-standard AT clause
     // uses for other table functions — does not parse against delta_scan. core/source.py's
     // read_expr_at is built around exactly this.
-    let dir = FileManager.default.temporaryDirectory
-        .appendingPathComponent("sift-fact6-\(UUID().uuidString)").path
-    try FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+    let dir = TestTemp.dir("fact6")
     let db = try Database.inMemory()
     db.harden()
     db.loadExtensions(["delta"])

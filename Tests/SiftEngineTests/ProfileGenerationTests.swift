@@ -1,5 +1,6 @@
 import Testing
 import Foundation
+import TestSupport
 import DuckDBKit
 @testable import SiftCore
 @testable import SiftEngine
@@ -25,20 +26,13 @@ import DuckDBKit
 //     arrived moments later was itself dropped and the stale one stayed cached for the life of
 //     the table.
 
-private func newSessionHome() -> String {
-    FileManager.default.temporaryDirectory
-        .appendingPathComponent("sift-profile-generation-tests-\(UUID().uuidString)").path
-}
+private func newSessionHome() -> String { TestTemp.path("profile-generation-tests") }
 
-/// Removed by each test's own `defer`. The fixtures here are the widest in the suite, and left
-/// behind they were measured at 1.7 GB across 28 runs — ~55x the suite's usual per-invocation temp
-/// cost, which is a different thing from the suite's general habit of leaking small dirs.
-private func tempDir() throws -> String {
-    let dir = FileManager.default.temporaryDirectory
-        .appendingPathComponent("sift-profile-gen-\(UUID().uuidString)").path
-    try FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
-    return dir
-}
+/// The fixtures here are the widest in the suite: left behind they were measured at 1.7 GB across
+/// 28 runs, which is why this file grew a per-test `defer` before anything else did. That defer is
+/// gone — `TestTemp` removes the whole per-process root at exit, so the 28-run number is now
+/// structurally impossible rather than one file's discipline.
+private func tempDir() throws -> String { TestTemp.dir("profile-gen") }
 
 /// Wide, not long, and PARQUET — all three matter, and all three are measured.
 ///
@@ -101,7 +95,6 @@ private func withAProfileStillInFlight(
     // Kills the `tables[name]?.openedAt == openedAt` guard, and only that guard: the delivery
     // below carries the live claim's own job ID, so guard 1 is proven to wave it through first.
     let dir = try tempDir()
-    defer { try? FileManager.default.removeItem(atPath: dir) }
     let widePath = try wideFixture(dir: dir, name: "wide.parquet", cols: 200, rows: 500)
     // Same column names as the wide file on purpose: the in-flight job's second query names all
     // 200 of them, and a reopened file that lacked them would fail that query and make the job
@@ -155,7 +148,6 @@ private func withAProfileStillInFlight(
     // generation: the stale profile is cached, the replacement's claim is deleted, and the
     // replacement's own correct result is then rejected and lost.
     let dir = try tempDir()
-    defer { try? FileManager.default.removeItem(atPath: dir) }
     let path = try wideFixture(dir: dir, name: "wide.parquet", cols: 200, rows: 500)
 
     try await withAProfileStillInFlight("the claim guard") {
@@ -214,7 +206,6 @@ private func withAProfileStillInFlight(
     // refused them, so `histogram` would draw one file's bin bounds over another file's data and
     // `distinct` would seed its exact/approximate decision from them.
     let dir = try tempDir()
-    defer { try? FileManager.default.removeItem(atPath: dir) }
     let widePath = try wideFixture(dir: dir, name: "wide.parquet", cols: 200, rows: 500)
     let shortPath = try wideFixture(dir: dir, name: "short.parquet", cols: 200, rows: 30)
 
@@ -258,7 +249,6 @@ private func withAProfileStillInFlight(
     // failure it was. A job's error is never the caller's unless the table it was launched for is
     // still the one open.
     let dir = try tempDir()
-    defer { try? FileManager.default.removeItem(atPath: dir) }
     let widePath = try wideFixture(dir: dir, name: "wide.parquet", cols: 200, rows: 500)
 
     try await withAProfileStillInFlight("the closed-mid-panel error") {
@@ -298,7 +288,6 @@ private func withAProfileStillInFlight(
     // this case: the profile did not fail, the TABLE went away, and the very next query is going
     // to fail for the same reason with a worse message.
     let dir = try tempDir()
-    defer { try? FileManager.default.removeItem(atPath: dir) }
     let widePath = try wideFixture(dir: dir, name: "wide.parquet", cols: 200, rows: 500)
 
     try await withAProfileStillInFlight("the closed-mid-distinct error") {
@@ -333,7 +322,6 @@ private func withAProfileStillInFlight(
     // `nextProfileJobID` counts REGISTRATIONS, so it is the coalescing count directly.
     let session = try Session(home: newSessionHome())
     let dir = try tempDir()
-    defer { try? FileManager.default.removeItem(atPath: dir) }
     let path = try wideFixture(dir: dir, name: "wide.parquet", cols: 200, rows: 500)
 
     _ = try await session.openPath(path, name: "x")

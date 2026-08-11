@@ -1,6 +1,7 @@
 import Testing
 import CDuckDB
 import Foundation
+import TestSupport
 @testable import DuckDBKit
 
 // Forces an actual link against libduckdb (module autolink only fires on import)
@@ -64,11 +65,9 @@ import Foundation
     // enable_external_access=false would have blocked read_csv itself, which is exactly
     // why harden() deliberately does not set it. `SELECT 1` would NOT test this: it
     // touches no filesystem at all.
-    let path = FileManager.default.temporaryDirectory
-        .appendingPathComponent("sift-harden-\(UUID().uuidString).csv")
-    try "a,b\n1,2\n".write(to: path, atomically: true, encoding: .utf8)
-    defer { try? FileManager.default.removeItem(at: path) }
-    try con.execute("SELECT * FROM read_csv('\(path.path)', header=true)")
+    let path = TestTemp.path("harden", ".csv")
+    try "a,b\n1,2\n".write(toFile: path, atomically: true, encoding: .utf8)
+    try con.execute("SELECT * FROM read_csv('\(path)', header=true)")
 
     // A network read must be refused, and we assert WHICH mechanism refuses it.
     // MEASURED: what actually blocks this path is the extension guard
@@ -134,18 +133,14 @@ import Foundation
     // LOAD takes no bound parameters, so the name is interpolated. MEASURED before the
     // guard: this exact call created evil.db, attached it, and recorded the whole string
     // as successfully loaded.
-    let dir = FileManager.default.temporaryDirectory
-        .appendingPathComponent("sift-load-\(UUID().uuidString)")
-    try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-    defer { try? FileManager.default.removeItem(at: dir) }
-    let evil = dir.appendingPathComponent("evil.db")
+    let evil = (TestTemp.dir("load") as NSString).appendingPathComponent("evil.db")
 
     let db = try Database.inMemory()
-    let injected = "httpfs; ATTACH '\(evil.path)'"
+    let injected = "httpfs; ATTACH '\(evil)'"
     db.loadExtensions([injected])
 
     #expect(db.loadedExtensions[injected] == false)
-    #expect(!FileManager.default.fileExists(atPath: evil.path),
+    #expect(!FileManager.default.fileExists(atPath: evil),
             "loadExtensions executed the injected ATTACH")
     #expect(Database.isExtensionName("httpfs"))
     #expect(Database.isExtensionName("_x9"))

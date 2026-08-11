@@ -1,15 +1,12 @@
 import Testing
 import Foundation
+import TestSupport
 @testable import SiftCore
 
 // Row estimation from byte samples. No connection needed. Ported verbatim from
 // engine/tests/test_estimate.py — every test in that file is pure, so nothing is skipped here.
 
-private func freshTempDir() throws -> String {
-    let dir = FileManager.default.temporaryDirectory.appendingPathComponent("sift-estimate-\(UUID().uuidString)")
-    try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-    return dir.path
-}
+private func freshTempDir() throws -> String { TestTemp.dir("estimate") }
 
 /// Mirrors Python's `len(open(p, "rb").readline())`: the byte length of the first line,
 /// including its terminator.

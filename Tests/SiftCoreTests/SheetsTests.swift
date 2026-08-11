@@ -1,5 +1,6 @@
 import Testing
 import Foundation
+import TestSupport
 @testable import SiftCore
 
 // Excel: sheet enumeration and the legacy .xls refusal. Ported from engine/tests/test_sheets.py.
@@ -78,9 +79,7 @@ private func makeNonXLSXZip(dir: String) throws -> String {
 }
 
 @Test func aZipThatIsNotXLSXIsRefused() throws {
-    let dir = FileManager.default.temporaryDirectory.appendingPathComponent("sift-sheets-\(UUID().uuidString)").path
-    try FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
-    let zip = try makeNonXLSXZip(dir: dir)
+    let zip = try makeNonXLSXZip(dir: TestTemp.dir("sheets"))
     #expect(throws: UnsupportedSource.self) { try detectFormat(zip) }
 }
 
