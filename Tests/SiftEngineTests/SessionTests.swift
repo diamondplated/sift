@@ -218,6 +218,58 @@ private func gzip(_ sourcePath: String, to destPath: String) throws {
     #expect(Set(state.tables.map(\.name)) == ["clean", "clean_2"])
 }
 
+// MARK: - the engine hardens its own database (§11 frozen contract)
+
+/// 🔴 `db.harden()` could be deleted from `Session.init` and all 461 tests stayed green. The only
+/// hardening tests live in `DuckDBKitTests/SmokeTests.swift` and call `harden()` THEMSELVES — they
+/// prove the method works, and nothing proved the engine calls it. Spec §11 lists the four
+/// settings as a frozen contract, so a silent regression here is the whole security posture of a
+/// tool that runs arbitrary user SQL against arbitrary local files.
+///
+/// Asserted on the SETTINGS and on a real refusal, not on the `hardened` flag alone, because §11
+/// specifically warns that a test here must assert on the message: `hardened` is a dictionary this
+/// engine writes about itself, and a test that only reads it would survive DuckDB renaming a
+/// setting out from under the whole layer.
+@Test func aSessionHardensTheDatabaseItHandsEveryQuery() async throws {
+    let session = try newSession()
+
+    // 1. Every setting `harden()` names actually applied. A `false` here means DuckDB renamed one
+    //    and a security layer is silently gone — the exact signal `hardened` exists to carry.
+    #expect(session.database.hardened == ["disabled_filesystems": true,
+                                          "autoinstall_known_extensions": true,
+                                          "autoload_known_extensions": true,
+                                          "allow_community_extensions": true])
+
+    // 2. The three readable ones, read back from DuckDB itself on a connection opened AFTER init —
+    //    which is every connection the engine makes. `disabled_filesystems` is deliberately absent:
+    //    MEASURED, it reads back empty even on the connection that set it, so behaviour below is
+    //    the only honest assertion for that one.
+    let con = try session.database.connect()
+    for setting in ["autoinstall_known_extensions", "autoload_known_extensions",
+                    "allow_community_extensions"] {
+        let value = try con.query("SELECT current_setting('\(setting)')").allRows()[0][0]
+        #expect(value == .bool(false), "\(setting) is not off in a live Session")
+    }
+
+    // 3. And the behaviour, through the engine's own SQL box rather than a hand-built connection:
+    //    a network read is refused by the extension guard before anything reaches the network.
+    //    With `harden()` deleted the URL simply 404s instead — also an error, and a completely
+    //    different one, which is why the message is what is asserted.
+    let t = try await session.openPath(sharedData.cleanCSV)
+    var message = ""
+    do {
+        _ = try await session.runSQL(
+            t.name, sql: "SELECT * FROM read_csv_auto('https://example.com/x.csv')",
+            offset: 0, limit: 1
+        )
+        Issue.record("a network read succeeded through a hardened Session")
+    } catch let error as SessionError {
+        message = error.message
+    }
+    #expect(message.contains("requires the extension httpfs"),
+            "expected the extension guard to refuse the read; got: \(message)")
+}
+
 // MARK: - state() is in OPEN order, not Dictionary order
 
 /// 🔴 The tab bar's order, the sources list's order, and which table is selected on launch all
