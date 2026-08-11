@@ -423,6 +423,53 @@ public func raggedCollapseNote(_ spec: SourceSpec) -> String? {
         + "\u{2014} re-open with null padding to see all \(recovered)"
 }
 
+// MARK: - the preamble that ate the file
+
+/// How many lines the sniffer threw away as a preamble before landing on a header that then matched
+/// no data at all — `nil` for every file that kept something.
+///
+/// THE TELL: **rows == 0 and skip > 0.** A user handed Sift a file with content in it and Sift is
+/// showing an empty grid, having discarded lines to get there. Both halves are load-bearing and
+/// both are already sitting in the spec, so this costs nothing and reads no bytes.
+///
+/// Why NOT a line count, which is the obvious instinct. MEASURED on the file this was found on —
+/// three lines of prose, sniffed as `;` with `SkipRows: 2` and the third line as the header — the
+/// arithmetic BALANCES: 2 skipped + 1 header + 0 rows = 3 lines, every line accounted for. Nothing
+/// is missing in a counting sense; the problem is *which* lines were discarded, not how many. So
+/// `lines > skip + header + rows` is false here and a line count cannot see this defect at all,
+/// while also costing a read of a file we know nothing good about. The same measurement rules out
+/// "are there bytes past the header": the preamble ATE the file, so there are none.
+///
+/// Why it does not fire on the three files that must stay quiet (each has its own test, all
+/// MEASURED against the real sniffer):
+///
+///  - a header and nothing else (`order_id,region\n`) — genuinely 0 rows, but `SkipRows` is 0, so
+///    nothing was thrown away. This is the file that looks identical to the defect from the row
+///    count alone, which is exactly why the row count alone is not the rule.
+///  - a real preamble in front of real data — `skip` is 3 and proud of it, and the rows survived.
+///    `skip` is a FEATURE (`makeCSV(preamble:)` exists for it); only a skip that ate everything is
+///    worth a word.
+///  - an empty file, or one line with no trailing newline — 0 rows, `SkipRows` 0, silent.
+public func preambleAteTheFile(_ spec: SourceSpec) -> Int? {
+    guard spec.fmt == .csv, spec.rowCount == 0,
+        case .int(let skipped)? = spec.readArgs["skip"], skipped > 0
+    else { return nil }
+    return skipped
+}
+
+/// The one sentence a file whose preamble ate it gets, or `nil` for a healthy one.
+///
+/// Same voice as the sheet, folder, Delta and ragged notes: what happened, then what to do. The way
+/// out it names is `buildSource(skipPreamble: false)`, and it is safe to name without measuring
+/// first — unlike the ragged note's column count, this one promises no number. Pinning `skip` to 0
+/// on a file that skipped at least one line structurally cannot come back with less than it had.
+public func preambleNote(_ spec: SourceSpec) -> String? {
+    guard let skipped = preambleAteTheFile(spec) else { return nil }
+    let what = skipped == 1 ? "The first line was" : "The first \(skipped) lines were"
+    return "\(what) skipped as a preamble, which left no rows at all "
+        + "\u{2014} re-open without skipping to see them"
+}
+
 // MARK: - building read expressions
 
 private func formatReadArg(_ arg: ReadArg) -> String {

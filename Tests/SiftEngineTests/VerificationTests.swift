@@ -160,7 +160,8 @@ private func newHome() -> String {
     for required in [
         "open csv", "open parquet", "open json", "open ndjson", "open xlsx", "open delta",
         "open folder", "profile", "distinct panel", "histogram panel",
-        "sample and length panels", "dropped rows", "ragged csv", "snippet and rendered SQL",
+        "sample and length panels", "dropped rows", "ragged csv", "skipped preamble",
+        "snippet and rendered SQL",
         "SELECT-only gate", "staging and unstaging", "merge", "export",
     ] {
         #expect(names.contains(required), "the \u{201C}\(required)\u{201D} check has gone missing")
@@ -482,6 +483,39 @@ private func newHome() -> String {
 ///
 /// Written to FAIL before the fix and kept as the end-to-end guard afterwards: it goes through
 /// `openAndDescribe` and `renderOverview`, i.e. the exact bytes `sift <path>` puts on a terminal.
+/// 🔴 THE REGRESSION TEST FOR THE SECOND INSTANCE OF THE SAME CLASS, found by hand-checking one of
+/// the ragged fix's own false-positive controls. A three-line file of prose printed `0 rows`, two
+/// columns the user never wrote (`another line`, `semicolon too`), `no rows dropped`, and `(no
+/// rows)`. The sniffer picked `;` off line 3, threw the first two lines away as a preamble, and
+/// used what was left as the header — two thirds of the file discarded in silence.
+///
+/// Written to FAIL before the fix. Goes through `openAndDescribe` and `renderOverview`, i.e. the
+/// exact bytes `sift <path>` puts on a terminal.
+@Test func aFileWhosePreambleAteItSaysSo() async throws {
+    let home = newHome()
+    let scratch = newHome()
+    try FileManager.default.createDirectory(atPath: scratch, withIntermediateDirectories: true)
+    defer {
+        try? FileManager.default.removeItem(atPath: home)
+        try? FileManager.default.removeItem(atPath: scratch)
+    }
+    let path = try writeProseCSV((scratch as NSString).appendingPathComponent("prose.csv"))
+
+    let overview = try await openAndDescribe(path: path, rows: 10, home: home)
+    // Unchanged on purpose: Sift does not quietly re-read the file with different options. What it
+    // must not do is show an empty grid and say nothing about why.
+    #expect(overview.rows == 0)
+    #expect(overview.columns.count == 2)
+
+    let rendered = renderOverview(overview)
+    #expect(
+        rendered.contains("skipped as a preamble"),
+        "`sift <path>` threw two thirds of the file away and said nothing:\n\(rendered)"
+    )
+    #expect(rendered.contains("The first 2 lines were"), "the note does not say how much was lost")
+    #expect(rendered.contains("(no rows)"))
+}
+
 @Test func aRaggedFileSaysOutLoudThatItCollapsedIntoOneColumn() async throws {
     let home = newHome()
     let scratch = newHome()
@@ -602,6 +636,9 @@ func deltaOpensAndHonoursTombstones() async throws { try await withWorkspace(che
 }
 @Test func aCollapsedRaggedFileSaysSoAndNullPaddingGetsTheColumnsBack() async throws {
     try await withWorkspace(checkRaggedCollapse)
+}
+@Test func aFileEatenByItsPreambleSaysSoAndKeepingItGetsTheRowsBack() async throws {
+    try await withWorkspace(checkPreambleAteTheFile)
 }
 @Test func theRenderedSQLAndEverySnippetDialectAreProduced() async throws {
     try await withWorkspace(checkSnippetAndRenderedSQL)

@@ -304,3 +304,54 @@ private func detectFormatMatchesExpectation(file: FixtureFile, want: Fmt) throws
     #expect(raggedCollapseNote(folder)?.contains("whole file") == false)
     #expect(raggedCollapseNote(folder)?.hasSuffix("to see all 5") == true)
 }
+
+// MARK: - the preamble that ate the file
+//
+// The pure half of the second mis-sniff: three lines of prose sniffed as `;`, the first two thrown
+// away as a preamble and the third used as the header, leaving an empty grid. The tell is
+// rows == 0 AND skip > 0 — both already on the spec, so this reads no bytes. The real-sniffer half
+// (that these are the shapes DuckDB actually produces) is in SiftEngineTests/SourceProbeTests.swift.
+
+private func csvSpec(rows: Int?, skip: Int?, fmt: Fmt = .csv) -> SourceSpec {
+    var args: [String: ReadArg] = ["delim": .text(","), "header": .bool(true)]
+    if let skip { args["skip"] = .int(skip) }
+    return SourceSpec(
+        key: SourceKey(path: "/data/x.csv", mtimeNs: 0, size: 120), fmt: fmt, readFn: "read_csv",
+        readArgs: args, columns: [Column(name: "a", type: "VARCHAR")], rowCount: rows
+    )
+}
+
+@Test func preambleAteTheFileNeedsBothHalvesOfTheTell() {
+    // The defect: lines thrown away, and nothing left.
+    #expect(preambleAteTheFile(csvSpec(rows: 0, skip: 2)) == 2)
+    #expect(preambleAteTheFile(csvSpec(rows: 0, skip: 1)) == 1)
+
+    // A header and nothing else. Genuinely zero rows — and the file that looks EXACTLY like the
+    // defect if you only look at the row count, which is why the row count alone is not the rule.
+    #expect(preambleAteTheFile(csvSpec(rows: 0, skip: 0)) == nil)
+    // `skip` is a feature. Junk lines in front of real data are supported and must stay silent,
+    // however many were skipped.
+    #expect(preambleAteTheFile(csvSpec(rows: 200, skip: 3)) == nil)
+    #expect(preambleAteTheFile(csvSpec(rows: 1, skip: 9)) == nil)
+    // 🔴 An UNKNOWN row count is not zero. A compressed or over-64MB CSV gets no count at build
+    // time, and firing there would claim the file is empty on the strength of not having looked.
+    #expect(preambleAteTheFile(csvSpec(rows: nil, skip: 2)) == nil)
+    // Only the plain-CSV branch bakes `skip` at all; nothing else can produce this shape.
+    #expect(preambleAteTheFile(csvSpec(rows: 0, skip: 2, fmt: .globCsv)) == nil)
+    #expect(preambleAteTheFile(csvSpec(rows: 0, skip: nil)) == nil)
+}
+
+@Test func preambleNoteSaysHowMuchWasLostAndHowToGetItBackOrNothingAtAll() {
+    #expect(
+        preambleNote(csvSpec(rows: 0, skip: 2)) == "The first 2 lines were skipped as a preamble, "
+            + "which left no rows at all \u{2014} re-open without skipping to see them"
+    )
+    // One line is "The first line was", not "The first 1 lines were" — the same pluralisation care
+    // `renderDropped` takes over "1 row dropped".
+    #expect(preambleNote(csvSpec(rows: 0, skip: 1))?.hasPrefix("The first line was skipped") == true)
+    #expect(preambleNote(csvSpec(rows: 0, skip: 1))?.contains("1 lines") == false)
+    // A healthy file gets no note at all, rather than an empty one that would still render a blank
+    // `note:` line in `sift <path>`.
+    #expect(preambleNote(csvSpec(rows: 200, skip: 3)) == nil)
+    #expect(preambleNote(csvSpec(rows: 0, skip: 0)) == nil)
+}

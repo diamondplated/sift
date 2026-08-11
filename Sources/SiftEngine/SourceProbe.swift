@@ -80,11 +80,19 @@ private func cellTextList(_ cell: Cell) -> [String] {
 /// only on the read: with it, the sniffer stops falling back to a delimiter the file does not
 /// contain and reports the real dialect and the real columns (MEASURED on 1.5.5 — the same file
 /// that sniffs as one `|`-delimited column sniffs as five comma-delimited ones with it on).
+///
+/// `skipPreamble: false` pins `skip=0` so the sniffer cannot throw the file's own data away as a
+/// preamble. It works for precisely the reason the `skip=0` landmine in `buildSource` below is a
+/// landmine: pinning `skip` narrows the dialect search. That is a disaster next to `null_padding`
+/// and exactly what is wanted here — which is also why the two are alternatives rather than
+/// options that combine (see `buildSource`).
 public func sniffCSV(
-    _ con: Connection, path: String, sampleSize: Int = 20480, nullPadding: Bool = false
+    _ con: Connection, path: String, sampleSize: Int = 20480, nullPadding: Bool = false,
+    skipPreamble: Bool = true
 ) throws -> CSVSniff {
     var args = sampleSize > 0 ? "sample_size=\(sampleSize)" : "sample_size=-1"
     if nullPadding { args += ", null_padding=true" }
+    if !skipPreamble { args += ", skip=0" }
     let sql = """
         SELECT Delimiter, Quote, Escape, Comment, SkipRows, HasHeader, Prompt, \
         list_transform(Columns, x -> x.name) AS col_names, \
@@ -222,8 +230,17 @@ private func raggedRecovery(
 /// `readExpr` alone would produce a five-column relation under a one-column spec — the same class
 /// of quiet disagreement this whole change exists to remove. So it is sniffed with, baked in, and
 /// carried, exactly like `delim` and `header` are.
+/// `skipPreamble: false` is the way out of the other mis-sniff, the one `preambleAteTheFile`
+/// detects: it pins `skip=0` so the sniffer cannot discard the file's own data as a preamble.
+///
+/// The two escape hatches are ALTERNATIVES, not options that combine, and that is a DuckDB fact
+/// rather than a design preference: `skipPreamble: false` works by pinning `skip`, and a pinned
+/// `skip` is exactly what defeats `null_padding` (the landmine documented in the CSV branch below).
+/// Asking for both would silently get neither. Nothing needs them together — a file that collapsed
+/// into one column still has rows, and a file whose preamble ate it has none.
 public func buildSource(
-    _ con: Connection, path: String, sheet: String? = nil, nullPadding: Bool = false
+    _ con: Connection, path: String, sheet: String? = nil, nullPadding: Bool = false,
+    skipPreamble: Bool = true
 ) throws -> SourceSpec {
     let resolvedPath = realPath(path)
     let (mtimeNs, size, _) = try statInfo(resolvedPath)
@@ -321,7 +338,10 @@ public func buildSource(
     case .csv:
         let compressed = isCompressedPath(resolvedPath)
         let sampleSize = (!compressed && key.size <= fullSniffMaxBytes) ? -1 : 20480
-        let sn = try sniffCSV(con, path: resolvedPath, sampleSize: sampleSize, nullPadding: nullPadding)
+        let sn = try sniffCSV(
+            con, path: resolvedPath, sampleSize: sampleSize, nullPadding: nullPadding,
+            skipPreamble: skipPreamble
+        )
         var args: [String: ReadArg] = [
             "delim": .text(sn.delim), "quote": .text(sn.quote), "escape": .text(sn.escape),
             "header": .bool(sn.header),

@@ -244,6 +244,7 @@ let verificationChecks: [VerificationCheck] = [
     VerificationCheck(name: "sample and length panels", run: checkSmallPanels),
     VerificationCheck(name: "dropped rows", run: checkDroppedRows),
     VerificationCheck(name: "ragged csv", run: checkRaggedCollapse),
+    VerificationCheck(name: "skipped preamble", run: checkPreambleAteTheFile),
     VerificationCheck(name: "snippet and rendered SQL", run: checkSnippetAndRenderedSQL),
     VerificationCheck(name: "SELECT-only gate", run: checkSelectOnlyGate),
     VerificationCheck(name: "staging and unstaging", run: checkStagingRoundTrip),
@@ -631,6 +632,68 @@ let verificationChecks: [VerificationCheck] = [
     )
 }
 
+// MARK: the file your preamble ate
+
+/// The third shape of the same product claim, and the one found by hand-checking the ragged fix's
+/// own false-positive controls. `checkDroppedRows` covers a file losing ROWS and `checkRaggedCollapse`
+/// a file losing its COLUMN STRUCTURE; this covers a file losing everything. Three lines of prose
+/// sniffed as `;`, the first two thrown away as a preamble, the third turned into column names, and
+/// an empty grid under the words "no rows dropped".
+///
+/// The two files that must stay SILENT are the point of this check as much as the one that must
+/// speak: a header with no rows under it is a legitimate zero-row file, and a real preamble in
+/// front of real data is a supported feature.
+@Sendable func checkPreambleAteTheFile(_ ws: Workspace) async throws {
+    let path = try writeProseCSV(ws.path("prose.csv"))
+    let session = try ws.session()
+    let t = try await session.openPath(path)
+
+    // What Sift SHOWS is deliberately unchanged — it does not quietly re-read the file with
+    // different options. What it must not do is show an empty grid and say nothing about why.
+    try requireEqual(t.rowCount, 0, "rows the sniffed dialect found")
+    try requireEqual(t.spec.columns.count, 2, "columns the sniffer produced")
+    try requireEqual(preambleAteTheFile(t.spec), 2, "lines thrown away as a preamble")
+    try require(
+        t.notes.contains { $0.contains("skipped as a preamble") && $0.contains("no rows at all") },
+        "the open said nothing about the file being thrown away; notes were \(t.notes)"
+    )
+
+    let overview = try await openAndDescribe(path: path, rows: 10, home: ws.path("cli-home"))
+    let rendered = renderOverview(overview)
+    try require(
+        rendered.contains("The first 2 lines were skipped as a preamble"),
+        "`sift <path>` did not report the discarded preamble:\n\(rendered)"
+    )
+    try require(rendered.contains("(no rows)"), "the empty grid stopped saying it was empty:\n\(rendered)")
+
+    // 🔴 The way out the note names really works: pinning `skip` to 0 recovers the one column the
+    // file actually has and both lines of prose that were thrown away.
+    let con = try scratchDatabase().connect()
+    let kept = try buildSource(con, path: path, skipPreamble: false)
+    try requireEqual(kept.columns.map(\.name), ["notes"], "columns recovered by not skipping")
+    try requireEqual(kept.rowCount, 2, "rows recovered by not skipping")
+    try requireEqual(preambleAteTheFile(kept), nil, "the recovered spec still reported itself eaten")
+    let rows = try con.query("SELECT * FROM \(readExpr(spec: kept))").allRows()
+    try requireEqual(
+        rows.map { $0[0].display },
+        ["this is prose, with a comma", "another line; semicolon too"], "the recovered lines"
+    )
+
+    // SILENCE, on both shapes that look like this one and are not it. A note that fires on either
+    // teaches the reader to skip past notes, which costs them the one that was true.
+    let headerOnly = try buildSource(con, path: writeHeaderOnlyCSV(ws.path("header.csv")))
+    try requireEqual(headerOnly.rowCount, 0, "a header-only file should genuinely have no rows")
+    try requireEqual(preambleNote(headerOnly), nil, "a header-only file was reported as eaten")
+
+    // `skip` is a feature: 3 junk lines and 200 real rows must pass without a word. The `skip`
+    // assertion is fixture integrity — if DuckDB ever classifies those junk lines as comments
+    // instead, this file stops being a preamble file and the silence below proves nothing.
+    let preamble = try buildSource(con, path: writePreambleCSV(ws.path("preamble.csv"), rows: 200))
+    try requireEqual(preamble.readArgs["skip"], .int(3), "lines skipped in front of real data")
+    try requireEqual(preamble.rowCount, 200, "rows behind a real preamble")
+    try requireEqual(preambleAteTheFile(preamble), nil, "a real preamble was reported as eaten")
+}
+
 // MARK: what the user copies out
 
 @Sendable func checkSnippetAndRenderedSQL(_ ws: Workspace) async throws {
@@ -947,6 +1010,45 @@ func writeRaggedCSV(_ path: String) throws -> String {
         6,West,60
 
         """.write(toFile: path, atomically: true, encoding: .utf8)
+    return path
+}
+
+/// Three lines of one-column prose — the shape that makes DuckDB's sniffer throw the data away as
+/// a preamble.
+///
+/// MEASURED on the vendored 1.5.5: it picks `;` (from line 3), decides the first TWO lines are
+/// junk, and uses line 3 as the header. Two thirds of the file discarded, the remaining third
+/// turned into column names, and not one row left. The commas and the semicolon are the whole
+/// fixture — they are what give the sniffer a delimiter worth preferring over "this is one column
+/// of text".
+@discardableResult
+func writeProseCSV(_ path: String) throws -> String {
+    try """
+        notes
+        this is prose, with a comma
+        another line; semicolon too
+
+        """.write(toFile: path, atomically: true, encoding: .utf8)
+    return path
+}
+
+/// A header and nothing else. Genuinely zero rows, and the detector above must stay silent on it —
+/// this is the one file that looks exactly like the defect from the row count alone.
+@discardableResult
+func writeHeaderOnlyCSV(_ path: String) throws -> String {
+    try "order_id,region,amount\n".write(toFile: path, atomically: true, encoding: .utf8)
+    return path
+}
+
+/// Junk preamble lines followed by real data. `skip` is a FEATURE — this is the file it exists for,
+/// and it has to stay silent too.
+@discardableResult
+func writePreambleCSV(_ path: String, rows: Int, preamble: Int = 3) throws -> String {
+    var out = ""
+    for i in 0..<preamble { out += "# generated file, junk line \(i)\n" }
+    out += "order_id,region,amount\n"
+    for i in 0..<rows { out += "\(i),West,\(i).50\n" }
+    try out.write(toFile: path, atomically: true, encoding: .utf8)
     return path
 }
 

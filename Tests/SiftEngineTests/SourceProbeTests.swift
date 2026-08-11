@@ -392,3 +392,94 @@ private let raggedCSVText = """
     // ...and the ordinary multi-column folder in the shared corpus stays quiet too.
     #expect(try buildSource(con, path: sharedData.hive).raggedColumns == nil)
 }
+
+// MARK: - supplementary: the preamble that ate the file
+//
+// The real-sniffer half of the second mis-sniff. The pure rule is pinned in
+// SiftCoreTests/SourceTests.swift against hand-built specs; these feed DuckDB the actual bytes,
+// which is the only way to know that the sniffer really does throw two of three lines away — and,
+// far more importantly, that the two files which look like this one and are NOT it stay silent.
+
+@Test func buildSourceNoticesWhenThePreambleAteTheWholeFile() throws {
+    let con = try newConnection()
+    let path = try writeCSVFixture(
+        "prose.csv", "notes\nthis is prose, with a comma\nanother line; semicolon too\n"
+    )
+    let spec = try buildSource(con, path: path)
+
+    // Still exactly what the sniffer said — the file is NOT quietly re-read behind the user's back.
+    #expect(spec.readArgs["skip"] == .int(2))
+    #expect(spec.columns.map(\.name) == ["another line", "semicolon too"])
+    #expect(spec.rowCount == 0)
+    // ...and the loss is now named.
+    #expect(preambleAteTheFile(spec) == 2)
+    #expect(preambleNote(spec)?.contains("The first 2 lines were") == true)
+}
+
+@Test func buildSourceStaysQuietOnEveryFileThatLegitimatelyHasNoRows() throws {
+    let con = try newConnection()
+    let quiet: [(String, String)] = [
+        // The one that looks identical from the row count alone: a real header, no data under it.
+        ("header_only.csv", "order_id,region,amount\n"),
+        ("header_only_trailing_newline.csv", "order_id,region,amount\n\n"),
+        // Genuinely empty, and one line with no trailing newline.
+        ("empty.csv", ""),
+        ("one_line.csv", "just one line of text"),
+    ]
+    for (name, text) in quiet {
+        let spec = try buildSource(con, path: try writeCSVFixture(name, text))
+        #expect(spec.rowCount == 0, "\(name) is not the zero-row file this test needs")
+        #expect(
+            preambleAteTheFile(spec) == nil,
+            "\(name) was wrongly reported as eaten by its preamble"
+        )
+        #expect(preambleNote(spec) == nil, "\(name) got a note it should not have")
+    }
+}
+
+@Test func aRealPreambleInFrontOfRealDataStaysSilent() throws {
+    // `skip` is a FEATURE — `makeCSV(preamble:)` exists for exactly this file, and the shared
+    // corpus already carries one (`weirdCSV`: 3 junk lines, a BOM, CRLF and 300 real rows). A note
+    // here would fire on every legitimately-preambled export in the world.
+    let con = try newConnection()
+    let spec = try buildSource(con, path: sharedData.weirdCSV)
+    #expect(spec.readArgs["skip"] == .int(3), "the fixture stopped carrying a preamble")
+    #expect(spec.rowCount == 300)
+    #expect(preambleAteTheFile(spec) == nil)
+    #expect(preambleNote(spec) == nil)
+
+    // And the ordinary no-preamble CSV, for completeness.
+    #expect(preambleAteTheFile(try buildSource(con, path: sharedData.cleanCSV)) == nil)
+}
+
+@Test func notSkippingIsTheWayOutAndItReallyGetsTheRowsBack() throws {
+    let con = try newConnection()
+    let path = try writeCSVFixture(
+        "prose.csv", "notes\nthis is prose, with a comma\nanother line; semicolon too\n"
+    )
+    let spec = try buildSource(con, path: path, skipPreamble: false)
+
+    #expect(preambleAteTheFile(spec) == nil, "the recovered spec still reported itself eaten")
+    // 🔴 The pin is the mechanism: `skip=0` baked into the sniff is what stops the sniffer
+    // throwing lines away. Delete the `if !skipPreamble` clause in sniffCSV and this goes red.
+    #expect(spec.readArgs["skip"] == .int(0))
+    #expect(spec.columns.map(\.name) == ["notes"])
+    #expect(spec.rowCount == 2)
+
+    let rows = try con.query("SELECT * FROM \(readExpr(spec: spec))").allRows()
+    try #require(rows.count == 2)
+    #expect(
+        rows.map { $0[0].display } == ["this is prose, with a comma", "another line; semicolon too"]
+    )
+}
+
+@Test func notSkippingLeavesAFileWithNothingToSkipExactlyAsItWas() throws {
+    // The option is an escape hatch, not a mode: asking for it on a file that never had a preamble
+    // must not reshape it either.
+    let con = try newConnection()
+    let plain = try buildSource(con, path: sharedData.cleanCSV)
+    let kept = try buildSource(con, path: sharedData.cleanCSV, skipPreamble: false)
+    #expect(kept.columns.map(\.name) == plain.columns.map(\.name))
+    #expect(kept.columns.map(\.type) == plain.columns.map(\.type))
+    #expect(kept.rowCount == plain.rowCount)
+}
