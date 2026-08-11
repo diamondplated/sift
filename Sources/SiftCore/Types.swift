@@ -233,12 +233,23 @@ public struct SourceSpec: Sendable, Equatable {
     public let sniffPrompt: String?
     /// The pattern actually handed to read_parquet/read_csv.
     public let glob: String?
+    /// How many columns reading this file with `null_padding=true` gets back, set ONLY when the
+    /// sniffer collapsed a ragged file into a single column (see `collapsedDelimiter`). `nil` on
+    /// every source that sniffed sanely, which is what makes it the switch `raggedCollapseNote`
+    /// reads.
+    ///
+    /// MEASURED at open time rather than counted off the collapsed header, because a ragged file's
+    /// widest row can carry more fields than its header does — the `--verify` fixture has a
+    /// three-field header and five real columns. Quoting the header's count would put a second
+    /// wrong number on top of the first one, in the note whose whole job is to correct it.
+    public let raggedColumns: Int?
 
     public init(
         key: SourceKey, fmt: Fmt, readFn: String, readArgs: [String: ReadArg] = [:],
         columns: [Column] = [], rowCount: Int? = nil, rowEstimate: RowEstimate? = nil,
         compressed: Bool = false, sheet: String? = nil, sheets: [SheetInfo] = [],
-        deltaVersion: Int? = nil, sniffPrompt: String? = nil, glob: String? = nil
+        deltaVersion: Int? = nil, sniffPrompt: String? = nil, glob: String? = nil,
+        raggedColumns: Int? = nil
     ) {
         self.key = key
         self.fmt = fmt
@@ -253,6 +264,7 @@ public struct SourceSpec: Sendable, Equatable {
         self.deltaVersion = deltaVersion
         self.sniffPrompt = sniffPrompt
         self.glob = glob
+        self.raggedColumns = raggedColumns
     }
 
     /// The path or glob the read function is pointed at.

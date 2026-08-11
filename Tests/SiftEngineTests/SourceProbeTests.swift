@@ -203,3 +203,192 @@ func sheetNamesWithQuotesDoNotBreakTheExpression() throws {
     let n = try con.query("SELECT count(*) FROM \(readExpr(spec: spec))").allRows()[0][0]
     #expect(n == .int(200))
 }
+
+// MARK: - supplementary: the ragged-CSV collapse
+//
+// The real-sniffer half of the fix. SiftCoreTests/SourceTests.swift pins the pure rule against
+// hand-built inputs; these feed DuckDB's actual sniffer the actual bytes, which is the only way to
+// know that the collapse shape is what it produces and — much more importantly — that none of the
+// legitimate one-column files trip it. A detector that fires on a healthy file is worse than no
+// detector, because it teaches the reader to skip past notes.
+
+/// A CSV written into its own temp directory. These fixtures are deliberately NOT in the shared
+/// corpus: each one exists to be handed to the sniffer whole, and they are six lines apiece.
+private func writeCSVFixture(_ name: String, _ text: String) throws -> String {
+    let dir = FileManager.default.temporaryDirectory
+        .appendingPathComponent("sift-ragged-\(UUID().uuidString)")
+    try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+    let path = dir.appendingPathComponent(name).path
+    try text.write(toFile: path, atomically: true, encoding: .utf8)
+    return path
+}
+
+private let raggedCSVText = """
+    order_id,region,amount
+    1,Midwest,10
+    2,West,20
+    3,South,30,EXTRA,FIELDS
+    4,East,40
+    5,North,50,BOOM
+    6,West,60
+
+    """
+
+@Test func buildSourceNoticesWhenARaggedFileCollapsedIntoOneColumn() throws {
+    let con = try newConnection()
+    let spec = try buildSource(con, path: try writeCSVFixture("ragged.csv", raggedCSVText))
+
+    // Still exactly what the sniffer said — the file is NOT quietly re-read behind the user's back.
+    #expect(spec.columns.map(\.name) == ["order_id,region,amount"])
+    #expect(spec.rowCount == 6)
+    // ...but the collapse is now recorded, with the number null padding really gets back. Five,
+    // not the header's three: row 3 carries two fields the header has no name for.
+    #expect(spec.raggedColumns == 5)
+    #expect(raggedCollapseNote(spec)?.contains("to see all 5") == true)
+}
+
+@Test func buildSourceNoticesTheCollapseWhateverTheRealDelimiterWas() throws {
+    let con = try newConnection()
+    // Semicolon, tab and pipe files all sniff as `,` when ragged (measured) — the opposite
+    // fallback from the comma case above, and the reason the rule looks at what is left inside the
+    // name rather than hard-coding which delimiter the sniffer runs away to.
+    for (name, delim) in [("semi.csv", ";"), ("tab.csv", "\t"), ("pipe.csv", "|")] {
+        let text = ["a", "b", "c"].joined(separator: delim) + "\n"
+            + "1\(delim)2\(delim)3\n4\(delim)5\(delim)6\(delim)7\(delim)8\n9\(delim)10\(delim)11\n"
+        let spec = try buildSource(con, path: try writeCSVFixture(name, text))
+        #expect(spec.columns.count == 1, "\(name) did not collapse, so it tests nothing")
+        #expect(spec.raggedColumns == 5, "\(name): recovered \(String(describing: spec.raggedColumns))")
+    }
+}
+
+@Test func buildSourceStaysQuietOnEveryLegitimateSingleColumnFile() throws {
+    let con = try newConnection()
+    let healthy: [(String, String)] = [
+        // Prose full of commas, quoted the way any real writer emits it.
+        ("prose.csv", "note\n\"Hello, world\"\n\"Once upon a time, there was a file.\"\n"
+            + "\"Commas, everywhere, really\"\n\"and, again, more\"\n\"yes, indeed\"\n"),
+        // URLs carrying commas in their paths.
+        ("urls.csv", "url\n\"https://example.com/a,b\"\n\"https://example.com/c,d\"\n"
+            + "\"https://example.com/e,f\"\n\"https://example.com/g,h\"\n\"https://example.com/i,j\"\n"),
+        // Quoted strings, nothing but.
+        ("quoted.csv", "label\n\"alpha\"\n\"bravo\"\n\"charlie\"\n\"delta\"\n\"echo\"\n"),
+        // A JSON document per row — commas, colons and braces inside one VARCHAR column.
+        ("json.csv", "payload\n\"{\"\"a\"\": 1, \"\"b\"\": 2}\"\n\"{\"\"a\"\": 3, \"\"b\"\": 4}\"\n"
+            + "\"{\"\"a\"\": 5, \"\"b\"\": 6}\"\n"),
+        // 🔴 The one that decides the rule's shape: the HEADER itself contains a comma. DuckDB
+        // sniffs `,` here, so the comma in the column name is the chosen delimiter — and a rule
+        // that only asked "is there a delimiter in the name" would fire on a perfectly good file.
+        ("names.csv", "\"Last, First\"\n\"Smith, John\"\n\"Doe, Jane\"\n\"Roe, Rich\"\n\"Poe, Edgar\"\n"),
+        // Plain single column, no delimiter anywhere.
+        ("plain.csv", "note\nalpha\nbeta\ngamma\ndelta\nepsilon\n"),
+    ]
+    for (name, text) in healthy {
+        let spec = try buildSource(con, path: try writeCSVFixture(name, text))
+        #expect(spec.columns.count == 1, "\(name) is not the one-column file this test needs")
+        #expect(
+            spec.raggedColumns == nil,
+            "\(name) was wrongly reported as collapsed into \(spec.raggedColumns ?? 0) columns"
+        )
+        #expect(raggedCollapseNote(spec) == nil, "\(name) got a note it should not have")
+    }
+    // And a perfectly ordinary multi-column CSV, for the same reason.
+    #expect(try buildSource(con, path: sharedData.cleanCSV).raggedColumns == nil)
+}
+
+@Test func nullPaddingIsTheWayOutAndItReallyRecoversTheColumns() throws {
+    let con = try newConnection()
+    let path = try writeCSVFixture("ragged.csv", raggedCSVText)
+    let spec = try buildSource(con, path: path, nullPadding: true)
+
+    #expect(spec.raggedColumns == nil, "a null-padded open reported itself collapsed")
+    #expect(spec.columns.map(\.name) == ["order_id", "region", "amount", "column3", "column4"])
+    // Baked into the spec, so every later query — the grid, the profile, the bad-cell scan —
+    // reads the same five columns rather than re-deriving them.
+    #expect(spec.readArgs["null_padding"] == .bool(true))
+    // 🔴 MEASURED, DuckDB 1.5.5: an explicit `skip=0` DEFEATS null_padding — the sniffer returns to
+    // the absent-delimiter fallback and the file collapses again. It reads as a no-op (it is the
+    // sniffer's own answer handed back), which is exactly why it needs a test rather than a
+    // comment: delete the `if !nullPadding` guard in buildSource and this line goes red.
+    #expect(spec.readArgs["skip"] == nil)
+
+    let rows = try con.query("SELECT * FROM \(readExpr(spec: spec))").allRows()
+    try #require(rows.count == 6)
+    // `#require`, not `#expect`, before indexing into a row: everything below reads columns 3 and
+    // 4, and on a regression that puts the file back to one column those subscripts TRAP — which
+    // in a parallel suite takes the whole runner down instead of failing one test. Measured while
+    // mutation-testing this file, not theorised.
+    try #require(rows.allSatisfy { $0.count == 5 })
+    #expect(rows[2].map(\.display) == ["3", "South", "30", "EXTRA", "FIELDS"])
+    // The two fields that had nowhere to live in the one-column read are NULL on the rows that
+    // never had them — not empty strings, and not a dropped row.
+    #expect(rows[0][3].isNull && rows[0][4].isNull)
+    #expect(!rows[4][3].isNull && rows[4][4].isNull)
+
+    // The all-varchar relation the bad-row scan reads has to survive the same option set —
+    // it drops `columns=` and adds `all_varchar`, and null padding has to still apply.
+    let raw = readExpr(spec: spec, allVarchar: true)
+    #expect(try con.query("SELECT count(*) FROM \(raw)").allRows()[0][0] == .int(6))
+    #expect(try describe(con, relationExpr: raw).count == 5)
+}
+
+@Test func nullPaddingLeavesAHealthyFileExactlyAsItWas() throws {
+    // The option is an escape hatch, not a mode: asking for it on a file that never needed it must
+    // not quietly reshape the file either.
+    let con = try newConnection()
+    let plain = try buildSource(con, path: sharedData.cleanCSV)
+    let padded = try buildSource(con, path: sharedData.cleanCSV, nullPadding: true)
+    #expect(padded.columns.map(\.name) == plain.columns.map(\.name))
+    #expect(padded.columns.map(\.type) == plain.columns.map(\.type))
+    #expect(padded.rowCount == plain.rowCount)
+}
+
+@Test func aFolderOfRaggedCSVsIsCaughtTheSameWayASingleOneIs() throws {
+    // The sibling path, found by pointing the shipped CLI at a folder: `glob_csv` never sniffs at
+    // all (it DESCRIBEs one member), so the single-file detection could not see it — and a folder
+    // of daily exports where one day came out ragged is exactly how this reaches a real user.
+    let con = try newConnection()
+    let first = try writeCSVFixture(
+        "a.csv", "order_id,region,amount\n1,Midwest,10\n2,West,20,EXTRA,FIELDS\n3,South,30\n"
+    )
+    let folder = (first as NSString).deletingLastPathComponent
+    try "order_id,region,amount\n4,East,40\n5,North,50,BOOM\n6,West,60\n".write(
+        toFile: (folder as NSString).appendingPathComponent("b.csv"), atomically: true, encoding: .utf8
+    )
+
+    let spec = try buildSource(con, path: folder)
+    #expect(spec.fmt == .globCsv)
+    #expect(spec.columns.map(\.name) == ["order_id,region,amount"])
+    #expect(spec.raggedColumns == 5)
+    // Worded for what actually happened: a folder collapses one file at a time.
+    #expect(raggedCollapseNote(spec)?.contains("every file in the folder") == true)
+
+    // And the same way out, on the same argument.
+    let padded = try buildSource(con, path: folder, nullPadding: true)
+    #expect(padded.raggedColumns == nil)
+    #expect(padded.columns.map(\.name) == ["order_id", "region", "amount", "column3", "column4"])
+    let rows = try con.query("SELECT * FROM \(readExpr(spec: padded))").allRows()
+    try #require(rows.count == 6)
+    // Five real columns plus the `filename` provenance column the folder read always appends —
+    // which is why the note counts the FILES' columns and not the relation's.
+    try #require(rows.allSatisfy { $0.count == 6 })
+    #expect(rows[1].prefix(5).map(\.display) == ["2", "West", "20", "EXTRA", "FIELDS"])
+    #expect(rows[4].prefix(5).map(\.display) == ["5", "North", "50", "BOOM", ""])
+}
+
+@Test func aHealthyFolderIsNotReportedAsCollapsed() throws {
+    // The folder fixtures the rest of the suite uses are multi-column, so this builds the harder
+    // case on purpose: a folder of legitimate ONE-column CSVs, which is the shape the new
+    // single-column pre-filter waves through to the delimiter check.
+    let con = try newConnection()
+    let first = try writeCSVFixture("a.csv", "note\n\"Hello, world\"\n\"and, again\"\n")
+    let folder = (first as NSString).deletingLastPathComponent
+    try "note\n\"third, line\"\n\"fourth, line\"\n".write(
+        toFile: (folder as NSString).appendingPathComponent("b.csv"), atomically: true, encoding: .utf8
+    )
+    let spec = try buildSource(con, path: folder)
+    #expect(spec.columns.count == 1)
+    #expect(spec.raggedColumns == nil)
+    #expect(raggedCollapseNote(spec) == nil)
+    // ...and the ordinary multi-column folder in the shared corpus stays quiet too.
+    #expect(try buildSource(con, path: sharedData.hive).raggedColumns == nil)
+}

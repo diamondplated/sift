@@ -243,6 +243,7 @@ let verificationChecks: [VerificationCheck] = [
     VerificationCheck(name: "histogram panel", run: checkHistogramPanel),
     VerificationCheck(name: "sample and length panels", run: checkSmallPanels),
     VerificationCheck(name: "dropped rows", run: checkDroppedRows),
+    VerificationCheck(name: "ragged csv", run: checkRaggedCollapse),
     VerificationCheck(name: "snippet and rendered SQL", run: checkSnippetAndRenderedSQL),
     VerificationCheck(name: "SELECT-only gate", run: checkSelectOnlyGate),
     VerificationCheck(name: "staging and unstaging", run: checkStagingRoundTrip),
@@ -571,6 +572,65 @@ let verificationChecks: [VerificationCheck] = [
     )
 }
 
+// MARK: the columns your file lost
+
+/// The other half of the same claim, and the half that shipped broken. `checkDroppedRows` covers a
+/// file losing ROWS; this covers one losing its entire COLUMN structure. When a CSV's rows do not
+/// all carry the same number of fields, DuckDB's sniffer cannot find a consistent field count for
+/// the real delimiter and falls back to one that does not occur in the file at all — so every row
+/// survives intact, as a single column literally named `order_id,region,amount`, under an
+/// honest-looking "no rows dropped". That is the exact failure this product exists to prevent, and
+/// it said nothing at all until this check existed.
+@Sendable func checkRaggedCollapse(_ ws: Workspace) async throws {
+    let path = try writeRaggedCSV(ws.path("ragged.csv"))
+    let session = try ws.session()
+    let t = try await session.openPath(path)
+
+    // What Sift SHOWS is deliberately unchanged. It does not quietly re-read the file with
+    // different options and hand back different columns — that would trade one silent behaviour
+    // for another, and the user would have no way to tell which read they were looking at.
+    try requireEqual(t.spec.columns.count, 1, "columns the sniffer produced")
+    try requireEqual(t.rowCount, 6, "rows in the file")
+    try requireEqual(t.spec.raggedColumns, 5, "columns null padding gets back")
+    try require(
+        t.notes.contains { $0.contains("read as one column") && $0.contains("null padding") },
+        "the open said nothing about the file losing its columns; notes were \(t.notes)"
+    )
+
+    // ...and it reaches the CLI, NEXT TO the dropped-rows line rather than instead of it. A file
+    // that lost its shape must not be able to print "no rows dropped" and stop there.
+    let overview = try await openAndDescribe(path: path, rows: 3, home: ws.path("cli-home"))
+    let rendered = renderOverview(overview)
+    try require(
+        rendered.contains("to see all 5"), "`sift <path>` did not report the collapse:\n\(rendered)"
+    )
+    try require(rendered.contains("no rows dropped"), "the dropped-rows line went missing:\n\(rendered)")
+
+    // 🔴 The half that makes the note worth printing at all: the way out it names really works.
+    // Same build path, one explicit option, and the five real columns come back with every field
+    // in place — including the two on row 3 that had nowhere to live in a one-column read.
+    let con = try scratchDatabase().connect()
+    let padded = try buildSource(con, path: path, nullPadding: true)
+    try requireEqual(
+        padded.columns.map(\.name), ["order_id", "region", "amount", "column3", "column4"],
+        "columns recovered by null padding"
+    )
+    try requireEqual(padded.raggedColumns, nil, "a null-padded open still reported itself collapsed")
+    let rows = try con.query("SELECT * FROM \(readExpr(spec: padded))").allRows()
+    try requireEqual(rows.count, 6, "rows read back with null padding")
+    try requireEqual(
+        rows[2].map(\.display), ["3", "South", "30", "EXTRA", "FIELDS"], "the widest row"
+    )
+
+    // The other direction, and the one that decides whether any of this is worth having: a healthy
+    // file stays quiet. A note that fires on a legitimate single-column file is worse than no note,
+    // because it teaches the reader to skip past the one that was true.
+    let clean = try writeSalesCSV(ws.path("sales.csv"), rows: 50)
+    try requireEqual(
+        try buildSource(con, path: clean).raggedColumns, nil, "a clean file was reported as collapsed"
+    )
+}
+
 // MARK: what the user copies out
 
 @Sendable func checkSnippetAndRenderedSQL(_ ws: Workspace) async throws {
@@ -864,6 +924,29 @@ func writeSalesCSV(_ path: String, rows: Int = 500) throws -> String {
         out += "\(i),\(regions[i % regions.count]),\(i).50,note \(i)\n"
     }
     try out.write(toFile: path, atomically: true, encoding: .utf8)
+    return path
+}
+
+/// A CSV whose rows do not all carry the same number of fields — the shape that makes DuckDB's
+/// sniffer give up on the real delimiter and collapse the whole file into one column.
+///
+/// Deliberately ragged by two different amounts: the header carries three fields, row 3 carries
+/// five and row 5 carries four. That is what makes 5 — not the header's 3, and not row 5's 4 — the
+/// number null padding recovers, and it is the whole reason `raggedColumns` is MEASURED rather than
+/// counted off the header. A fixture whose widest row matched its header would let a header count
+/// pass for the right answer and quietly turn the check into a tautology.
+@discardableResult
+func writeRaggedCSV(_ path: String) throws -> String {
+    try """
+        order_id,region,amount
+        1,Midwest,10
+        2,West,20
+        3,South,30,EXTRA,FIELDS
+        4,East,40
+        5,North,50,BOOM
+        6,West,60
+
+        """.write(toFile: path, atomically: true, encoding: .utf8)
     return path
 }
 

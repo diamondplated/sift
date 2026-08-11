@@ -370,6 +370,59 @@ private func readLine(from handle: FileHandle) -> Data {
     return line
 }
 
+// MARK: - the ragged-CSV collapse
+
+/// The delimiters DuckDB's sniffer chooses between, and therefore the only ones a collapsed
+/// header can still be carrying.
+private let plausibleDelimiters: [Character] = [",", ";", "\t", "|"]
+
+/// The delimiter a CSV really uses, when the sniffer collapsed the whole file into a single
+/// column — `nil` for every file that sniffed sanely.
+///
+/// THE TELL, and why it is this one. When a file's rows do not all carry the same number of
+/// fields, the sniffer can find no consistent field count for the real delimiter, so it settles on
+/// one that does not occur in the file at all — MEASURED on the vendored DuckDB 1.5.5: a
+/// comma-delimited ragged file sniffs as `|`, and a semicolon- or pipe-delimited one sniffs as
+/// `,`. One field per row is trivially consistent, so the entire header comes back as a single
+/// column NAME with the real delimiter still sitting inside it. That surviving delimiter — present
+/// in the name, absent from the delimiter the sniffer chose — is the signature this looks for. It
+/// is a strictly better tell than "the chosen delimiter does not appear in the file", which needs
+/// to read the file and still says nothing about how many columns were lost.
+///
+/// Why it does not fire on a legitimate single-column file (all five shapes MEASURED against the
+/// real sniffer, each with its own test in SourceProbeTests): a column of prose, of URLs, of quoted
+/// strings or of embedded JSON all sniff as `,` with a header like `note`/`url`/`payload` — no
+/// delimiter in the NAME at all, so `columns[0].name.contains` is false and nothing fires. The
+/// interesting one is a header that genuinely contains a comma, `"Last, First"`: the sniffer picks
+/// `,` there, so the comma in the name IS the chosen delimiter and the `!delim.contains` half
+/// stands the detector down. `delim.contains` rather than `delim != ","` because DuckDB's
+/// delimiter may be more than one character.
+///
+/// Firing on any of those would be worse than detecting nothing at all: a note that cries wolf is
+/// a note the user learns to read past, which costs them the one that was true.
+public func collapsedDelimiter(delim: String, columns: [Column]) -> Character? {
+    guard columns.count == 1 else { return nil }
+    return plausibleDelimiters.first { columns[0].name.contains($0) && !delim.contains($0) }
+}
+
+/// The one sentence a collapsed file gets, or `nil` for a healthy one.
+///
+/// Says what happened and what to do, and nothing else — same shape and same voice as the sheet,
+/// folder and Delta notes `openPath` attaches. `raggedColumns` is only ever set after a null-padded
+/// read was actually TRIED (`buildSource`), so the way out named here is one already measured to
+/// work rather than one hopefully suggested — and `> 1` is the rest of that promise: a recovery
+/// that recovers one column is not a way out, and "re-open with null padding to see all 1" would be
+/// a note that spends the reader's attention to tell them nothing.
+public func raggedCollapseNote(_ spec: SourceSpec) -> String? {
+    guard let recovered = spec.raggedColumns, recovered > 1 else { return nil }
+    // A folder collapses one file at a time, so "the whole file" would be quietly wrong there —
+    // and `recovered` counts the FILES' own columns, not the `filename` provenance column Sift
+    // appends on top of them.
+    let what = spec.fmt == .globCsv ? "every file in the folder" : "the whole file"
+    return "Not every row has the same number of fields, so \(what) read as one column "
+        + "\u{2014} re-open with null padding to see all \(recovered)"
+}
+
 // MARK: - building read expressions
 
 private func formatReadArg(_ arg: ReadArg) -> String {

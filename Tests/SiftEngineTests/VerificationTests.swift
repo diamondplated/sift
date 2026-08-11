@@ -160,7 +160,7 @@ private func newHome() -> String {
     for required in [
         "open csv", "open parquet", "open json", "open ndjson", "open xlsx", "open delta",
         "open folder", "profile", "distinct panel", "histogram panel",
-        "sample and length panels", "dropped rows", "snippet and rendered SQL",
+        "sample and length panels", "dropped rows", "ragged csv", "snippet and rendered SQL",
         "SELECT-only gate", "staging and unstaging", "merge", "export",
     ] {
         #expect(names.contains(required), "the \u{201C}\(required)\u{201D} check has gone missing")
@@ -474,6 +474,41 @@ private func newHome() -> String {
     #expect(rendered.contains("showing 4 of 40 rows"))
 }
 
+/// 🔴 THE REGRESSION TEST FOR THE DEFECT THIS WHOLE FEATURE EXISTS FOR. Inherited from the Python
+/// original, found by running the shipped CLI over a real file: a CSV whose rows do not all carry
+/// the same number of fields printed one column literally named `order_id,region,amount`, an
+/// honest-looking `no rows dropped`, and nothing else. Every row was intact; the entire column
+/// structure was gone, and the one line on screen that talks about loss said there wasn't any.
+///
+/// Written to FAIL before the fix and kept as the end-to-end guard afterwards: it goes through
+/// `openAndDescribe` and `renderOverview`, i.e. the exact bytes `sift <path>` puts on a terminal.
+@Test func aRaggedFileSaysOutLoudThatItCollapsedIntoOneColumn() async throws {
+    let home = newHome()
+    let scratch = newHome()
+    try FileManager.default.createDirectory(atPath: scratch, withIntermediateDirectories: true)
+    defer {
+        try? FileManager.default.removeItem(atPath: home)
+        try? FileManager.default.removeItem(atPath: scratch)
+    }
+    let path = try writeRaggedCSV((scratch as NSString).appendingPathComponent("ragged.csv"))
+
+    let overview = try await openAndDescribe(path: path, rows: 10, home: home)
+    // Unchanged on purpose: Sift does not quietly re-read the file with different options and
+    // show different columns. That would trade one silent behaviour for another.
+    #expect(overview.columns.count == 1)
+    #expect(overview.droppedRows == 0)
+
+    let rendered = renderOverview(overview)
+    #expect(
+        rendered.contains("read as one column"),
+        "`sift <path>` lost the file's column structure and said nothing:\n\(rendered)"
+    )
+    #expect(rendered.contains("to see all 5"), "the note does not say how many columns are there")
+    // The dropped-rows line is still printed and still true — the point is that it is no longer
+    // the ONLY thing said about a file that lost its shape.
+    #expect(rendered.contains("no rows dropped"))
+}
+
 @Test func openAndDescribeCountsAShortFileExactlyEvenBeforeTheBackgroundScanLands() async throws {
     let home = newHome()
     let scratch = newHome()
@@ -564,6 +599,9 @@ func deltaOpensAndHonoursTombstones() async throws { try await withWorkspace(che
 }
 @Test func droppedRowsAreCountedAndSaidOutLoud() async throws {
     try await withWorkspace(checkDroppedRows)
+}
+@Test func aCollapsedRaggedFileSaysSoAndNullPaddingGetsTheColumnsBack() async throws {
+    try await withWorkspace(checkRaggedCollapse)
 }
 @Test func theRenderedSQLAndEverySnippetDialectAreProduced() async throws {
     try await withWorkspace(checkSnippetAndRenderedSQL)

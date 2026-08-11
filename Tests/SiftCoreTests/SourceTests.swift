@@ -232,3 +232,75 @@ private func detectFormatMatchesExpectation(file: FixtureFile, want: Fmt) throws
     #expect(deltaVersion(sharedData.delta) == 1)   // makeDelta writes versions 0 and 1
     #expect(deltaVersion(try freshTempDir()) == nil)   // no _delta_log at all
 }
+
+// MARK: - the ragged-CSV collapse
+//
+// The pure half of the fix for the defect the shipped CLI showed on a real file: a CSV whose rows
+// do not all carry the same number of fields came back as ONE column literally named
+// `order_id,region,amount`, over the words "no rows dropped". `collapsedDelimiter` is the tell, and
+// it is pure — the real-sniffer half (that these are the shapes DuckDB actually produces, and that
+// null padding really recovers the columns) lives in SiftEngineTests/SourceProbeTests.swift.
+
+@Test func collapsedDelimiterSpotsEachDelimiterLeftInsideAOneColumnHeader() {
+    // The four shapes MEASURED on DuckDB 1.5.5: a ragged comma file sniffs as `|`; ragged
+    // semicolon, tab and pipe files all sniff as `,`. In every one the real delimiter is still
+    // sitting in the surviving column name.
+    #expect(collapsedDelimiter(delim: "|", columns: [Column(name: "order_id,region,amount", type: "VARCHAR")]) == ",")
+    #expect(collapsedDelimiter(delim: ",", columns: [Column(name: "a;b;c", type: "VARCHAR")]) == ";")
+    #expect(collapsedDelimiter(delim: ",", columns: [Column(name: "a\tb\tc", type: "VARCHAR")]) == "\t")
+    #expect(collapsedDelimiter(delim: ",", columns: [Column(name: "a|b|c", type: "VARCHAR")]) == "|")
+}
+
+@Test func collapsedDelimiterStandsDownOnEveryHealthySingleColumnFile() {
+    // Each of these is a legitimate one-column CSV, and firing on one would be worse than
+    // detecting nothing at all — a note that cries wolf is a note the reader learns to skip past.
+    // The header names are the ones DuckDB really reports for these files (SourceProbeTests feeds
+    // it the actual bytes); what matters here is that a plain name never trips the rule.
+    for name in ["note", "url", "payload", "amount", "Description of the thing"] {
+        #expect(
+            collapsedDelimiter(delim: ",", columns: [Column(name: name, type: "VARCHAR")]) == nil,
+            "fired on a one-column file named \u{201C}\(name)\u{201D}"
+        )
+    }
+    // The interesting one: a header that genuinely contains a comma. The sniffer picks `,` for it,
+    // so the comma in the name IS the chosen delimiter and the detector must stay quiet.
+    #expect(collapsedDelimiter(delim: ",", columns: [Column(name: "Last, First", type: "VARCHAR")]) == nil)
+    // Multi-character delimiters exist, which is why the rule tests membership rather than
+    // equality: a `, ` delimiter still accounts for the comma in the name.
+    #expect(collapsedDelimiter(delim: ", ", columns: [Column(name: "Last, First", type: "VARCHAR")]) == nil)
+    // And a file that really did sniff into columns is never collapsed, whatever is in the names.
+    #expect(
+        collapsedDelimiter(
+            delim: "|", columns: [Column(name: "a,b", type: "VARCHAR"), Column(name: "c", type: "VARCHAR")]
+        ) == nil
+    )
+    #expect(collapsedDelimiter(delim: ",", columns: []) == nil)
+}
+
+@Test func raggedCollapseNoteSaysWhatHappenedAndWhatToDoOrNothingAtAll() {
+    let key = SourceKey(path: "/data/ragged.csv", mtimeNs: 0, size: 0)
+    let collapsed = SourceSpec(key: key, fmt: .csv, readFn: "read_csv", raggedColumns: 5)
+    #expect(
+        raggedCollapseNote(collapsed) == "Not every row has the same number of fields, so the "
+            + "whole file read as one column \u{2014} re-open with null padding to see all 5"
+    )
+    // The switch is `raggedColumns`, and a healthy source gets no note at all rather than an
+    // empty one that would still render a blank `note:` line in `sift <path>`.
+    #expect(raggedCollapseNote(SourceSpec(key: key, fmt: .csv, readFn: "read_csv")) == nil)
+    // And a "recovery" that recovers a single column is not a way out. `buildSource` records what
+    // null padding measured either way; deciding whether that is worth a sentence is this
+    // function's job, so that the number in the note is always an improvement on what is on screen.
+    #expect(
+        raggedCollapseNote(SourceSpec(key: key, fmt: .csv, readFn: "read_csv", raggedColumns: 1)) == nil
+    )
+}
+
+@Test func raggedCollapseNoteSaysFolderWhenItWasAFolder() {
+    // A folder collapses one file at a time, so "the whole file" would be quietly wrong — the kind
+    // of small inaccuracy that makes a reader distrust the rest of the sentence.
+    let key = SourceKey(path: "/data/daily", mtimeNs: 0, size: 0)
+    let folder = SourceSpec(key: key, fmt: .globCsv, readFn: "read_csv", raggedColumns: 5)
+    #expect(raggedCollapseNote(folder)?.contains("every file in the folder") == true)
+    #expect(raggedCollapseNote(folder)?.contains("whole file") == false)
+    #expect(raggedCollapseNote(folder)?.hasSuffix("to see all 5") == true)
+}

@@ -95,6 +95,11 @@ public struct Table: Sendable {
         self.qspec = qspec
         self.openedAt = openedAt
         self.lastUsed = Date()
+        // Seeded here, not appended by `openPath` alongside the sheet/folder/Delta notes, because
+        // this one is a property of the SPEC rather than of one code path that happened to open
+        // it: a table built from a collapsed source carries the note whoever constructed it, and
+        // there is no way to add a second construction site that quietly loses it.
+        self.notes = raggedCollapseNote(spec).map { [$0] } ?? []
     }
 
     /// This table's columns keyed by name. `uniquingKeysWith` (last wins), not
