@@ -241,6 +241,11 @@ extension Session {
 
         // Profiled eagerly like any freshly-opened source, exactly where Python profiles it.
         // Python then emits `{"type": "opened"}`; in-process the catalog write above IS that.
+        //
+        // Awaited, not kicked: `merge` returns the joined `Table` and the caller renders it
+        // immediately, so returning before the profile exists would hand the UI a table with no
+        // column widths, no carets and an empty Schema tab. The wait is off the actor now
+        // (`computeProfile`), so a merge no longer freezes paging on the two source tables.
         _ = try await computeProfile(base)
         // `Table` is a struct, so the profile `computeProfile` just stored lives in the catalog's
         // copy, not in `t` — return the catalog's (the same object Python's caller gets back).

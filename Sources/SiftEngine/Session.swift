@@ -34,12 +34,16 @@ import SiftCore
 //
 // `Session` is an `actor`; it owns the catalog. `openPath`'s initial work and `page` run directly
 // on the actor — both are meant to be interactive-latency, matching Python running them in the
-// request-handling thread rather than the background pool. Only `_after_open`'s background work
-// (exact count, bad-row detection, staging decision) is genuinely slow, so it alone becomes a
-// detached `Task` that creates its own `Connection` off the actor and calls back with small, fast,
-// actor-isolated "apply" methods — each one checked against the `Table.openedAt` it was launched
-// for (see `runAfterOpen`'s doc comment), so a result from a closed-and-reopened table's stale
-// background scan can never land on the new table sharing its name.
+// request-handling thread rather than the background pool. The genuinely slow work — `_after_open`'s
+// pipeline (exact count, bad-row detection, staging decision), the staging CTAS, and profiling —
+// runs instead as a detached `Task` that creates its own `Connection` off the actor and calls back
+// with small, fast, actor-isolated "apply" methods: `applyCount`, `applyBadRows`,
+// `applyStageDecision`, `applyStaged`, `applyProfile`. Every one of them is checked against the
+// `Table.openedAt` it was launched for (see `runAfterOpen`'s doc comment), so a result from a
+// closed-and-reopened table's stale background work can never land on the new table sharing its
+// name. Profiling is the newest of these and the one with a public caller waiting on it: see
+// `SessionQueries.computeProfile`, which detaches the work and then awaits it, so the actor is free
+// for the duration while the caller still gets its profile.
 //
 // SSE (`attach_loop`/`subscribe`/`unsubscribe`/`emit`) is deleted, per the design spec: in-process,
 // a property change on an actor a SwiftUI-facing observer wraps IS the notification. Every call
@@ -101,6 +105,19 @@ public actor Session {
     /// which produces a `Table` that is not backed by a file but still needs an identity no later
     /// open can collide with.
     var nextOpenGeneration = 0
+
+    /// The in-flight profile per table name, with the `openedAt` it was launched for
+    /// (SessionQueries.swift owns every method that touches it; it lives here because Swift
+    /// extensions cannot add stored properties).
+    ///
+    /// Two jobs: it coalesces concurrent callers onto one `SUMMARIZE` — the UI kicks a profile
+    /// speculatively after the first page and the panels ask for one the moment a column is
+    /// clicked, and on a wide table each of those is over a second of DuckDB work — and it is the
+    /// claim token `applyProfile` checks, so a result whose claim was dropped (the table closed,
+    /// or `applyStaged`/`unstage` invalidating the profile mid-flight) lands nowhere. Keyed by
+    /// name AND generation because a table closed and reopened under the same name is a different
+    /// table whose caller must not be handed the old one's profile.
+    var profileJobs: [String: (openedAt: Int, task: Task<[ColumnProfile], Error>)] = [:]
 
     // Staging job state (Staging.swift owns every method that touches these; they live here
     // because Swift extensions cannot add stored properties).

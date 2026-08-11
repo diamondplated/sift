@@ -22,7 +22,10 @@ import SiftCore
 // own throwaway `Connection` per call, exactly like `openPath`'s initial half and
 // `runAfterOpen`'s background pipeline. There is no materialized-sort state here for a second
 // connection to fail to see, so there is no reason to share one — and no need for the "never
-// awaits inside" proof that makes sharing `pagingConnection` safe.
+// awaits inside" proof that makes sharing `pagingConnection` safe. Profiling goes one step
+// further: its `Connection` is opened inside a detached `Task` (`runProfile`), because it is the
+// one query pair here slow enough that running it on the actor froze paging — see
+// `computeProfile`.
 //
 // DECLARATION STYLE: functions that open a `Connection` and run SQL are declared `async throws`,
 // matching `page`'s own precedent (synchronous inside, `async` anyway for API consistency — see
@@ -90,18 +93,79 @@ extension Session {
     /// open — instead of re-running the all-varchar scan `uncastableSQL` represents. That scan
     /// reads every cell of every text column; running it twice per open is exactly the cost this
     /// cache exists to avoid.
+    ///
+    /// **The two queries run OFF the actor**, in a detached `Task` with its own `Connection`, the
+    /// same shape as `runAfterOpen`/`runStage` — and this method then awaits that task, so the
+    /// contract every caller already relies on is unchanged: it returns the profile, or throws.
+    /// What changed is that awaiting suspends, which releases the actor: paging, a second open,
+    /// and every `apply*` callback now run *during* a profile instead of behind it.
+    ///
+    /// MEASURED, and the whole reason for the detour: run on the actor, the two queries below hold
+    /// it for ~1.29 s on a 200-column × 200,000-row table (~0.12 s at 20 × 200k), because nothing
+    /// in them suspends. The UI kicks a profile as soon as the first page has rendered, so on a
+    /// wide file that was the user's first scroll stalling for over a second — spec §13a's
+    /// page-latency cliff in a second location. The numbers, before and after, are in
+    /// `.superpowers/sdd/2026-08-09-siftengine/profile-detach-report.md`.
+    ///
+    /// A caller that does NOT want to wait (the UI's speculative kick after the first page) wraps
+    /// this in its own `Task` and never awaits it; the coalescing in `profileJob(for:)` means that
+    /// kick and a panel's `profileOf` moments later share one `SUMMARIZE` rather than paying twice.
     public func computeProfile(_ name: String) async throws -> [ColumnProfile] {
-        var t = try table(name)
+        let t = try table(name)
         if let profile = t.profile { return profile }
-        t.profiling = true
-        defer {
-            t.profiling = false
-            tables[name] = t
+        return try await profileJob(for: t).value
+    }
+
+    /// The in-flight profile for this exact open of this table, started if there isn't one.
+    ///
+    /// Synchronous and actor-isolated on purpose: it publishes `profiling = true` and registers the
+    /// job in one uninterrupted step, so by the time `computeProfile` suspends on the task, the
+    /// flag is already visible to every other caller and a second caller can only ever find the
+    /// job — never a window where neither is true.
+    private func profileJob(for snapshot: Table) -> Task<[ColumnProfile], Error> {
+        if let existing = profileJobs[snapshot.name], existing.openedAt == snapshot.openedAt {
+            return existing.task
         }
 
+        var t = snapshot
+        // Published BEFORE the work starts, which is what finally makes `Table.profiling` a flag
+        // anything can observe: while `computeProfile` ran on the actor it set the flag and cleared
+        // it in a `defer` without ever suspending, so no other actor call could run in between and
+        // `true` was unreachable by construction.
+        t.profiling = true
+        tables[t.name] = t
+
+        let name = t.name
+        let openedAt = t.openedAt
+        let spec = t.spec
+        let rel = relation(t)
+        let uncastable = t.uncastable ?? [:]
+        // Everything the work needs is copied out here, as `Sendable` values. `Connection` is not
+        // `Sendable` and is created inside the task, never handed to it — and emphatically not
+        // `pagingConnection`, whose safety rests on every one of its users running to completion on
+        // the actor without suspending (Session.swift's header, fact 3).
+        let task = Task.detached { [self] in
+            do {
+                let profile = try runProfile(spec: spec, rel: rel, uncastable: uncastable)
+                await applyProfile(name, profile, openedAt: openedAt)
+                return profile
+            } catch {
+                await applyProfile(name, nil, openedAt: openedAt)
+                throw error
+            }
+        }
+        profileJobs[name] = (openedAt, task)
+        return task
+    }
+
+    /// The two profiling queries, off the actor on their own `Connection`. Ported verbatim from the
+    /// body `computeProfile` used to run inline; `nonisolated` and taking only `Sendable` values so
+    /// the detached task can run it without an actor hop, matching `runAfterOpen`'s helpers.
+    nonisolated func runProfile(
+        spec: SourceSpec, rel: String, uncastable: [String: Int]
+    ) throws -> [ColumnProfile] {
         do {
             let con = try database.connect()
-            let rel = relation(t)
 
             let summRS = try con.query("SUMMARIZE \(rel)")
             let summRows = try summRS.allRows()
@@ -113,15 +177,43 @@ extension Session {
                 rows: summRows.map { row in row.map { $0.isNull ? nil : $0.display } }
             )
 
-            let extraRS = try con.query(profileExtraSQL(rel, t.spec.columns))
+            let extraRS = try con.query(profileExtraSQL(rel, spec.columns))
             let extraRow = try extraRS.allRows()[0]
             var extra: [String: Int] = [:]
             for (i, meta) in extraRS.columns.enumerated() { extra[meta.name] = cellInt(extraRow[i]) }
 
-            let profile = buildProfile(
-                cols: t.spec.columns, summ: summ, extra: extra, uncastable: t.uncastable ?? [:],
+            return buildProfile(
+                cols: spec.columns, summ: summ, extra: extra, uncastable: uncastable,
                 nRows: extra["n"]
             )
+        } catch let error as DuckDBError {
+            throw SessionError(error.firstLine)
+        }
+    }
+
+    /// Land a finished profile on the open table — or, with `profile: nil`, record that the job
+    /// ended without one. The `applyCount`/`applyBadRows`/`applyStaged` shape, `Int?`-optional
+    /// argument included, for the same reason they have it: a background result is applied by a
+    /// small, fast, actor-isolated method, never by the background task itself.
+    ///
+    /// **The registry check is a claim token, and the `openedAt` half of it is the fix for a real
+    /// bug shape this branch has already shipped once** (a background row count applied by table
+    /// NAME reported 3,000,000 rows for a 10-row file). A table closed and reopened under the same
+    /// name is a different table; a profile computed for the old one describes the wrong columns of
+    /// the wrong file. `applyStaged`/`unstage` drop the entry outright for the same reason — the
+    /// copy they just published means a profile computed against what the name USED to point at is
+    /// no longer about this table either. Both cases land here as "no claim, drop the result".
+    ///
+    /// `profiling` stays `true` on a dropped result on purpose: the only two things that drop a
+    /// claim from under a live table both re-profile immediately afterward, so the flag reads as
+    /// "a profile is still owed", and the replacement job clears it.
+    func applyProfile(_ name: String, _ profile: [ColumnProfile]?, openedAt: Int) {
+        guard profileJobs[name]?.openedAt == openedAt else { return }
+        profileJobs.removeValue(forKey: name)
+        guard var t = tables[name], t.openedAt == openedAt else { return }
+
+        t.profiling = false
+        if let profile {
             t.profile = profile
             for p in profile where looksLikeExcelSerialDates(p) && t.spec.fmt == .xlsx {
                 t.notes.append(
@@ -129,13 +221,20 @@ extension Session {
                         + "(\(p.minS ?? "")\u{2013}\(p.maxS ?? ""))"
                 )
             }
-            return profile
-        } catch let error as DuckDBError {
-            throw SessionError(error.firstLine)
         }
+        tables[name] = t
     }
 
     /// Ported from Python's `profile_of`.
+    ///
+    /// Awaits the profile — it does not kick one and return a partial answer. That is the only
+    /// coherent contract for its three callers: `distinct` seeds `wantsExactDistinct` from
+    /// `approxDistinct` and would silently take the approximate branch for a table it was about to
+    /// learn is small; `histogram` derives its bin bounds from `numericBounds(p)` and has no
+    /// histogram at all without them; and the Column panel exists to display these numbers. A
+    /// "come back later" result would mean every one of them re-asking on a timer. What the detach
+    /// buys them is that the wait is now a suspension rather than a held actor, so the grid keeps
+    /// paging while a panel is loading.
     public func profileOf(_ name: String, col: String) async throws -> ColumnProfile {
         let profile = try await computeProfile(name)
         guard let match = profile.first(where: { $0.name == col }) else {
@@ -147,6 +246,13 @@ extension Session {
     // MARK: - distinct panel
 
     /// Ported from Python's `distinct`.
+    ///
+    /// The `profileOf` call in the middle of this method is now a real suspension point (see
+    /// `computeProfile`), so `cols`, `rel` and `facet` — all read before it — are a snapshot: a
+    /// `setSpec` landing during the wait produces a panel built against the spec that was current
+    /// when the user clicked. That is the same staleness Python had by construction (its panels ran
+    /// in a threadpool while the filters could change underneath), and the UI re-requests panels
+    /// after a spec change anyway. Worth knowing rather than worth fixing.
     public func distinct(
         _ name: String, col: String, limit: Int = 200, search: String? = nil
     ) async throws -> DistinctPanel {
@@ -232,7 +338,9 @@ extension Session {
         let cols = t.cols
         guard let column = cols[col] else { throw SessionError("No column '\(col)' in \(name).") }
         // NOT swallowed, unlike `distinct`'s own `profileOf` call above — Python leaves this one
-        // to propagate; it runs before the `try`/`except duckdb.Error` block even starts.
+        // to propagate; it runs before the `try`/`except duckdb.Error` block even starts. Same
+        // snapshot caveat as `distinct`: this awaits a profile that now runs off the actor, and
+        // `t`/`cols` were read before it.
         let p = try await profileOf(name, col: col)
         let rel = relation(t)
 

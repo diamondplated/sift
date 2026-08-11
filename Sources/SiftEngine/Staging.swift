@@ -336,6 +336,11 @@ extension Session {
             t.sortKey = nil
         }
         t.profile = nil                  // re-profile against the native table
+        // And revoke any profile already in flight: it is reading the VIEW this rename just
+        // replaced, so its answer is about what the name used to point at. `applyProfile` treats a
+        // missing registry entry as "no claim" and drops the result; `runStage` kicks a fresh
+        // profile against the copy immediately below.
+        profileJobs.removeValue(forKey: name)
         // After staging the table is materialized, so its own count is now authoritative and
         // already excludes the rows `ignore_errors` dropped at parse time.
         let rowCount = physicalRows + t.badRows
@@ -665,6 +670,7 @@ extension Session {
             t.sortKey = nil
         }
         t.profile = nil
+        profileJobs.removeValue(forKey: name)   // same revocation as `applyStaged`, other direction
         tables[name] = t
 
         _ = try await computeProfile(name)
