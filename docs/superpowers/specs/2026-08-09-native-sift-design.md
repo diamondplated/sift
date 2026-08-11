@@ -485,7 +485,7 @@ case that keeps each element as its own `Cell` rather than joining into text. Co
 `badRowsSQL`'s generated SQL against a real dirty CSV and asserts the decoded
 `bad_columns` names the failing column.
 
-**Six DuckDB types do not decode — Plan 3.** `ENUM` (23), `BIT` (29), `BIGNUM` (35),
+**Six DuckDB types do not decode — UNOWNED, deliberately (reassigned 2026-08-11).** `ENUM` (23), `BIT` (29), `BIGNUM` (35),
 `TIME_NS` (39), `VARIANT` (41) and `GEOMETRY` (40) render `⟨unsupported type N⟩`. NULLs
 in those columns still decode to `.null` correctly. `TIME_NS` is the notable one — the
 direct sibling of the `TIMESTAMP_NS` that Plan 1 does decode. Note that
@@ -535,10 +535,24 @@ change that rebuilds the engine, or a test suite that opens two on one home. **P
 add a second window without closing this first.** The fix is small — a process-wide set of open
 home paths in `Session.init` that either throws or hands back the existing `Database`.
 
-**`loadedExtensions[name] == false` conflates two failures — Plan 3.** A legal name with
+**`loadedExtensions[name] == false` conflates two failures — Plan 4 (reassigned 2026-08-11).** A legal name with
 no such extension installed, and a name rejected by the injection guard, both record
 `false`. Spec §11 turns this dictionary into "a missing `delta` extension refuses the
 open", so a caller cannot distinguish a missing binary from a typo in its own call.
+
+*Reassignment note, 2026-08-11.* Both entries above were tagged "Plan 3", and Plan 3 closed
+without them — which the whole-plan review refused to let pass silently. The rulings:
+
+- **The six types stay unowned on purpose.** Every one renders a loud `⟨unsupported type N⟩`
+  marker, so nothing is silently wrong, which is the bar this project actually holds. None has
+  appeared in a real file yet. Whoever hits one first owns it, and the marker is the contract
+  until then. `TIME_NS` is the one to watch: it is the direct sibling of the `TIMESTAMP_NS`
+  that pandas parquet produces and that Plan 1 does decode.
+- **The extension conflation moves to Plan 4**, because Plan 4 is the first thing that has to
+  tell a human the difference. A missing `delta` binary and a name the injection guard rejected
+  both record `false`, and §11 turns that dictionary into "a missing `delta` extension refuses
+  the open" — so the UI cannot say whether to install something or whether Sift asked for the
+  wrong thing. It needs distinguishable states before a banner can be written on it.
 
 **A mid-stream result error cannot be tested here — Plan 3 if streaming is adopted.**
 `allRows()` throws if `duckdb_result_error` is set after the drain, which closes the
