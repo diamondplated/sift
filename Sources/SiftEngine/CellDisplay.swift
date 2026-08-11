@@ -123,34 +123,12 @@ public func doubleGlyph(_ value: Double) -> String {
     return groupDigits(text == "-0" ? "0" : text)
 }
 
-/// Insert thousands separators into an already-correct digit string.
-///
-/// 🔴 It takes a STRING and never parses it, which is the entire point: a BIGINT, a HUGEINT and a
-/// DECIMAL all reach the grid with exact digits, and routing any of them through a `Double` on the
-/// way to a comma would round the value — `9007199254740993` becomes `...992`, silently, in an
-/// order-id column. Same reason the web's own `groupDigits` works on the string.
-///
-/// Anything that is not a plain digit run passes through untouched, so `inf`, `1e+16` from some
-/// future producer, or a text value that only looks numeric cannot be mangled here.
-///
-/// Not a fourth copy of `DuckDBKit.Cell.grouped` or `SiftCore.grouped(_:decimals:)`: both are
-/// module-internal and unreachable from here, and neither has this signature — one takes an `Int`,
-/// the other a `Double`, and the whole point of this one is that it takes neither.
-public func groupDigits(_ text: String) -> String {
-    let negative = text.hasPrefix("-")
-    let body = negative ? String(text.dropFirst()) : text
-    let parts = body.split(separator: ".", maxSplits: 1, omittingEmptySubsequences: false)
-    let whole = String(parts[0])
-    guard !whole.isEmpty, whole.allSatisfy(isASCIIDigit) else { return text }
-
-    var out = ""
-    for (i, digit) in whole.enumerated() {
-        if i > 0 && (whole.count - i) % 3 == 0 { out.append(",") }
-        out.append(digit)
-    }
-    let fraction = parts.count > 1 ? "." + parts[1] : ""
-    return (negative ? "-" : "") + out + fraction
-}
+// `groupDigits` and `isASCIIDigit` used to live here. They are now `SiftCore.groupDigits` /
+// `SiftCore.isASCIIDigit`, reached through this file's `import SiftCore` — see their doc comments
+// there for why: the string loop existed twice, once here and once inside SiftCore's own
+// `grouped(_:decimals:)`, and this module is the wrong home for a rule SiftCore already needed.
+// Only `DuckDBKit.Cell.grouped(Int)` remains separate, and only because DuckDBKit sits below
+// SiftCore in the module graph.
 
 /// `^-?\d+(\.\d+)?$`, the web's `NUMERIC_STR`, without NSRegularExpression.
 func isPlainNumber(_ text: String) -> Bool {
@@ -165,10 +143,6 @@ func isPlainNumber(_ text: String) -> Bool {
     }
     return true
 }
-
-/// ASCII `0`-`9` only. `Character.isNumber` is true for Devanagari and Arabic-Indic digits too,
-/// which `\d` in the ported regex is not, and which `String(format:)` never produces.
-func isASCIIDigit(_ c: Character) -> Bool { c.isASCII && c >= "0" && c <= "9" }
 
 // MARK: - timestamps
 

@@ -91,29 +91,63 @@ func human(_ nInput: Double) -> String {
     return "\(grouped(n, decimals: 1)) TB"
 }
 
+/// Insert thousands separators into an already-correct digit string.
+///
+/// 🔴 It takes a STRING and never parses it, which is the entire point: a BIGINT, a HUGEINT and a
+/// DECIMAL all reach the grid with exact digits, and routing any of them through a `Double` on the
+/// way to a comma would round the value — `9007199254740993` becomes `...992`, silently, in an
+/// order-id column. Same reason the web's own `groupDigits` works on the string.
+///
+/// Anything that is not a plain digit run passes through untouched, so `inf`, `nan`, `1e+16` from
+/// some future producer, or a text value that only looks numeric cannot be mangled here.
+///
+/// Lives in SiftCore, the lowest layer both consumers can import, and is `public` because
+/// SiftEngine's cell renderer (`CellDisplay.glyph`) and the `sift` CLI's row counts call it
+/// directly. It used to exist here AND in SiftEngine as two loops; `grouped(_:decimals:)` below is
+/// now a wrapper over it. One copy remains elsewhere — `DuckDBKit.Cell.grouped(Int)`, for blob
+/// sizes — and it stays there because DuckDBKit sits BELOW SiftCore in the module graph and cannot
+/// import it. Two loops separated by the dependency graph, rather than three separated by nobody
+/// having looked.
+///
+/// 🔴 NOT NumberFormatter, here or anywhere else on this branch. Without an explicit `.locale` it
+/// follows `Locale.current` and the same value renders four ways (MEASURED: en_US "1,234",
+/// de_DE "1.234", fr_FR "1 234", en_US_POSIX "1234").
+public func groupDigits(_ text: String) -> String {
+    let negative = text.hasPrefix("-")
+    let body = negative ? String(text.dropFirst()) : text
+    let parts = body.split(separator: ".", maxSplits: 1, omittingEmptySubsequences: false)
+    let whole = String(parts[0])
+    guard !whole.isEmpty, whole.allSatisfy(isASCIIDigit) else { return text }
+
+    var out = ""
+    for (i, digit) in whole.enumerated() {
+        if i > 0 && (whole.count - i) % 3 == 0 { out.append(",") }
+        out.append(digit)
+    }
+    let fraction = parts.count > 1 ? "." + parts[1] : ""
+    return (negative ? "-" : "") + out + fraction
+}
+
+/// ASCII `0`-`9` only. `Character.isNumber` is true for Devanagari and Arabic-Indic digits too,
+/// which `\d` in the ported regex is not, and which `String(format:)` never produces.
+public func isASCIIDigit(_ c: Character) -> Bool { c.isASCII && c >= "0" && c <= "9" }
+
 /// `n` formatted to `decimals` places with a thousands-grouped integer part — Python's
 /// `f"{n:,.{decimals}f}"`. Rounding comes from `String(format:)`, which — like Python's float
 /// formatting — round-trips the double's exact binary value and rounds half-to-even on an exact
-/// tie (verified against CPython; see task-6-report.md). Grouping loop mirrors DuckDBKit's
-/// `Cell.grouped`, extended to carry a fractional part and a sign.
+/// tie (verified against CPython; see task-6-report.md).
+///
+/// Formats, then defers to `groupDigits` for the separators. It carried its own copy of that loop
+/// until Task 9. Behaviour is unchanged, including the non-finite cases: `%.Nf` of an infinity
+/// spells "inf"/"-inf"/"nan", which the old loop passed through untouched (no digit ever satisfies
+/// `(count - i) % 3 == 0` for a 3-character run) and which `groupDigits` also passes through
+/// untouched, via its explicit all-digits guard.
 ///
 /// Not `private`: Source.swift's `estimateRows` reuses this for its `basis` strings (Python's
 /// `f"{n:,}"`), on the same "no NumberFormatter, no locale sensitivity" grounds — see task-9
 /// gotcha #5. Still module-internal, not `public`; nothing outside SiftCore needs it.
 func grouped(_ n: Double, decimals: Int) -> String {
-    let formatted = String(format: "%.\(decimals)f", n)
-    let negative = formatted.hasPrefix("-")
-    let unsigned = negative ? String(formatted.dropFirst()) : formatted
-    let parts = unsigned.split(separator: ".", maxSplits: 1, omittingEmptySubsequences: false)
-    let intDigits = String(parts[0])
-    let frac = parts.count > 1 ? ".\(parts[1])" : ""
-
-    var out = ""
-    for (i, c) in intDigits.enumerated() {
-        if i > 0 && (intDigits.count - i) % 3 == 0 { out.append(",") }
-        out.append(c)
-    }
-    return (negative ? "-" : "") + out + frac
+    groupDigits(String(format: "%.\(decimals)f", n))
 }
 
 public func stagingName(_ table: String) -> String {
