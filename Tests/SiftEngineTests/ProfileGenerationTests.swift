@@ -282,6 +282,48 @@ private func withAProfileStillInFlight(
     }
 }
 
+@Test func closingATableWhileTheDistinctPanelLoadsGivesItASentenceNotACatalogDump() async throws {
+    // The same close, one panel over. `histogram` lets `profileOf` propagate and reports
+    //     No open table named 'x'.
+    // `distinct` wrapped the identical call in `try?`, threw that sentence away, and then ran its
+    // stats query against a relation `closeTable` had just dropped — so the user closing a tab got
+    //     Catalog Error: Table with name x does not exist!
+    // This is the fourth instance of the "one clean sentence, never a parser dump" contract
+    // breaking in this plan, and it reopens one `ced8df7` fixed a level up (its own comment says
+    // "that used to surface as a raw 'Catalog Error…' when a user closed a tab mid-panel"). It is
+    // in the panel the UI calls on EVERY column click.
+    //
+    // The `try?` was there for a real reason — Python's own bare `except Exception: pass`, so a
+    // table whose profile fails still renders the panel. That reason does not survive contact with
+    // this case: the profile did not fail, the TABLE went away, and the very next query is going
+    // to fail for the same reason with a worse message.
+    let dir = try tempDir()
+    defer { try? FileManager.default.removeItem(atPath: dir) }
+    let widePath = try wideFixture(dir: dir, name: "wide.parquet", cols: 200, rows: 500)
+
+    try await withAProfileStillInFlight("the closed-mid-distinct error") {
+        let session = try Session(home: newSessionHome())
+        _ = try await session.openPath(widePath, name: "x")
+        let panel = Task { try await session.distinct("x", col: "c0") }
+        guard try await waitForProfileJob(session, "x") else {
+            Issue.record("the profile job never registered"); return true
+        }
+        // `profiling == true` means `distinct` is already suspended inside `profileOf`: its top-N
+        // query has run, and the stats query has not. That is exactly the window.
+        try await session.closeTable("x")
+
+        do {
+            _ = try await panel.value
+            // The profile beat the close and the panel was built for the table that was still
+            // open. Correct, and not what this test is about.
+            return false
+        } catch let error as SessionError {
+            #expect(error.message == "No open table named 'x'.", "got: \(error.message)")
+            return true
+        }
+    }
+}
+
 // MARK: - what the registry is actually for
 
 @Test func concurrentProfileCallsShareOneJobAndPublishTheProfilingFlag() async throws {

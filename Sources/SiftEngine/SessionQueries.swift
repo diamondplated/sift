@@ -324,12 +324,20 @@ extension Session {
             let (sql, params) = try topNSQL(rel, col, cols: cols, filters: facet, limit: limit, search: search)
             let rows = try con.query(sql, params.map(toDBValue)).allRows()
 
-            // Swallowed exactly like Python's bare `except Exception: pass` — a table with no
-            // profile yet (or one that fails to compute) still renders the panel, just without
-            // the "chosen view" hint or a seed for whether to ask DuckDB for an exact distinct
-            // count.
-            let p = try? await profileOf(name, col: col)
-            let approx = p?.approxDistinct ?? 0
+            // 🔴 NOT `try?`, and that is a fix rather than a divergence. Python's bare
+            // `except Exception: pass` here means "a table whose profile fails still renders the
+            // panel" — a fine intention that produced the worst message in the engine. Closing a
+            // tab while this panel loads makes `profileOf` throw the clean
+            // `No open table named 'x'.`; swallowing it left the very next statement querying a
+            // relation `closeTable` had just dropped, so the user got
+            // `Catalog Error: Table with name x does not exist!` for closing a tab. `histogram`
+            // lets the identical call propagate (see its own note) and reports the sentence; this
+            // now matches it. Nothing is lost: the case Python's `except` was protecting — a
+            // profile that fails while the table is still open — is precisely the case where the
+            // stats query below is about to fail too, and `computeProfile` already refuses to hand
+            // a caller an error that belonged to a different open of this name.
+            let p = try await profileOf(name, col: col)
+            let approx = p.approxDistinct
             let (statsSQL, statsParams) = try distinctStatsSQL(
                 rel, col, cols: cols, filters: facet, exact: wantsExactDistinct(approx)
             )
@@ -362,7 +370,7 @@ extension Session {
             }
 
             return DistinctPanel(
-                mode: p?.view ?? .topn, col: col, type: column.type, kind: column.kind,
+                mode: p.view, col: col, type: column.type, kind: column.kind,
                 nRows: nRows, nNonnull: cellInt(stats["n_nonnull"] ?? .int(0)),
                 nDistinct: .init(value: nDistinct, exact: exact),
                 values: values, otherN: max(0, nRows - shown), shown: values.count,
