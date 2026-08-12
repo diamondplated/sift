@@ -20,10 +20,8 @@ public struct RootView: View {
 
     public var body: some View {
         NavigationSplitView(columnVisibility: $state.sidebarVisibility) {
-            List(state.tables, id: \.name, selection: $state.activeName) { table in
-                Text(table.name)
-            }
-            .navigationSplitViewColumnWidth(min: 160, ideal: 220, max: 400)
+            SourceSidebar(state: state)
+                .navigationSplitViewColumnWidth(min: 160, ideal: 220, max: 400)
         } detail: {
             // Banners, filter bar, console, grid — `web/index.html:336-368`'s order. The banners sit
             // ABOVE the toolbar because several of them (staging, a missing extension) are about the
@@ -48,6 +46,9 @@ public struct RootView: View {
             }
         }
         .inspector(isPresented: $state.inspectorVisible) { InspectorView(state: state) }
+        // The whole window is the drop target. It publishes `\.sourceDragHot`, which is how the
+        // sidebar's dropzone and the empty state below both learn that a drag is over it.
+        .sourceDrop(state: state)
     }
 }
 
@@ -123,6 +124,10 @@ private let gridHeaderInset: CGFloat = 28
 /// The no-file-open state — `showEmptyState("nofile")` (`web/index.html:637-657`), copy included.
 private struct NothingOpenYet: View {
     let onOpen: () -> Void
+    /// `.gempty.drop` (`web/index.html:1543`) — the second half of the shell's drag hint, so a drag
+    /// over the window lights the pane the user is actually looking at as well as the sidebar.
+    /// Read from the environment rather than passed in, so `RootView`'s call site stays untouched.
+    @Environment(\.sourceDragHot) private var dragHot
 
     private let formats = ["csv", "parquet", "json", "ndjson", "xlsx", "delta table", "folder"]
 
@@ -164,5 +169,6 @@ private struct NothingOpenYet: View {
             .frame(maxWidth: 360)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background(dragHot ? Color.accentColor.opacity(0.10) : Color.clear)
     }
 }

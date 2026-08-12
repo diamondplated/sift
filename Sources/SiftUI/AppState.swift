@@ -215,25 +215,16 @@ public final class AppState {
 /// reachable from a test with a planted table — "counting…" in particular cannot be produced by
 /// opening a real file small enough for a test to wait on.
 ///
+/// 🔴 **The row phrase itself is `SourceSidebar`'s `rowText`, not a second copy of it.** Task 13 and
+/// Task 14 each ported `web/index.html:958-963` and landed within hours of each other, which on this
+/// branch is already a named failure — see commit 3c114b4, "Two tasks wrote compactCount, and only
+/// one of them was right". The toolbar's contribution is the ` · N cols · N dropped` tail; the
+/// count sentence has exactly one implementation, and both suites point at it.
+///
 /// Digits are grouped by `SiftCore.groupDigits`, the same function the row-number gutter and the
 /// CLI use. Not `NumberFormatter`: without an explicit locale the same count renders four ways.
 public func rowSummaryText(_ table: SiftEngine.Table) -> String {
-    let rows: String
-    // `r.value === null || t.counting` first, exactly as the web has it. An exact count already in
-    // flight makes the estimate a number about to be replaced, and "counting…" is the honest thing
-    // to say about it — this app's whole premise is not putting a number on screen it is unsure of.
-    if let known = table.displayRows, !table.counting {
-        // `r.filtered && r.unfiltered` — both, so a filtered table whose unfiltered count has not
-        // landed yet reads as a plain count rather than "12 of 0 rows".
-        if !table.qspec.filters.isEmpty, let unfiltered = table.gridRows {
-            rows = "\(groupDigits(String(known))) of \(groupDigits(String(unfiltered))) rows"
-        } else {
-            rows = "\(table.rowsAreExact ? "" : "≈ ")\(groupDigits(String(known))) rows"
-        }
-    } else {
-        rows = "counting…"
-    }
-    var summary = "\(rows) · \(table.spec.columns.count) cols"
+    var summary = "\(rowText(table)) · \(table.spec.columns.count) cols"
     if table.badRows > 0 { summary += " · \(groupDigits(String(table.badRows))) dropped" }
     return summary
 }
