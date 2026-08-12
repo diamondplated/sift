@@ -49,6 +49,35 @@ public struct RootView: View {
         // The whole window is the drop target. It publishes `\.sourceDragHot`, which is how the
         // sidebar's dropzone and the empty state below both learn that a drag is over it.
         .sourceDrop(state: state)
+        // The five sheets, presented from one place. Every route that raises one — the File menu,
+        // the toolbar, the clickable dropped-rows chip, a dropped workbook, the sidebar's context
+        // menu — sets `AppState.modalSheet` and stops; until this modifier existed they all set a
+        // value nothing read, so five finished features were unreachable.
+        .sheet(item: $state.modalSheet) { which in
+            switch which {
+            case .export:
+                if let t = state.active {
+                    ExportSheet(session: state.session, table: t) { state.banner = $0 }
+                }
+            case .merge:
+                MergeSheet(
+                    session: state.session, tables: state.tables.map(\.name),
+                    initialLeft: state.activeName
+                ) { merged in
+                    Task { await state.refresh(); state.activeName = merged.name }
+                }
+            case .staged:
+                StagedDataSheet(session: state.session)
+            case .badRows:
+                if let t = state.active {
+                    BadRowsSheet(session: state.session, table: t.name)
+                }
+            case .workbook(let path):
+                SheetPickerSheet(path: path) { picked in
+                    Task { for name in picked { await state.open(path: path, sheet: name) } }
+                }
+            }
+        }
     }
 }
 

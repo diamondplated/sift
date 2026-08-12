@@ -126,7 +126,10 @@ public final class AppState {
     /// Set here, rendered by `RootView`'s sheet presentation. One optional rather than five
     /// booleans, because two modals up at once is not a state this app has — and five booleans is
     /// exactly how it would become one.
-    public enum ModalSheet: Equatable, Sendable {
+    /// `Identifiable` so one `.sheet(item:)` in `RootView` presents all five. The id is the
+    /// case, not the payload: presenting `.workbook` for a second file while the first picker
+    /// is up should replace it, not stack.
+    public enum ModalSheet: Equatable, Sendable, Identifiable {
         case export
         case merge
         case staged
@@ -135,6 +138,15 @@ public final class AppState {
         case badRows
         /// A workbook on its way in, waiting for a sheet to be chosen. See `needsSheetPicker`.
         case workbook(path: String)
+        public var id: String {
+            switch self {
+            case .export: return "export"
+            case .merge: return "merge"
+            case .staged: return "staged"
+            case .badRows: return "badRows"
+            case .workbook: return "workbook"
+            }
+        }
     }
 
     public var modalSheet: ModalSheet?
