@@ -77,12 +77,29 @@ public func gridState(columnCount: Int, scrollExtent: Int, rowCountKnown: Bool) 
 /// the lifetime of one view identity, and the coordinator holds the model.
 public struct TableGridView: NSViewRepresentable {
     private let model: TableViewModel
+    private let onColumnSelected: ((String) -> Void)?
+    private let onError: ((String) -> Void)?
 
-    public init(model: TableViewModel) {
+    /// Both closures default to `nil` so the existing call site keeps compiling. `onColumnSelected`
+    /// is where a plain header click lands once there is an inspector to select a column *in* (Task
+    /// 8); `onError` is where a failed sort goes, and leaving it unwired means a shift-click that
+    /// fails does nothing visible.
+    public init(
+        model: TableViewModel,
+        onColumnSelected: ((String) -> Void)? = nil,
+        onError: ((String) -> Void)? = nil
+    ) {
         self.model = model
+        self.onColumnSelected = onColumnSelected
+        self.onError = onError
     }
 
-    public func makeCoordinator() -> GridBridge { GridBridge(model: model) }
+    public func makeCoordinator() -> GridBridge {
+        let bridge = GridBridge(model: model)
+        bridge.onColumnSelected = onColumnSelected
+        bridge.onError = onError
+        return bridge
+    }
 
     public func makeNSView(context: Context) -> NSScrollView {
         let bridge = context.coordinator
@@ -173,6 +190,15 @@ public final class GridBridge: NSObject, NSTableViewDataSource, NSTableViewDeleg
 
     public let model: TableViewModel
 
+    /// A plain click on a header. The web set `state.col` and switched the inspector to its Column
+    /// tab; there is no inspector on this branch yet, so this is the seam it lands on when Task 8
+    /// builds one — passed in from `TableGridView.init`, and `nil` until then.
+    public var onColumnSelected: ((String) -> Void)?
+    /// Where a failed sort goes. `setSort` runs in a detached `Task`, so there is no caller left to
+    /// throw back to; without this the user's shift-click would simply do nothing, which is the
+    /// silent failure this app exists to be the opposite of.
+    public var onError: ((String) -> Void)?
+
     private var stamp: ColumnStamp?
     private var builtExtent = -1
 
@@ -194,19 +220,16 @@ public final class GridBridge: NSObject, NSTableViewDataSource, NSTableViewDeleg
         )
     }
 
-    /// Column widths, in model-column order — `computeWidths` (`web/index.html:576-583`), rule for
-    /// rule. The `120` is the pre-profile fallback and the reason a profile has to force a rebuild:
-    /// every column sits on it until `max_len` exists.
+    /// Column widths, in model-column order. The arithmetic is `ColumnLayout.columnWidths`, which is
+    /// where every decision this header makes lives; this is the model-shaped call of it.
     func columnWidths() -> [CGFloat] {
-        var maxLens: [String: Int] = [:]
-        for column in model.profile where (column.maxLen ?? 0) > 0 {
-            maxLens[column.name] = column.maxLen
-        }
-        return model.columns.map { column in
-            let byName = Double(column.name.count) * 7.6 + 26
-            let byData = maxLens[column.name].map { Double(min($0, 42)) * 7.4 + 20 } ?? 120
-            return CGFloat(max(76, min(320, max(byName, byData))).rounded())
-        }
+        SiftUI.columnWidths(model.columns, profile: model.profile).map { CGFloat($0) }
+    }
+
+    /// The profile for one column, by name. `nil` before a profile has landed — which is a different
+    /// thing from "all zero", and `headerDecoration` treats it as such.
+    func profile(for name: String) -> ColumnProfile? {
+        model.profile.first { $0.name == name }
     }
 
     /// Rebuild the table's columns if — and only if — they changed identity or a profile arrived.
@@ -218,9 +241,25 @@ public final class GridBridge: NSObject, NSTableViewDataSource, NSTableViewDeleg
         guard stamp != next else { return false }
         stamp = next
 
+        // 🔴 MEASURED: `style = .plain` leaves `intercellSpacing.width` at SEVENTEEN points. Every
+        // column then occupies 17 pt more than the width `columnWidths` computed for it; the cell
+        // views are centred in that slot while the header cell is handed the whole of it, so the
+        // header name sat 8.5 pt to the left of its own column's values and a full-width missing bar
+        // ran a quarter of the way into the next column. The web grid's cells are flush
+        // (`.gcell { flex:none; padding:2px 7px }`, no margin) and these widths are ported from it,
+        // so the gap is zero and a column is exactly as wide as it was measured to be.
+        //
+        // Set here rather than in `makeNSView` for the usual reason: `makeNSView` cannot be tested,
+        // and a header that lines up only in the shipping app is a header nothing checks.
+        tableView.intercellSpacing = NSSize(width: 0, height: 0)
+
         for column in tableView.tableColumns { tableView.removeTableColumn(column) }
 
         let gutter = NSTableColumn(identifier: gutterID)
+        // A `SiftHeaderCell` with nothing in it, rather than the stock `NSTableHeaderCell`: the
+        // custom cell paints its own background and hairlines, so a stock neighbour over the gutter
+        // would be the one square of the header wearing the system's chrome instead.
+        gutter.headerCell = SiftHeaderCell(textCell: "")
         gutter.title = ""
         gutter.width = gutterWidth()
         gutter.minWidth = minimumGutterWidth
@@ -230,14 +269,51 @@ public final class GridBridge: NSObject, NSTableViewDataSource, NSTableViewDeleg
         let widths = columnWidths()
         for (i, column) in model.columns.enumerated() {
             let col = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("c\(i)"))
+            let header = SiftHeaderCell(textCell: column.name)
+            header.typeText = column.type
+            col.headerCell = header
             col.title = column.name
             col.width = widths[i]
             col.minWidth = 40
             col.maxWidth = 2000
-            col.headerToolTip = "\(column.name) — \(column.type)"
             tableView.addTableColumn(col)
         }
+        syncHeaders(tableView)
         return true
+    }
+
+    /// Push the caret, the distinct count and the missing bar onto the header cells, and say whether
+    /// any of them moved.
+    ///
+    /// Separate from `syncColumns` and called on every `sync`, because the three of them change on
+    /// triggers the column stamp deliberately does not carry. A sort click changes nothing about the
+    /// columns' identity — same names, same types — so a caret that only appeared on a rebuild would
+    /// never appear at all. Rebuilding the columns instead would work and would also throw away
+    /// every column's user-dragged width on every sort.
+    ///
+    /// `Equatable` on `HeaderDecoration` is what makes this cheap enough to run unconditionally: a
+    /// scroll tick reaches here and finds nothing changed.
+    @discardableResult
+    func syncHeaders(_ tableView: NSTableView) -> Bool {
+        let sort = model.table.qspec.sort
+        var changed = false
+        for (i, column) in model.columns.enumerated() {
+            let at = i + 1  // the gutter is column 0
+            guard at < tableView.tableColumns.count,
+                let header = tableView.tableColumns[at].headerCell as? SiftHeaderCell
+            else { continue }
+            let profile = profile(for: column.name)
+            let next = headerDecoration(column, profile: profile, sort: sort)
+            if header.decoration != next {
+                header.decoration = next
+                changed = true
+            }
+            // Not part of `changed`: a tooltip is not drawn, so it can never be the reason to
+            // repaint. It is refreshed here anyway because the counts in it come from the same
+            // profile the decoration does.
+            tableView.tableColumns[at].headerToolTip = headerTooltip(column, profile: profile)
+        }
+        return changed
     }
 
     /// Reload when the number of rows the scroll bar may reach changed. Separate from the column
@@ -269,6 +345,11 @@ public final class GridBridge: NSObject, NSTableViewDataSource, NSTableViewDeleg
 
     func sync(_ tableView: NSTableView) {
         let columnsChanged = syncColumns(tableView)
+        // After the rebuild, and unconditionally: a sort click leaves the columns identical and is
+        // the one thing that must still repaint a caret.
+        if syncHeaders(tableView) || columnsChanged {
+            tableView.headerView?.needsDisplay = true
+        }
         let extentChanged = syncExtent(tableView)
         // The extent is what the gutter is measured from, and it moves on its own — an exact count
         // landing behind a byte-sample estimate can add a digit without touching the columns.
@@ -381,6 +462,41 @@ public final class GridBridge: NSObject, NSTableViewDataSource, NSTableViewDeleg
             return nil
         }
         return at - 1
+    }
+
+    // MARK: - delegate: a click on a header
+
+    /// 🔴 The modifier flags are read HERE and nowhere below, because this is the only place they
+    /// exist. `tableView(_:mouseDownInHeaderOf:)` hands over the column and not the event, so the
+    /// shift key has to come off `NSApp.currentEvent` — and `NSApp` is exactly the kind of ambient
+    /// global that makes a decision untestable. So this method reads the one bit and hands it to
+    /// `headerClicked`, which is where the decision is and which the suite drives directly.
+    public func tableView(_ tableView: NSTableView, mouseDownInHeaderOf tableColumn: NSTableColumn) {
+        guard let index = dataColumnIndex(tableColumn, in: tableView),
+            index < model.columns.count
+        else { return }
+        let shift = NSApp.currentEvent?.modifierFlags.contains(.shift) ?? false
+        headerClicked(model.columns[index].name, shift: shift)
+    }
+
+    /// Plain click opens the column; shift-click sorts. The web build's binding, and the reason its
+    /// header tooltip ends `click: values · shift-click: sort` (`web/index.html:617`) — nobody
+    /// guesses this one.
+    ///
+    /// It is this way round rather than the more obvious click-to-sort because a sort on a file this
+    /// app is built for is not free: `Table.scrollableRows` caps a sorted table at what the engine
+    /// materialized, so an accidental sort of a 40M-row Parquet is a visible, expensive thing to
+    /// have done by brushing the header on the way to the scrollbar.
+    func headerClicked(_ column: String, shift: Bool) {
+        guard shift else {
+            onColumnSelected?(column)
+            return
+        }
+        let next = nextSort(for: column, current: model.table.qspec.sort)
+        Task { [weak self] in
+            guard let self else { return }
+            do { try await model.setSort(next) } catch { onError?(error.localizedDescription) }
+        }
     }
 }
 
@@ -554,5 +670,144 @@ final class GridCellView: NSTableCellView {
     private func italic(_ font: NSFont) -> NSFont {
         let descriptor = font.fontDescriptor.withSymbolicTraits(.italic)
         return NSFont(descriptor: descriptor, size: font.pointSize) ?? font
+    }
+}
+
+// MARK: - one column header
+
+/// One column header: the name on the first line, the type with its sort caret and distinct count on
+/// the second, and a bar along the bottom edge for how much of the column is missing.
+///
+/// **Why a cell subclass and not a custom `NSTableHeaderView`.** Replacing the header view means
+/// re-implementing column hit-testing, drag-to-resize and the divider tracking areas — all of which
+/// AppKit already does correctly and none of which this design changes. An `NSTableHeaderCell` per
+/// column gets the two-line layout for the price of one `draw(withFrame:in:)`.
+///
+/// 🔴 It decides NOTHING. Every value it draws is computed by `ColumnLayout` and handed over as a
+/// `HeaderDecoration`, because an `NSCell` draws into a context and has no state afterwards to
+/// assert on. What is left here is geometry, and the suite checks that by rendering it.
+final class SiftHeaderCell: NSTableHeaderCell {
+    /// The column's SQL type, drawn under the name. Not `stringValue` — that stays the name, because
+    /// `NSTableColumn.title` is a proxy for it and the rest of the app reads titles.
+    var typeText = ""
+    var decoration = HeaderDecoration(caret: nil, distinctLabel: "", missingFraction: 0)
+
+    /// `.hcell .hn { font-weight:700; font-size:11.5px }`.
+    private var nameFont: NSFont { .systemFont(ofSize: 11.5, weight: .bold) }
+    /// `.hcell .ht`/`.dcount { font-size:9px; font-family:ui-monospace }`. Monospaced so the distinct
+    /// counts down a wide table line up with each other instead of wandering.
+    private var metaFont: NSFont { .monospacedSystemFont(ofSize: 9, weight: .regular) }
+    /// `letter-spacing:.06em` on a 9 pt uppercase run — without it `VARCHAR` sets as a grey smudge.
+    private var metaKern: CGFloat { 0.54 }
+    /// `.hcell { padding: 3px 7px }`, and the same 7 the cells below use, so a header sits over its
+    /// own column's values rather than 2 pt off them.
+    private let inset: CGFloat = 7
+    /// `.hcell .hbar { height:2px }`.
+    private let barHeight: CGFloat = 2
+
+    override func draw(withFrame cellFrame: NSRect, in controlView: NSView) {
+        // NOT `super.draw`: the superclass paints the system header chrome *and* `stringValue`, and
+        // the name would then be drawn twice — once by AppKit, vertically centred, and once here.
+        let flipped = controlView.isFlipped
+        NSColor.windowBackgroundColor.setFill()
+        cellFrame.fill()
+        NSColor.separatorColor.setFill()
+        // `.ghead { border-bottom: 1px solid var(--line) }`, plus the divider between columns. The
+        // divider is what makes a 0-width missing bar readable as "nothing missing" rather than as
+        // the neighbouring column's bar running long.
+        band(cellFrame, fromTop: cellFrame.height - 1, height: 1, flipped: flipped).fill()
+        NSRect(x: cellFrame.maxX - 1, y: cellFrame.minY, width: 1, height: cellFrame.height).fill()
+
+        let nameHeight = lineHeight(nameFont)
+        let metaHeight = lineHeight(metaFont)
+        // Anchored from the BOTTOM — the meta line sits on the bar, the name takes what is left, and
+        // the whole thing therefore fits whatever height AppKit gives the header (28 pt, measured)
+        // rather than assuming one. The bar's two points are reserved whether or not there is a bar,
+        // so a profile landing does not shunt the type line up by two points on every column at
+        // once. `max(0,)` because a header shorter than its own two lines must overlap rather than
+        // draw the name off the top edge; `theHeaderPaintsBothOfItsLines…` is what stops
+        // that from being something anyone ever sees.
+        let metaTop = cellFrame.height - 1 - barHeight - metaHeight
+        let nameTop = max(0, (metaTop - nameHeight) / 2).rounded()
+
+        let name = band(cellFrame, fromTop: nameTop, height: nameHeight, flipped: flipped)
+            .insetBy(dx: inset, dy: 0)
+        guard name.width > 0 else { return }
+        draw(stringValue, font: nameFont, color: .labelColor, in: name)
+
+        let meta = band(cellFrame, fromTop: metaTop, height: metaHeight, flipped: flipped)
+            .insetBy(dx: inset, dy: 0)
+        drawMetaLine(in: meta)
+
+        if decoration.missingFraction > 0 {
+            // `.hbar.nul { background: var(--stale); opacity:.55 }` — the amber the whole app uses
+            // for "stale/incomplete", and a system colour rather than the web's literal #b07d1e so
+            // it follows a light↔dark switch.
+            NSColor.systemOrange.withAlphaComponent(0.55).setFill()
+            var bar = band(cellFrame, fromTop: cellFrame.height - 1 - barHeight,
+                           height: barHeight, flipped: flipped)
+            bar.size.width = (cellFrame.width * decoration.missingFraction).rounded()
+            bar.fill()
+        }
+    }
+
+    /// Type on the left, then the caret and the distinct count against the right edge.
+    ///
+    /// Right-aligned as a measured group rather than with a trailing paragraph style, because the
+    /// two have different colours and therefore have to be two draws — and because the type's own
+    /// truncation width is whatever they leave behind. A type that ran under the count would put
+    /// `VARC…` and `≈4.2k` on top of each other.
+    private func drawMetaLine(in rect: NSRect) {
+        var right = rect.maxX
+        if !decoration.distinctLabel.isEmpty {
+            let width = measure(decoration.distinctLabel, font: metaFont)
+            right -= width
+            draw(decoration.distinctLabel, font: metaFont, color: .tertiaryLabelColor,
+                 in: NSRect(x: right, y: rect.minY, width: width, height: rect.height))
+        }
+        if let caret = decoration.caret {
+            let width = measure(caret, font: metaFont)
+            right -= width + 3
+            // `.hcell .caret { color: var(--accent) }` — the one accent-coloured thing in the header,
+            // because it is the only part of it that reflects something the user did.
+            draw(caret, font: metaFont, color: .controlAccentColor,
+                 in: NSRect(x: right, y: rect.minY, width: width, height: rect.height))
+        }
+        // `text-transform: uppercase`. `uppercased()` and not `uppercased(with:)` — the locale-aware
+        // one turns a Turkish `i` into `İ`, and these are DuckDB type names.
+        let width = right - rect.minX - (right < rect.maxX ? 4 : 0)
+        guard width > 0 else { return }
+        draw(typeText.uppercased(), font: metaFont, color: .tertiaryLabelColor,
+             in: NSRect(x: rect.minX, y: rect.minY, width: width, height: rect.height), kern: metaKern)
+    }
+
+    // MARK: - geometry
+
+    /// A band `fromTop` points down from the top edge. Everything above is expressed this way so the
+    /// layout reads top-to-bottom the way it looks; `NSTableHeaderView` is flipped, and the
+    /// `flipped` argument is what keeps this honest if it is ever drawn into a context that is not.
+    private func band(_ f: NSRect, fromTop: CGFloat, height: CGFloat, flipped: Bool) -> NSRect {
+        NSRect(
+            x: f.minX, y: flipped ? f.minY + fromTop : f.maxY - fromTop - height,
+            width: f.width, height: height)
+    }
+
+    func lineHeight(_ font: NSFont) -> CGFloat { (font.ascender - font.descender + font.leading).rounded(.up) }
+
+    func measure(_ text: String, font: NSFont, kern: CGFloat = 0) -> CGFloat {
+        (text as NSString).size(withAttributes: [.font: font, .kern: kern]).width.rounded(.up)
+    }
+
+    private func draw(
+        _ text: String, font: NSFont, color: NSColor, in rect: NSRect, kern: CGFloat = 0
+    ) {
+        let style = NSMutableParagraphStyle()
+        // A header too narrow for its own name elides it rather than spilling into the next column.
+        style.lineBreakMode = .byTruncatingTail
+        (text as NSString).draw(
+            in: rect,
+            withAttributes: [
+                .font: font, .foregroundColor: color, .paragraphStyle: style, .kern: kern,
+            ])
     }
 }
