@@ -558,6 +558,13 @@ extension Session {
     /// delete, which is the number that answers "what is this tool holding on to".
     public nonisolated func stagedTotalBytes() -> Int { dbBytes() }
 
+    /// The age-out and size limits this session is actually enforcing, so the staged-data
+    /// manager can state them rather than restating a default that `SIFT_STAGE_BUDGET_GB` may
+    /// have overridden. `nonisolated`: both read only the environment.
+    public nonisolated func stagePolicy() -> StagePolicy {
+        StagePolicy(budgetBytes: stageBudgetBytes(), maxAgeDays: stageMaxAgeDays())
+    }
+
     /// Drop staged tables — explicitly, by age, or under size pressure. Ported from `purge_staged`.
     ///
     /// Python's `reason` argument only ever fed a log line and an SSE event, neither of which
@@ -835,6 +842,24 @@ public struct PurgeResult: Sendable, Equatable {
     public let stagedBytes: Int
 }
 
+/// The two limits the purge is enforcing on this store right now — read from the environment
+/// through `stageBudgetBytes()`/`stageMaxAgeDays()` below, so a `SIFT_STAGE_BUDGET_GB` override is
+/// reflected rather than shadowed by a restated default.
+///
+/// `budgetBytes` rather than a `budgetGB`, even though the only consumer divides it back down:
+/// bytes is what `selectForPurge` actually compares against, and a second unit in the type is a
+/// second place for the conversion to drift. The UI does the division (exactly — the value is
+/// always a whole number of GiB).
+public struct StagePolicy: Sendable, Equatable {
+    public let budgetBytes: Int
+    public let maxAgeDays: Int
+
+    public init(budgetBytes: Int, maxAgeDays: Int) {
+        self.budgetBytes = budgetBytes
+        self.maxAgeDays = maxAgeDays
+    }
+}
+
 // MARK: - free helpers
 
 /// `epoch_ms(...)` comes back as a BIGINT of milliseconds; `.null` (a catalog row written before
@@ -847,15 +872,20 @@ private func dateFromEpochMs(_ cell: Cell) -> Date {
 /// `SIFT_STAGE_BUDGET_GB`, ported from session.py:978. Unparseable input falls back to the
 /// default rather than raising the way Python's bare `int()` would — an env var typo must not
 /// stop the engine from starting.
-private func stageBudgetBytes() -> Int {
+///
+/// Internal rather than `private` so `Session.stagePolicy()` can report it: the staged-data panel
+/// has to state the numbers its own copy is governed by, and it must not read the environment a
+/// second time to find them. One authority.
+func stageBudgetBytes() -> Int {
     guard let raw = ProcessInfo.processInfo.environment["SIFT_STAGE_BUDGET_GB"],
         let gb = Int(raw)
     else { return defaultBudgetBytes }
     return gb * 1024 * 1024 * 1024
 }
 
-/// `SIFT_STAGE_MAX_AGE_DAYS`, ported from session.py:979.
-private func stageMaxAgeDays() -> Int {
+/// `SIFT_STAGE_MAX_AGE_DAYS`, ported from session.py:979. Internal for the same reason as
+/// `stageBudgetBytes` above.
+func stageMaxAgeDays() -> Int {
     guard let raw = ProcessInfo.processInfo.environment["SIFT_STAGE_MAX_AGE_DAYS"],
         let days = Int(raw)
     else { return defaultMaxAgeDays }
