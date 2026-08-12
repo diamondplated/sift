@@ -453,6 +453,28 @@ public actor Session {
         tables[name] = t
     }
 
+    /// Test support: a hook every profile job awaits before it does any work. `nil` in production,
+    /// where `await barrier?()` on a `nil` optional is not even a suspension.
+    ///
+    /// **This is the seam that turns "a profile is still in flight" from a race into a fact.** The
+    /// guards on `applyProfile` can only be tested by delivering a result while a real job is
+    /// registered, and the tests that do so used to get there by being faster than the job: kick a
+    /// profile, poll until it registers, then close and reopen before it finishes. That is not a
+    /// property of the code, it is a property of the machine. The job runs on DuckDB's own threads
+    /// while the close-and-reopen queues on the cooperative pool, so a 70x margin measured on a
+    /// developer Mac inverted completely on a CI runner — 6 failures in 6, against 1 in 8 locally.
+    /// Holding the job here instead makes the window the test's to open, and removes the machine
+    /// from the question. Same reasoning as `setStageDwellForTest`: a test that waits on a real
+    /// clock to prove a timer is a flake generator, not a test.
+    ///
+    /// Captured by `profileJob(for:)` per job, alongside `spec`/`rel`, so a barrier installed after
+    /// a job started does not reach back and hold it — and a gate the test has already opened lets
+    /// every later job through, including the ones `computeProfile`'s own retry starts.
+    var profileBarrierForTest: (@Sendable () async -> Void)?
+    func setProfileBarrierForTest(_ hook: (@Sendable () async -> Void)?) {
+        profileBarrierForTest = hook
+    }
+
     /// Test support: override whether `openPath` believes the `delta` extension loaded. `nil`
     /// (the default) means "ask the database", which is what production always does — this exists
     /// only so DeltaTests can reach `openPath`'s refusal, which on every machine this code runs on

@@ -212,12 +212,16 @@ extension Session {
         // replacement registered under the same `openedAt` after a revocation.
         nextProfileJobID += 1
         let jobID = nextProfileJobID
+        // Snapshotted with everything else, so a barrier installed later cannot reach back and
+        // hold a job that is already running. `nil` in production — see its declaration.
+        let barrier = profileBarrierForTest
         // Everything the work needs is copied out here, as `Sendable` values. `Connection` is not
         // `Sendable` and is created inside the task, never handed to it — and emphatically not
         // `pagingConnection`, whose safety rests on every one of its users running to completion on
         // the actor without suspending (Session.swift's header, fact 3).
         let task = Task.detached { [self] in
             do {
+                await barrier?()
                 let profile = try runProfile(spec: spec, rel: rel, uncastable: uncastable)
                 await applyProfile(name, profile, jobID: jobID, openedAt: openedAt)
                 return profile
