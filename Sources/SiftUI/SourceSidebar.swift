@@ -480,12 +480,33 @@ func droppedPaths(from providers: [NSItemProvider]) async -> [String] {
         // "No such file or folder: <whatever those bytes were>". MEASURED by mutation: without this
         // clause a provider carrying plain bytes under the `public.file-url` identifier produced a
         // path, and the test built to catch exactly that passed anyway.
-        guard let item = try? await provider.loadItem(
-                forTypeIdentifier: UTType.fileURL.identifier),
-            let data = item as? Data,
+        // `loadDataRepresentation`, not `loadItem`. `loadItem` returns `any NSSecureCoding`, which
+        // is not `Sendable`, so awaiting it from here is a hard error under the macOS 15 SDK's
+        // stricter concurrency checking — accepted silently by this machine's newer SDK and caught
+        // only by CI, which is the second time that exact skew has bitten this branch. The data
+        // representation is what the code wanted anyway; the cast to `Data` is gone with it.
+        // Bridged by hand rather than awaiting `loadItem`. `loadItem` returns `any NSSecureCoding`,
+        // which is not `Sendable`, so awaiting it here is a hard error under the macOS 15 SDK's
+        // stricter concurrency checking — accepted silently by this machine's newer SDK and caught
+        // only by CI, the second time that exact skew has bitten this branch. `Data` IS `Sendable`,
+        // so resuming the continuation with it crosses the boundary legally, and the completion
+        // handler is the only spelling available on the floor version.
+        guard let data = await loadFileURLData(from: provider),
             let url = URL(dataRepresentation: data, relativeTo: nil), url.isFileURL
         else { continue }
         found.append(url.path)
     }
     return found
+}
+
+
+/// One drag item's `public.file-url` bytes, or nil. See `droppedPaths` for why this is bridged by
+/// hand instead of awaiting `loadItem` directly.
+@MainActor
+private func loadFileURLData(from provider: NSItemProvider) async -> Data? {
+    await withCheckedContinuation { continuation in
+        provider.loadDataRepresentation(forTypeIdentifier: UTType.fileURL.identifier) { data, _ in
+            continuation.resume(returning: data)
+        }
+    }
 }
