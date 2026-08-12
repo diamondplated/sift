@@ -17,29 +17,9 @@ import SwiftUI
 
 // MARK: - byte sizes
 //
-// 🔴 **TASK 9 OWNS `humanBytes`** (`Sources/SiftUI/Inspector/…`, per task-9-brief.md step 2). This
-// copy exists only so Task 12 builds and tests standalone against base commit 905fc15, where Task
-// 9 has not landed. When the two branches meet, DELETE THIS BLOCK — Swift will tell you loudly
-// ("invalid redeclaration"), which is exactly the merge conflict you want rather than two
-// implementations quietly disagreeing about what 1023 bytes is called.
-
-/// `1023 → "1023 B"`, `1024 → "1.0 KB"`. Ported from the web's `human` (web/index.html:464-470).
-///
-/// NOT `ByteCountFormatter`, which is locale- and unit-convention dependent (it renders `1.05 MB`
-/// on a system using SI units, and translates the unit names). NOT `SiftCore.human` either, even
-/// though that is the same ladder: it groups its integer branch through `grouped(_:decimals:)`, so
-/// 1023 bytes reads `1,023 B` there and `1023 B` here — the web's own output, and what task-9's
-/// brief pins. `String(format:)` takes no locale and is POSIX.
-public func humanBytes(_ n: Int) -> String {
-    let units = ["B", "KB", "MB", "GB", "TB"]
-    var value = Double(n)
-    var unit = 0
-    while abs(value) >= 1024, unit < units.count - 1 {
-        value /= 1024
-        unit += 1
-    }
-    return String(format: unit == 0 ? "%.0f" : "%.1f", value) + " " + units[unit]
-}
+// `humanBytes` lives in SourceTab.swift, where Task 9 put it. The standalone copy that was
+// here existed only so this file could build against a base commit where Task 9 had not landed;
+// it was deleted the moment the two met, which is what the redeclaration error was for.
 
 // MARK: - phrasing
 

@@ -143,11 +143,9 @@ public struct ColumnPanel: View {
                 Text("loading…").font(.system(size: 11)).foregroundStyle(.secondary)
             }
         case .hist:
-            Text("The spread lens arrives with Task 9.")
-                .font(.system(size: 11)).foregroundStyle(.secondary)
+            SpreadLens(session: session, model: model, column: column, profile: profile)
         case .highcard:
-            Text("The identity lens arrives with Task 9.")
-                .font(.system(size: 11)).foregroundStyle(.secondary)
+            IdentityLens(session: session, model: model, column: column, profile: profile)
         }
     }
 }
