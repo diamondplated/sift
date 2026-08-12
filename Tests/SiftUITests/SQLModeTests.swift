@@ -312,64 +312,114 @@ private func appKitReady() { _ = NSApplication.shared }
 }
 
 // MARK: - the pane, drawn
+//
+// 🔴 **Nothing below measures a pixel COUNT, a COORDINATE, or a `* scale` term, and that is not
+// style — it is the fix for a real CI failure.** The first version of the status-line check asserted
+// that the claimed sentence's ink reached at least 40 pt further right than the mirrored one's. It
+// passed here and failed on the macos-15 runner with both renders ending at the same column, because
+// a headless runner's backing scale, font rasterization and available typefaces are all different
+// from this Mac's — so the number being compared described the environment as much as the code.
+// Widening the margin only moves the point at which it lies. Every assertion here is now a
+// RELATIONSHIP (these two renders differ / these two are identical) or a PROPORTION of the pane
+// (most of it is dark), neither of which has a value to calibrate.
+//
+// The two renderers each do the half the other cannot, and `InspectorRenderTests`'s header documents
+// the same split from the other side:
+//   * `ImageRenderer` draws SwiftUI text faithfully and hands back a prohibited-symbol placeholder
+//     for anything AppKit-backed — here, the `TextEditor`. Fine for the status line, since the
+//     placeholder is identical in both renders being compared.
+//   * `NSHostingView` + `cacheDisplay` draws the AppKit-backed control and the pane's own
+//     background, and drops much of the SwiftUI-drawn text. Fine for "is it dark", which is what it
+//     is used for and all it is used for.
 
-/// 🔴 **Rendered, not inspected.** `NSHostingView` is a live `NSView`, so `cacheDisplay(in:to:)`
-/// draws it for real with no window and no Screen Recording permission — the same route
-/// `GridBridgeTests` uses on the empty-string rule, and the only one available here. The pane is
-/// rendered rather than a window: `cacheDisplay` cannot capture an `NSVisualEffectView`.
+/// 🔴 The status line actually REDRAWS when the box is claimed — a claim no property read can make,
+/// and the same class of defect as the empty-string cell that reported a dotted rule from every
+/// property while AppKit quietly declined to draw an underline under whitespace.
 ///
-/// Two claims a property read could not make: the console is genuinely DARK (a light box of
-/// monospaced text is not a console), and the status line actually redraws with the longer sentence
-/// when the box is claimed. Pin `sqlStatusText` to one string and the second half goes red.
+/// The two renders being compared differ in `sqlOwned` and in **nothing else**: `typeSQL` is bounced
+/// off an intermediate string and back to the mirrored text, so `sqlText` is byte-identical going
+/// into both. The only things that can move a pixel are the sentence, its weight and its colour.
+///
+/// It does not distinguish WHICH of those three moved, and does not try to — MEASURED by mutation:
+/// pinning `sqlStatusText` to one string leaves this green, because the weight and colour still
+/// change. The copy is pinned by `theStatusLineSaysWhichOfTheTwoThingsTheBoxIs`, which compares the
+/// strings directly; what this adds is that the line is drawn at all and is redrawn on the flip
+/// (replace the `Text` with an empty one and this is the only test that goes red).
+///
+/// **Why this survives a different renderer.** The assertions are "these two images are equal" and
+/// "these two are not". Both are decided entirely inside one process, by one rasterizer, on two
+/// images it produced itself — a different backing scale, a different font, or different subpixel
+/// antialiasing changes both images the same way and cancels out. The control render is what makes
+/// the inequality mean something: it proves this renderer is deterministic here, so a difference can
+/// only have come from the state that changed. A renderer too unstable for that fails the CONTROL,
+/// loudly, instead of making the real assertion flaky.
 @MainActor
-@Test func theConsoleDrawsDarkAndItsStatusLineRedrawsWhenTheBoxIsClaimed() async throws {
+@Test func theStatusLineRedrawsWhenTheBoxIsClaimed() async throws {
+    let (_, model) = try await openedFixture(rows: 12)
+    try await model.mirrorRenderedSQL()
+    let mirroredText = model.sqlText
+
+    func pixels() throws -> Data {
+        let renderer = ImageRenderer(
+            content: SQLConsole(model: model, onError: { _ in })
+                .frame(width: 900, height: 130, alignment: .topLeading))
+        let image = try #require(renderer.cgImage, "ImageRenderer produced no image at all")
+        // The raw buffer, compared byte for byte. Deliberately NOT hashed: `Data.hash(into:)` mixes
+        // in at most the first 80 bytes, which on a 900-pt render is blank margin — the trap
+        // `InspectorRenderTests.pixelDigest` documents, and `==` simply does not have it.
+        return try #require(image.dataProvider?.data) as Data
+    }
+
+    let unclaimed = try pixels()
+    let control = try pixels()
+    #expect(control == unclaimed, "rendering is not deterministic here — nothing below means anything")
+
+    model.typeSQL("")
+    model.typeSQL(mirroredText)
+    #expect(model.sqlText == mirroredText, "the same text going in…")
+    #expect(model.sqlOwned, "…and the only difference is that the box is now claimed")
+
+    #expect(try pixels() != unclaimed, "the status line did not redraw when the box was claimed")
+}
+
+/// 🔴 The console is a CONSOLE — a light box of monospaced text is the defect, and `.background`
+/// silently not applying is exactly the kind of thing every property on the view denies.
+///
+/// **Why this survives a different renderer.** It asks what fraction of the pane is dark, not what
+/// colour sits at one coordinate. The background covers essentially all of a 900 × 130 pane in any
+/// layout a renderer could produce; text ink and two small buttons cannot approach a fifth of it. So
+/// the 80% floor has enormous headroom in both directions and no calibration in it. The opacity
+/// check is there because "dark" is also what a bitmap that was never drawn into looks like — that
+/// is the vacuous pass this would otherwise have.
+@MainActor
+@Test func theConsoleDrawsOnADarkSurfaceAndNotADocumentOne() async throws {
     appKitReady()
     let (_, model) = try await openedFixture(rows: 12)
     try await model.mirrorRenderedSQL()
 
     let host = NSHostingView(rootView: SQLConsole(model: model, onError: { _ in }))
     host.frame = NSRect(x: 0, y: 0, width: 900, height: 130)
+    host.layoutSubtreeIfNeeded()
+    let rep = try #require(host.bitmapImageRepForCachingDisplay(in: host.bounds))
+    host.cacheDisplay(in: host.bounds, to: rep)
 
-    /// The pane's pixels, and the console-background test in one: every capture asserts the editor
-    /// area is dark, because a console that renders on the default light surface is the defect.
-    func render() throws -> NSBitmapImageRep {
-        host.layoutSubtreeIfNeeded()
-        let rep = try #require(host.bitmapImageRepForCachingDisplay(in: host.bounds))
-        host.cacheDisplay(in: host.bounds, to: rep)
-        return rep
-    }
-
-    /// The rightmost pixel column carrying ink, within `xs`, over the rows of `ys`. "Ink" is
-    /// anything meaningfully lighter than the console background it is drawn on.
-    func inkRight(_ rep: NSBitmapImageRep, xs: Range<Int>, ys: Range<Int>) -> Int? {
-        xs.reversed().first { x in
-            ys.contains { y in
-                (rep.colorAt(x: x, y: y)?.usingColorSpace(.deviceRGB)?.brightnessComponent ?? 0) > 0.5
-            }
+    // Every 3rd pixel each way — a sample of the whole pane rather than a point on it, so the answer
+    // does not depend on where anything landed.
+    var opaque = 0
+    var dark = 0
+    var total = 0
+    for x in stride(from: 0, to: rep.pixelsWide, by: 3) {
+        for y in stride(from: 0, to: rep.pixelsHigh, by: 3) {
+            guard let colour = rep.colorAt(x: x, y: y)?.usingColorSpace(.deviceRGB) else { continue }
+            total += 1
+            if colour.alphaComponent > 0.9 { opaque += 1 }
+            if colour.alphaComponent > 0.9 && colour.brightnessComponent < 0.3 { dark += 1 }
         }
     }
 
-    let mirroring = try render()
-    let scale = mirroring.pixelsWide / 900
-    // Mid-editor, well clear of any text: the console's own background.
-    let background = try #require(
-        mirroring.colorAt(x: 700 * scale, y: 40 * scale)?.usingColorSpace(.deviceRGB))
-    #expect(background.brightnessComponent < 0.25, "the console is dark, in both appearances")
-
-    // The status line lives in the bar along the bottom, and starts at the left. The right half is
-    // where the buttons are, so the search stops well short of them.
-    let bar = (mirroring.pixelsHigh - 22 * scale)..<(mirroring.pixelsHigh - 4 * scale)
-    let leftHalf = 0..<(420 * scale)
-    let mirrored = try #require(inkRight(mirroring, xs: leftHalf, ys: bar), "the status line drew")
-
-    model.typeSQL("SELECT 1")
-    let owned = try render()
-    let claimed = try #require(inkRight(owned, xs: leftHalf, ys: bar))
-
-    // "your SQL — filters and header controls are frozen" is twice the sentence "mirrors the
-    // filters above" is, so the claimed line reaches materially further right. A status line that
-    // never changed, or one that elided at the same place, cannot produce this.
-    #expect(claimed > mirrored + 40 * scale, "mirrored ended at \(mirrored), claimed at \(claimed)")
+    #expect(total > 0)
+    #expect(Double(opaque) / Double(total) > 0.95, "the pane never drew — everything below is vacuous")
+    #expect(Double(dark) / Double(total) > 0.8, "a console, not a document surface")
 }
 
 /// 🔴 The one-way-door sentence is the warning; a truncated warning is not one. AppKit's own answer
@@ -379,6 +429,12 @@ private func appKitReady() { _ = NSApplication.shared }
 ///
 /// The budget is the space the bar leaves the status line beside its two buttons in a narrow
 /// window; a copy change that overruns it goes red here rather than on someone's screen.
+///
+/// **Why this survives a different renderer**, unlike the pixel comparison this file used to carry:
+/// it measures a STRING in a FONT, not a rendered layout. MEASURED at 274.1 pt against a 300 pt
+/// budget — 9% headroom, where SF Pro's metrics move by fractions of a percent between macOS
+/// versions and a fallback to Helvetica moves them by about 5%. What can consume 9% is a longer
+/// sentence, which is exactly what this is here to catch.
 @MainActor
 @Test func theOneWayDoorSentenceFitsTheBarWithoutEliding() {
     appKitReady()

@@ -78,17 +78,36 @@ speculative full block had guessed.
 Screen Recording is not granted, so the visual check is `cacheDisplay(in:to:)` on a live
 `NSHostingView` of the pane — no permissions, real AppKit drawing, and the pane rather than a window
 because `cacheDisplay` cannot capture an `NSVisualEffectView`.
-`theConsoleDrawsDarkAndItsStatusLineRedrawsWhenTheBoxIsClaimed` samples the editor background
-(brightness < 0.25 — a light box of monospaced text is not a console) and then measures the
-rightmost inked pixel column of the status line before and after `typeSQL`, proving the longer
-sentence actually redraws. `theOneWayDoorSentenceFitsTheBarWithoutEliding` uses `expansionFrame` —
-AppKit's own answer to "did this have to draw an ellipsis" — against the 300-pt budget the bar leaves
-beside its two buttons in a narrow window.
+
+🔴 **The first version of the status-line check measured the environment, and CI caught it.** It
+asserted that the claimed sentence's ink reached at least 40 pt further right than the mirrored
+one's. Green here; red on the macos-15 runner with **both renders ending at the same column** — a
+headless runner's backing scale, font rasterization and available typefaces are all different from
+this Mac's, so the number under comparison described the machine as much as the code. Widening the
+margin would only have moved the point at which it lies. The rewrite keeps the coverage and changes
+what it measures; nothing in the render tests is now a pixel count, a coordinate, or a `* scale`
+term.
+
+| Test | Asserts | Why it survives a different renderer |
+|---|---|---|
+| `theStatusLineRedrawsWhenTheBoxIsClaimed` | two renders of the same model are byte-identical (**control**), and the render with `sqlOwned` flipped is not | Both images come from one rasterizer in one process. A different scale, font or antialiasing changes both the same way and cancels. The control is what gives the inequality meaning — a renderer too unstable to compare fails the *control*, loudly, instead of making the real assertion flaky. |
+| `theConsoleDrawsOnADarkSurfaceAndNotADocumentOne` | >95% of sampled pixels opaque, >80% dark | A *proportion of the pane*, not a colour at a coordinate. The background covers essentially all of a 900 × 130 pane under any layout; text and two small buttons cannot approach a fifth of it, so the floor has enormous headroom in both directions. The opacity check closes the vacuous pass — "dark" is also what a bitmap nobody drew into looks like. |
+| `theOneWayDoorSentenceFitsTheBarWithoutEliding` | `expansionFrame` empty at the 300-pt bar budget | Measures a *string in a font*, not a rendered layout. MEASURED at 274.1 pt — 9% headroom, where SF Pro's metrics move fractions of a percent between OS versions and a Helvetica fallback moves them ~5%. What consumes 9% is longer copy, which is the thing it guards. |
+
+The two renderers each do the half the other cannot, and `InspectorRenderTests`'s header documents
+the same split from the other side: `ImageRenderer` draws SwiftUI text faithfully and placeholders
+anything AppKit-backed (here the `TextEditor`, identical in both compared renders, so harmless);
+`NSHostingView` + `cacheDisplay` draws the AppKit control and the pane's background and drops much of
+the SwiftUI text. Status line → `ImageRenderer`; "is it dark" → `cacheDisplay`.
+
+Byte equality on the raw pixel buffer, deliberately **not** a hash: `Data.hash(into:)` mixes in at
+most the first 80 bytes, which on a 900-pt render is blank margin — the trap
+`InspectorRenderTests.pixelDigest` had to work around, and `==` simply does not have it.
 
 ## Mutation testing
 
-15 mutations, all killed. The first sweep found **two vacuous assertions and one that never applied**,
-which are the interesting rows.
+15 mutations in the first sweep, all killed after two fixes; 6 more aimed at the rewritten render
+tests, all killed. The interesting rows are the ones that survived a sweep.
 
 | Mutation | Killed by |
 |---|---|
@@ -98,15 +117,17 @@ which are the interesting rows.
 | `deliver` stops growing the SQL extent | 4 tests |
 | `fetchBlock` ignores SQL mode | `everyBlockInSQLModeGoesBackThroughTheGate` — **survived the first sweep** |
 | `scrollExtent` ignores `sqlExtent` | 4 tests |
-| `typeSQL` does not claim the box | 3 tests, including the pixel one |
+| `typeSQL` does not claim the box | 3 tests, including both render tests |
 | `mirrorRenderedSQL` claims the box | 3 tests |
 | `exitSQLMode` leaves the SQL extent behind | `takingOverTheBox…`, `enteringSQLModeAbandons…` |
 | `exitSQLMode` does not re-mirror the box | `takingOverTheBox…` |
 | `runSQL` leaves the grid alone when the engine flipped | `aPrepareFailureReports…` |
 | `runSQL` wipes the grid *before* running (the web's order) | `aNonSelectComesBackAsTheGuardsOwnSentence` |
-| `sqlStatusText` never changes | `theStatusLine…`, `theConsoleDrawsDark…` |
-| the console is not dark | `theConsoleDrawsDark…` |
-| the status line copy grows past the bar | `theOneWayDoorSentenceFitsTheBar…`, `theStatusLine…` |
+| `sqlStatusText` never changes | `theStatusLineSaysWhichOfTheTwoThings…` |
+| the status line `Text` is replaced by an empty one | `theStatusLineRedrawsWhenTheBoxIsClaimed` |
+| the console is not dark | `theConsoleDrawsOnADarkSurface…` |
+| `.background(consoleBackground)` deleted outright | `theConsoleDrawsOnADarkSurface…` |
+| the status line copy grows past the bar | `theOneWayDoorSentenceFitsTheBar…`, `theStatusLineSaysWhich…` |
 
 **The two survivors, and what they were hiding.**
 
@@ -114,6 +135,12 @@ which are the interesting rows.
   after a short one — the direction `max` already handles. The case that matters is the opposite:
   block 0 coming back with three rows after a speculative 501 had been guessed. Without the fix, the
   scroll bar reaches 501 rows into a three-row answer.
+- *`sqlStatusText` never changes* (second sweep, and a **scope correction rather than a bug**). The
+  render test stayed green: with the sentence pinned, the weight and colour still flip, so the pane
+  genuinely does redraw. It proves the line is drawn and redrawn; it does not and cannot say which of
+  the three moved. The copy itself is pinned by `theStatusLineSaysWhichOfTheTwoThingsTheBoxIs`, which
+  compares the strings directly. Written into the test's own doc comment so nobody reads the render
+  check as a copy guard.
 - *`fetchBlock` ignores SQL mode.* This one is the useful find: `Session.page` **already** wraps
   `sqlText` into a subquery, so paging SQL mode through it produces byte-identical results on any
   accepted query. The branch is only observable through the gate, so the test that kills it had to
@@ -133,6 +160,12 @@ which are the interesting rows.
 - **`Session.page`'s SQL-mode branch does not re-gate.** Not touched (engine is out of scope for this
   task) and not currently reachable with unvetted text, since `runSQL` is the only writer of
   `Table.sqlText`. Named here so it is a decision rather than an oversight.
+- **The render tests now assume the renderer is deterministic within one process.** If macos-15 ever
+  stops being, `theStatusLineRedrawsWhenTheBoxIsClaimed` fails on its *control* assertion with a
+  message saying exactly that, rather than flaking on the real one. That is the intended failure
+  mode, not an oversight — but it is the one thing left in these tests that CI could disagree with,
+  and the fallback if it ever does is `ProfileBenchTests`-style env gating plus an honest "does not
+  run on CI" line here.
 - **`TableViewModel.swift` is shared with the filter-bar task.** Three existing lines are modified
   (the loader's fetch closure, `scrollExtent`, and four lines inside `deliver`); everything else is
   new declarations appended in their own `MARK` section. Should merge, but the loader closure is the
