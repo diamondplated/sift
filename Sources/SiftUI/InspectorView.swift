@@ -206,13 +206,12 @@ private struct MissingBar: View {
 /// Thousands-grouped, through the one grouping loop the grid and the CLI already share.
 func countText(_ n: Int) -> String { groupDigits(String(n)) }
 
-/// `compact` (`web/index.html:632`) — the schema row's distinct count, where the shape of the
-/// number matters more than its last three digits.
-func compactCount(_ n: Int) -> String {
-    if n < 1_000 { return String(n) }
-    if n < 1_000_000 { return String(format: "%.\(n < 10_000 ? 1 : 0)f", Double(n) / 1_000) + "k" }
-    return String(format: "%.1f", Double(n) / 1_000_000) + "M"
-}
+// `compactCount` lives in ColumnLayout.swift — one copy, deliberately. The version that was here
+// computed it as `String(format: "%.1f", Double(n) / 1_000)`, which the surviving one documents as
+// wrong on both counts this project cares about: routing a count through a `Double` on its way to a
+// string is the no-NumberFormatter rule wearing a different hat (one locale away from `1,0k`), and
+// `printf` rounds an exact tie half-to-EVEN where the web's `toFixed` rounds half-away — so 10,500
+// rendered `10k` here and `11k` in the shipping app, on a value a real column reaches.
 
 /// `pct` (`web/index.html:471`): one decimal, or two below 1% so a rare-but-present value does not
 /// round to a flat `0.0%` and read as absent.
