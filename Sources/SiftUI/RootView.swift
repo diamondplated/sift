@@ -31,6 +31,7 @@ public struct RootView: View {
                 }
             }
         }
+        .inspector(isPresented: $state.inspectorVisible) { InspectorView(state: state) }
     }
 }
 
