@@ -4,11 +4,6 @@ import SiftEngine
 import SwiftUI
 
 /// The window's whole contents: sources on the left, the open table on the right.
-///
-/// **Deliberately crude.** Task 6 replaces the detail side with the real virtualized grid over
-/// `NSTableView`; until then this draws one page of rows in a `LazyVStack` so there is something
-/// to look at and something to be wrong. The one thing it does NOT do crudely is render a cell —
-/// see `cell(_:_:)`.
 public struct RootView: View {
     @Bindable private var state: AppState
     private let onOpen: () -> Void
@@ -30,9 +25,9 @@ public struct RootView: View {
                     BannerLine(text: banner) { state.banner = nil }
                 }
                 if let table = state.active, let model = state.model(for: table.name) {
-                    TableRows(model: model) { state.banner = $0 }
+                    TableGrid(model: model) { state.banner = $0 }
                 } else {
-                    EmptyState(onOpen: onOpen)
+                    NothingOpenYet(onOpen: onOpen)
                 }
             }
         }
@@ -41,39 +36,46 @@ public struct RootView: View {
 
 // MARK: - detail
 
-private struct TableRows: View {
+/// The grid, plus the two empty states that only make sense once a table is open.
+///
+/// Which of them is showing is `gridState(columnCount:scrollExtent:rowCountKnown:)`'s decision, not
+/// this body's — a body cannot be tested, and that function's edges can.
+private struct TableGrid: View {
     let model: TableViewModel
     let onError: (String) -> Void
 
-    private let columnWidth: CGFloat = 170
+    private var state: GridState {
+        gridState(
+            columnCount: model.columns.count, scrollExtent: model.scrollExtent,
+            rowCountKnown: model.table.displayRows != nil)
+    }
 
     var body: some View {
-        ScrollView([.vertical, .horizontal]) {
-            LazyVStack(alignment: .leading, spacing: 2) {
-                HStack(spacing: 16) {
-                    ForEach(model.columns, id: \.name) { column in
-                        Text(column.name)
-                            .bold()
-                            .lineLimit(1)
-                            .frame(width: columnWidth, alignment: .leading)
-                    }
-                }
-                Divider()
-                // One block, straight out of the cache. Task 6's `NSTableView` is what turns
-                // `scrollExtent` into a real scroll bar; until then this draws the rows that are
-                // there and nothing where they are not.
-                ForEach(0..<min(model.scrollExtent, pageRows), id: \.self) { row in
-                    HStack(spacing: 16) {
-                        if case .loaded(let cells) = model.rowSlot(at: row) {
-                            ForEach(model.columns.indices, id: \.self) { column in
-                                cell(cells[column], model.columns[column])
-                            }
+        Group {
+            switch state {
+            case .noColumns:
+                Text("No columns.")
+                    .foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+            case .noRows, .rows:
+                // 🔴 `.id(model.name)`: `NSViewRepresentable` reuses its coordinator for the life of
+                // one view identity, and the coordinator holds the model. Without this, switching
+                // tabs leaves the previous table's `GridBridge` driving the new table's grid.
+                TableGridView(model: model)
+                    .id(model.name)
+                    // The "no rows match" state deliberately does NOT cover the header —
+                    // `web/index.html:198` (`inset: 46px 0 0 0`), so the filters that emptied the
+                    // grid are still there to be undone. Opaque, so no stale rows show behind it.
+                    .overlay(alignment: .top) {
+                        if state == .noRows {
+                            Text("No rows match the current filters.")
+                                .foregroundStyle(.secondary)
+                                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                                .background(.background)
+                                .padding(.top, gridHeaderInset)
                         }
                     }
-                }
             }
-            .font(.system(.body, design: .monospaced))
-            .padding(12)
         }
         // `id:` so switching tabs re-runs this against the newly selected table. The error is
         // surfaced rather than swallowed: `loadFirstPage` is the only thing standing between the
@@ -83,34 +85,53 @@ private struct TableRows: View {
             do { try await model.loadFirstPage() } catch { onError(error.localizedDescription) }
         }
     }
-
-    /// 🔴 A real NULL, a real empty string and a cell whose text is literally `N/A` must remain
-    /// three visibly different things — that distinction is the product (spec §9).
-    ///
-    /// The value string comes from `SiftEngine.glyph(for:kind:)`, the ONE renderer, shared with
-    /// the `sift` CLI because two renderings of the same file that disagree is a defect in a tool
-    /// whose premise is not lying about data. **Never `Cell.display`**: it renders `.null` and
-    /// `.text("")` identically, collapsing two of the three. The UI's own contribution is only the
-    /// styling — `nullGlyph`/`emptyStringGlyph` are public constants precisely so it can do that
-    /// rather than reuse the CLI's ASCII spelling.
-    @ViewBuilder
-    private func cell(_ cell: Cell, _ column: Column) -> some View {
-        let absent = cell.isNull || cell == .text("")
-        Text(glyph(for: cell, kind: column.kind))
-            .foregroundStyle(absent ? AnyShapeStyle(.tertiary) : AnyShapeStyle(.primary))
-            .italic(absent)
-            .lineLimit(1)
-            .frame(width: columnWidth, alignment: column.kind == .number ? .trailing : .leading)
-    }
 }
 
-private struct EmptyState: View {
+/// Height of the `NSTableView` header the "no rows" overlay must not cover.
+private let gridHeaderInset: CGFloat = 28
+
+/// The no-file-open state — `showEmptyState("nofile")` (`web/index.html:637-657`), copy included.
+private struct NothingOpenYet: View {
     let onOpen: () -> Void
+
+    private let formats = ["csv", "parquet", "json", "ndjson", "xlsx", "delta table", "folder"]
 
     var body: some View {
         VStack(spacing: 14) {
-            Text("No file open").font(.title2).foregroundStyle(.secondary)
-            Button("Open a File…", action: onOpen)
+            Text("⚡")
+                .font(.system(size: 30))
+                .frame(width: 66, height: 66)
+                .background(Color.accentColor.opacity(0.14), in: RoundedRectangle(cornerRadius: 16))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 16)
+                        .strokeBorder(Color.accentColor.opacity(0.28)))
+            Text("Nothing open yet").font(.system(size: 16, weight: .semibold))
+            Text(
+                """
+                Drop a file anywhere here, or open one — it loads instantly and stays on disk, \
+                so size isn't the constraint it usually is.
+                """
+            )
+            .font(.system(size: 12.5))
+            .foregroundStyle(.secondary)
+            .multilineTextAlignment(.center)
+            .frame(maxWidth: 340)
+            Button(action: onOpen) { Label("Open a File…", systemImage: "plus") }
+                .controlSize(.large)
+                .buttonStyle(.borderedProminent)
+            // The formats the open panel will actually accept, said before the user has to guess.
+            HStack(spacing: 5) {
+                ForEach(formats, id: \.self) { format in
+                    Text(format.uppercased())
+                        .font(.system(size: 10, design: .monospaced))
+                        .kerning(0.6)
+                        .foregroundStyle(.tertiary)
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 2)
+                        .background(.quaternary, in: RoundedRectangle(cornerRadius: 5))
+                }
+            }
+            .frame(maxWidth: 360)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
