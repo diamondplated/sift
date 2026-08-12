@@ -31,7 +31,7 @@ cd sift
 .venv/bin/python -c "import sys;sys.path.insert(0,'engine');import app;print(len(app.app.routes))"
 sed -n '/^<script>/,/^<\/script>/p' web/index.html | sed '1d;$d' | node --check /dev/stdin
 ( cd shell && swift build -c release )                     # native shell; no Xcode needed
-./build-app.sh                                             # -> ./Sift.app, then relaunch it
+./scripts/fetch-duckdb.sh && ./build-app.sh                # -> ./Sift.app, then relaunch it
 ```
 The web layer is identical in browser mode (`dev.sh`, `NATIVE=false`) and the native shell, so
 verify UI logic in the browser preview; the native window can't be screenshotted here. After any

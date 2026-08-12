@@ -51,18 +51,20 @@ imported — a 20 GB CSV opens as fast as a 2 MB one, and never has to fit in me
 ## Quick start
 
 ```bash
-uv venv --python 3.12 .venv
-uv pip install --python .venv/bin/python -r requirements.txt -r requirements-dev.txt
-# Once, needs network. Extension binaries are per-DuckDB-version, so repeat after a version bump.
-.venv/bin/python -c "import duckdb; c=duckdb.connect(); [c.execute(f'INSTALL {e}') for e in ('delta','excel')]"
+./scripts/fetch-duckdb.sh           # once, needs network — the pinned prebuilt libduckdb
 ./build-app.sh /Applications        # builds Sift.app and installs it
 ```
 
 Drag a file onto the Dock icon, or right-click a `.parquet` → **Open With → Sift**.
 
-Prefer a browser? `./dev.sh` serves the same UI on <http://127.0.0.1:8642>.
+The app is self-contained: libduckdb is copied inside the bundle, so it keeps working with this
+checkout deleted.
 
-**Requirements:** macOS 13+, Python 3.12+. No Xcode needed — the native shell builds with SwiftPM.
+Prefer a browser? `./dev.sh` serves the same UI on <http://127.0.0.1:8642> — that one still needs
+the Python setup in [CONTRIBUTING.md](CONTRIBUTING.md).
+
+**Requirements:** macOS 14+. No Xcode needed — everything builds with SwiftPM and the Command Line
+Tools.
 
 ---
 
