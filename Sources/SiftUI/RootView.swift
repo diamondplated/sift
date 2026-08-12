@@ -8,6 +8,11 @@ public struct RootView: View {
     @Bindable private var state: AppState
     private let onOpen: () -> Void
 
+    /// Whether the SQL console is showing. Per window and not per table — `sqlwrap`'s `display` was
+    /// one element for the whole page (`web/index.html:359`), and a toggle that forgot itself on
+    /// every tab switch would be worse than one that remembers the wrong thing.
+    @State private var showSQL = false
+
     public init(state: AppState, onOpen: @escaping () -> Void) {
         self.state = state
         self.onOpen = onOpen
@@ -20,12 +25,23 @@ public struct RootView: View {
             }
             .navigationSplitViewColumnWidth(min: 160, ideal: 220, max: 400)
         } detail: {
+            // Banners, filter bar, console, grid — `web/index.html:336-368`'s order. The banners sit
+            // ABOVE the toolbar because several of them (staging, a missing extension) are about the
+            // engine rather than about this view of the table, and pushing them under the filters
+            // would read as though the filters caused them.
             VStack(spacing: 0) {
-                if let banner = state.banner {
-                    BannerLine(text: banner) { state.banner = nil }
-                }
+                BannerStack(state: state)
                 if let table = state.active, let model = state.model(for: table.name) {
-                    TableGrid(model: model) { state.banner = $0 }
+                    FilterBar(model: model, showSQL: $showSQL) { state.banner = $0 }
+                    Divider()
+                    if showSQL {
+                        SQLConsole(model: model) { state.banner = $0 }
+                        Divider()
+                    }
+                    TableGrid(
+                        model: model,
+                        onColumnSelected: { state.selectedColumn = $0 },
+                        onError: { state.banner = $0 })
                 } else {
                     NothingOpenYet(onOpen: onOpen)
                 }
@@ -43,6 +59,7 @@ public struct RootView: View {
 /// this body's — a body cannot be tested, and that function's edges can.
 private struct TableGrid: View {
     let model: TableViewModel
+    let onColumnSelected: (String) -> Void
     let onError: (String) -> Void
 
     private var state: GridState {
@@ -62,7 +79,13 @@ private struct TableGrid: View {
                 // 🔴 `.id(model.name)`: `NSViewRepresentable` reuses its coordinator for the life of
                 // one view identity, and the coordinator holds the model. Without this, switching
                 // tabs leaves the previous table's `GridBridge` driving the new table's grid.
-                TableGridView(model: model)
+                // 🔴 Both closures wired. The header task built them and could not reach this call
+                // site: `onColumnSelected` is a plain header click, which without this does
+                // *nothing at all*, and `onError` is a failed shift-click sort — `setSort` runs in a
+                // detached `Task`, so there is no caller left to throw to and the banner is the only
+                // place that error can go.
+                TableGridView(
+                    model: model, onColumnSelected: onColumnSelected, onError: onError)
                     .id(model.name)
                     // The "no rows match" state deliberately does NOT cover the header —
                     // `web/index.html:198` (`inset: 46px 0 0 0`), so the filters that emptied the
@@ -77,6 +100,12 @@ private struct TableGrid: View {
                         }
                     }
             }
+        }
+        // The §13a busy overlay, on the GRID and nothing else: the actor is blocked, not the app, so
+        // the sidebar, the inspector and the menu bar stay live and the scrim covers exactly the
+        // thing that has stopped answering.
+        .overlay {
+            if model.busy.visible { BusyOverlay(message: model.busy.message) }
         }
         // `id:` so switching tabs re-runs this against the newly selected table. The error is
         // surfaced rather than swallowed: `loadFirstPage` is the only thing standing between the
@@ -135,23 +164,5 @@ private struct NothingOpenYet: View {
             .frame(maxWidth: 360)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
-    }
-}
-
-/// One user-facing sentence with a way to dismiss it. Task 10 replaces this with the real banner
-/// stack (staging progress, notes, missing extensions, busy).
-private struct BannerLine: View {
-    let text: String
-    let dismiss: () -> Void
-
-    var body: some View {
-        HStack(alignment: .firstTextBaseline) {
-            Text(text).textSelection(.enabled)
-            Spacer(minLength: 12)
-            Button("Dismiss", action: dismiss)
-        }
-        .padding(.horizontal, 12)
-        .padding(.vertical, 8)
-        .background(Color.red.opacity(0.16))
     }
 }

@@ -33,6 +33,13 @@ public final class AppState {
     /// SSE, so the banner IS the notification — an open that fails without setting this is a
     /// silent failure, and the user's click just does nothing.
     public var banner: String?
+    /// The column the inspector's Column tab is about.
+    ///
+    /// Here rather than as `@State` inside `InspectorView` because the two things that set it are
+    /// two views apart: the Schema tab's own list, and a plain click on a grid column header
+    /// (`GridBridge.onColumnSelected`, wired in `RootView`). The web kept the same value in the same
+    /// place, as `state.col`, for the same reason.
+    public var selectedColumn: String?
 
     /// `@ObservationIgnored` on both, deliberately. Views observe the `TableViewModel` objects
     /// themselves, never this dictionary — and `model(for:)` is called from `RootView.body`, so an

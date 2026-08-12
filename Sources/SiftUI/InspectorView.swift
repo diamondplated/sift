@@ -21,14 +21,14 @@ public enum InspectorTab: String, CaseIterable, Sendable {
 
 /// The inspector pane: a tab strip over one of three bodies.
 ///
-/// The selected tab and column are `@State` here rather than on `AppState` on purpose — nothing
-/// outside this pane reads either one, and the app already has one observable object per open
-/// table. The one thing that DOES cross the boundary is `AppState.inspectorVisible`, which the View
-/// menu toggles, and that already existed.
+/// The selected tab is `@State` here rather than on `AppState` on purpose — nothing outside this
+/// pane reads it. The selected *column* moved to `AppState.selectedColumn` in Task 10, because a
+/// plain click on a grid column header selects one from two views away and `@State` here was
+/// unreachable from there; `AppState.inspectorVisible`, which the View menu toggles, already
+/// crossed the same boundary.
 public struct InspectorView: View {
     private let state: AppState
     @State private var tab: InspectorTab = .schema
-    @State private var column: String?
 
     public init(state: AppState) {
         self.state = state
@@ -54,6 +54,13 @@ public struct InspectorView: View {
             }
         }
         .inspectorColumnWidth(min: 260, ideal: 320, max: 520)
+        // A column selected from OUTSIDE this pane — a plain click on a grid header — brings the
+        // Column tab forward, matching the web's `state.itab = "column"` on the same click. The
+        // Schema tab's own rows still set the tab directly, because clicking the row that is
+        // already selected changes nothing here and would leave the user on Schema.
+        .onChange(of: state.selectedColumn) { _, next in
+            if next != nil { tab = .column }
+        }
     }
 
     @ViewBuilder
@@ -61,12 +68,12 @@ public struct InspectorView: View {
         if let model {
             switch tab {
             case .schema:
-                SchemaList(model: model, selected: column) { name in
-                    column = name
+                SchemaList(model: model, selected: state.selectedColumn) { name in
+                    state.selectedColumn = name
                     tab = .column
                 }
             case .column:
-                if let column {
+                if let column = state.selectedColumn {
                     // `id:` so switching columns rebuilds the panel rather than handing the next
                     // column the previous one's search text and lens.
                     ColumnPanel(session: state.session, model: model, column: column)

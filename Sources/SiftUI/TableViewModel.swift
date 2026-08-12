@@ -43,6 +43,23 @@ public final class TableViewModel {
     public private(set) var sqlText = ""
     public private(set) var sqlOwned = false
 
+    /// The overlay for this table's grid. Owned here rather than by `AppState` because the thing it
+    /// announces is one table's fetch, and a second tab must not be told the first one is slow.
+    public let busy = BusyState()
+
+    /// The last block fetch that threw, as its own sentence, or `nil`.
+    ///
+    /// 🔴 A block that fails is otherwise INVISIBLE. `PageLoader` continues to the next block on
+    /// purpose (one bad page must not wedge the grid), so without this the rows it covered stay
+    /// skeletons forever with nothing on screen saying why — and in SQL mode, where every block
+    /// re-runs the user's query, a statement that fails on block 7 leaves a grid of placeholders
+    /// under a console reporting success. `BannerStack` draws this and writes `nil` back to dismiss
+    /// it, which is why it is settable.
+    ///
+    /// A property and NOT a fourth callback: this file's ceiling is three closures, and the fourth
+    /// is the one that is supposed to force the observer-protocol decision rather than slip past.
+    public var pageError: String?
+
     /// Called when a profile lands. The grid re-measures its column widths from `max_len`; the
     /// inspector re-renders. (The web's `loadProfile()` did the same by calling `renderHead()`.)
     public var onProfileArrived: (() -> Void)?
@@ -79,9 +96,19 @@ public final class TableViewModel {
         self.columns = table.spec.columns
         loader = PageLoader<TablePage> { [weak self] block in
             guard let self else { throw CancellationError() }
+            // 🔴 The begin/end pair lives HERE, in the closure the view model supplies, and not in
+            // `PageLoader`. This is the one place that already knows both the loader and the busy
+            // state; giving `PageLoader.init` a `BusyState` parameter would break the `init(fetch:)`
+            // contract four of Task 4's tests pin ("consumes nothing from the engine; the fetch is
+            // injected") for a dependency the loader has no other use for.
+            self.busy.begin("Loading rows…")
+            defer { self.busy.end() }
             return try await self.fetchBlock(block)
         }
         loader.onDeliver = { [weak self] block, page in self?.deliver(block, page) }
+        // Installed, at last. The loader has had this hook since Task 4 and nothing set it, so a
+        // block that threw was dropped in silence — see `pageError`.
+        loader.onFailure = { [weak self] error in self?.pageError = error.localizedDescription }
     }
 
     // MARK: - what the grid draws
@@ -113,6 +140,11 @@ public final class TableViewModel {
     /// `onViewportReset` fires. Every spec change ends here; see `applySpec`.
     public func resetViewport() {
         firstRow = 0
+        // Every spec change ends here, which makes this the one place that knows the block that
+        // failed described a query nobody is looking at anymore. (A failure still *in flight* can
+        // never land: `PageLoader` checks the generation before calling `onFailure`. This is about
+        // the one already on screen.)
+        pageError = nil
         onViewportReset?()
         requestCurrentViewport()
     }
@@ -218,6 +250,12 @@ public final class TableViewModel {
     /// ever read, and a swallowed one leaves the user's click doing nothing at all — the same
     /// reason `loadFirstPage` throws and `RootView` banners it.
     public func setSort(_ sort: [QuerySpec.SortTerm]) async throws {
+        // Immediately, without the 400 ms wait, because this is the one case where the stall is
+        // KNOWN before the work starts rather than discovered by it — see `sortBusyMessage`.
+        if let message = sortBusyMessage(rows: table.visibleRows) {
+            busy.begin(message, immediately: true)
+        }
+        defer { busy.end() }
         try await applySpec(filters: table.qspec.filters, sort: sort)
     }
 
@@ -403,6 +441,20 @@ public final class TableViewModel {
 /// extent the end of the result already settled.
 func sqlModeExtent(_ current: Int, block: Int, rows: Int) -> Int {
     rows < pageRows ? block * pageRows + rows : max(current, (block + 1) * pageRows + 1)
+}
+
+/// The overlay's message for a sort that is about to start, or `nil` when the table is small enough
+/// that the skeleton rows cover the wait on their own.
+///
+/// 250,000 rows is a threshold about the §13a cliff and not about the sort: `Session.page` never
+/// suspends, so the first sorted page over a large table blocks every other actor call while
+/// `sortedRelation` materializes. Below the threshold that is a flicker; above it, it is a window
+/// that stops answering, and the user is owed a reason before it happens rather than 400 ms into it.
+///
+/// `nil` rather than an empty string so the caller cannot accidentally show an empty overlay.
+func sortBusyMessage(rows: Int?) -> String? {
+    guard let rows, rows > 250_000 else { return nil }
+    return "Sorting \(groupDigits(String(rows))) rows…"
 }
 
 /// The sentence for a `Table.RowsBasis`, shown under the row count.
