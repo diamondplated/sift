@@ -262,6 +262,15 @@ private final class HeaderHarness {
         view.layoutSubtreeIfNeeded()
     }
 
+    /// Re-lay the header after a column's width changed — what a drag-to-resize does.
+    func retile() {
+        table.tile()
+        view.frame = NSRect(
+            x: 0, y: 0, width: table.tableColumns.reduce(0) { $0 + $1.width },
+            height: view.frame.height)
+        view.layoutSubtreeIfNeeded()
+    }
+
     var height: Int { Int(view.bounds.height) }
     func rect(ofColumn i: Int) -> NSRect { view.headerRect(ofColumn: i) }
     func cell(_ i: Int) throws -> SiftHeaderCell {
@@ -288,6 +297,15 @@ private final class HeaderHarness {
                 abs(c.redComponent - background.redComponent)
                     + abs(c.greenComponent - background.greenComponent)
                     + abs(c.blueComponent - background.blueComponent) > 0.08
+            }
+        }
+
+        /// Points painted in a saturated colour — the accent caret, told apart from the grey name
+        /// and type beside it by the spread between its channels rather than by where it is.
+        func coloured(x: Range<Int>, fromTop: Range<Int>) -> [Int] {
+            pixels(x: x, fromTop: fromTop) { c, _ in
+                max(c.redComponent, c.greenComponent, c.blueComponent)
+                    - min(c.redComponent, c.greenComponent, c.blueComponent) > 0.15
             }
         }
 
@@ -412,35 +430,136 @@ private final class HeaderHarness {
 
 /// 🔴 The caret and the distinct count are the two things this task adds that a person has to
 /// *read*, and both are drawn into a context rather than set on a control — so nothing but a bitmap
-/// can say whether they arrived. Three renders of the same cell, each adding one decoration, each
-/// of which has to add ink.
+/// can say whether they arrived. Renders of the same cell, each adding one decoration, each of
+/// which has to add ink where that decoration lives.
 @MainActor
 @Test func theCaretAndTheDistinctCountAreActuallyPaintedAndNotJustComputed() async throws {
     appKitReady()
     let (_, model) = try await profiledHeaderFixture()
     let harness = try HeaderHarness(GridBridge(model: model))
     let r = harness.rect(ofColumn: 2)
-    // The right-hand third of `description`'s type line, where the caret and the count live and
-    // where its own seven-character type does not reach.
-    let region = Int(r.maxX) - Int(r.width) / 3..<Int(r.maxX) - 2
-    let line = harness.height / 2..<harness.height - 3
+    // The right-hand third of `description`'s type line, where the count lives and where its own
+    // seven-character type does not reach.
+    let countRegion = Int(r.maxX) - Int(r.width) / 3..<Int(r.maxX) - 2
+    let typeLine = harness.height / 2..<harness.height - 3
+    // …and the name line to the right of where `description` ends, which is where the caret goes.
+    let cell = try harness.cell(2)
+    let nameEnds = Int(r.minX) + 7 + Int(cell.measure("description", font: .systemFont(ofSize: 11.5, weight: .bold)))
+    let caretRegion = nameEnds..<Int(r.maxX) - 2
+    let nameLine = 0..<harness.height / 2
 
-    func ink(_ decoration: HeaderDecoration) throws -> [Int] {
-        try harness.cell(2).decoration = decoration
-        return try harness.shot().ink(x: region, fromTop: line)
+    func shot(_ decoration: HeaderDecoration) throws -> HeaderHarness.Shot {
+        cell.decoration = decoration
+        return try harness.shot()
     }
 
-    let bare = try ink(HeaderDecoration(caret: nil, distinctLabel: "", missingFraction: 0))
-    #expect(bare.isEmpty, "`VARCHAR` in a 168 pt column does not reach the right third")
+    let bare = try shot(HeaderDecoration(caret: nil, distinctLabel: "", missingFraction: 0))
+    #expect(bare.ink(x: countRegion, fromTop: typeLine).isEmpty,
+        "`VARCHAR` in a 168 pt column does not reach the right third")
+    #expect(bare.ink(x: caretRegion, fromTop: nameLine).isEmpty, "nothing past the name yet")
 
-    let counted = try ink(HeaderDecoration(caret: nil, distinctLabel: "≈42k", missingFraction: 0))
-    #expect(!counted.isEmpty, "a distinct count that draws nothing is a count nobody can read")
+    let counted = try shot(HeaderDecoration(caret: nil, distinctLabel: "≈42k", missingFraction: 0))
+    let countInk = counted.ink(x: countRegion, fromTop: typeLine)
+    #expect(!countInk.isEmpty, "a distinct count that draws nothing is a count nobody can read")
+    #expect(counted.ink(x: caretRegion, fromTop: nameLine).isEmpty,
+        "…and an unsorted column still has no caret")
 
-    let sorted = try ink(HeaderDecoration(caret: "▼", distinctLabel: "≈42k", missingFraction: 0))
-    // The caret sits to the LEFT of the count, so it has to extend the painted run further left
-    // rather than landing on top of it — which is what a right-aligned caret and count would do.
-    #expect(sorted.min() ?? 0 < counted.min() ?? 0, "the caret is beside the count, not over it")
-    #expect(sorted.max() == counted.max(), "…and the count stays where it was")
+    let sorted = try shot(HeaderDecoration(caret: "▼", distinctLabel: "≈42k", missingFraction: 0))
+    // 🔴 The caret is on the NAME line, immediately after the name — the web's `.hn` flex row. It
+    // used to be down beside the count, and that cost the type line 12 pt it did not have.
+    let caretInk = sorted.ink(x: caretRegion, fromTop: nameLine)
+    #expect(!caretInk.isEmpty, "a caret that draws nothing is a sort nobody can see")
+    #expect(caretInk.min() ?? 999 < nameEnds + 8, "…and it sits beside the name, not at the edge")
+    // The count is untouched by the move, and the type line gained nothing.
+    #expect(sorted.ink(x: countRegion, fromTop: typeLine) == countInk)
+}
+
+/// 🔴 The reason the caret is on the name line, and the property that keeps it there: the caret
+/// must take NO space from the type line. It used to sit beside the distinct count, and MEASURED,
+/// that cost the type 12 pt it did not have — a sorted `BIGINT` column at the 76-pt width floor
+/// rendered `BIG…` where the shipping web build renders `BIGINT`. The native app is not allowed to
+/// be the worse one.
+@MainActor
+@Test func theSortCaretTakesNoSpaceFromTheTypeLine() throws {
+    appKitReady()
+    let cell = SiftHeaderCell(textCell: "id")
+    cell.typeText = "BIGINT"
+    let frame = NSRect(x: 0, y: 0, width: 76, height: 28)
+
+    func typeWidth(caret: String?, count: String) -> CGFloat {
+        cell.decoration = HeaderDecoration(caret: caret, distinctLabel: count, missingFraction: 0)
+        return cell.typeRect(in: cell.layout(frame, flipped: true).meta).width
+    }
+    #expect(typeWidth(caret: "▲", count: "1.2k") == typeWidth(caret: nil, count: "1.2k"),
+        "sorting a column must not shrink the room its type has")
+    #expect(typeWidth(caret: "▼", count: "1.2k") == typeWidth(caret: nil, count: "1.2k"))
+
+    // …and at the 76-pt floor there is now room for the whole type. `NSString.draw(in:)` puts in an
+    // ellipsis exactly when the measured text is wider than the rect it is given, so this is the
+    // elision question asked directly of the real layout.
+    let metaFont = NSFont.monospacedSystemFont(ofSize: 9, weight: .regular)
+    let needed = cell.measure("BIGINT", font: metaFont, kern: 0.54)
+    #expect(needed <= typeWidth(caret: "▲", count: "1.2k"),
+        "BIGINT needs \(needed) pt of \(typeWidth(caret: "▲", count: "1.2k"))")
+    #expect(needed <= typeWidth(caret: "▲", count: "999"))
+
+    // MEASURED, and the honest edge of this: a FIVE-character count (`≈1.2k`, `≈1.0M`) takes 28 of
+    // the 62 points a 76-pt column has, leaving 34 for a type that wants 37, and `BIGINT` renders
+    // `BIGI…`. The web build is in the same place — `.hcell { padding:3px 7px }` gives it the same
+    // 62 px box and `ui-monospace` at 9 px is the same SF Mono this measures — so it is parity
+    // rather than a regression. Not asserted, because an assertion that something does NOT fit goes
+    // red the day someone improves it.
+
+    // The floor is the floor: this is the width `columnWidths` actually hands a two-character
+    // BIGINT column, not a number picked to make the arithmetic work.
+    #expect(columnWidths([col("id", "BIGINT")], profile: [profile("id", maxLen: 4)]) == [76])
+}
+
+/// 🔴 A name too long for its column must lose its own tail rather than its caret. The width
+/// formula sizes for the name, so this only bites once a column is narrower than computed — the 320
+/// clamp on a very long name, or a user dragging one in — and in both cases a caret drawn past the
+/// right edge is simply gone, and the column silently stops looking sorted.
+@MainActor
+@Test func aNameTooLongForItsColumnIsTruncatedBeforeItsCaretIs() async throws {
+    appKitReady()
+    let (_, model) = try await profiledHeaderFixture()
+    let harness = try HeaderHarness(GridBridge(model: model))
+    try harness.cell(2).decoration = HeaderDecoration(
+        caret: "▼", distinctLabel: "", missingFraction: 0)
+
+    // `description` needs about 74 pt for its name; give it 60 and it cannot have all of it.
+    harness.table.tableColumns[2].width = 60
+    harness.retile()
+    let r = harness.rect(ofColumn: 2)
+    #expect(Int(r.width) == 60)
+
+    let shot = try harness.shot()
+    let painted = shot.coloured(x: Int(r.minX)..<Int(r.maxX) - 1, fromTop: 0..<harness.height / 2)
+    #expect(!painted.isEmpty, "the caret was pushed off the edge by a name that would not fit")
+
+    // 🔴 The WHOLE caret, not "some accent-coloured pixels". Without the reservation the caret is
+    // drawn starting past the column's right edge and four of its six points still land inside —
+    // enough for a `!isEmpty` assertion to pass on a caret that is visibly cut in half. Measured,
+    // and the reason this compares against the glyph's own width.
+    let width = try harness.cell(2).measure("▼", font: .monospacedSystemFont(ofSize: 9, weight: .regular))
+    let drawn = painted.max()! - painted.min()! + 1
+    #expect(drawn >= Int(width) - 1, "\(drawn) of the caret's \(width) pt made it inside")
+    #expect(painted.max()! < Int(r.maxX) - 1, "…and it is inside its own column")
+}
+
+/// The name line has to hold the name AND the caret it takes on when sorted.
+@MainActor
+@Test func theNameLineHoldsBothTheNameAndItsCaret() throws {
+    appKitReady()
+    let cell = SiftHeaderCell(textCell: "")
+    let caret = cell.measure("▲", font: .monospacedSystemFont(ofSize: 9, weight: .regular))
+    for name in ["id", "description", "a_very_long_column_name_here_x", "created_at_utc"] {
+        let width = try #require(columnWidths([col(name)], profile: []).first)
+        cell.stringValue = name
+        let box = cell.layout(NSRect(x: 0, y: 0, width: width, height: 28), flipped: true)
+        let needed = cell.measure(name, font: .systemFont(ofSize: 11.5, weight: .bold)) + 3 + caret
+        #expect(needed <= box.name.width, "\(name) plus a caret needs \(needed) of \(box.name.width)")
+    }
 }
 
 /// A header whose name is elided is a column whose identity is a guess. `columnWidths` is measured

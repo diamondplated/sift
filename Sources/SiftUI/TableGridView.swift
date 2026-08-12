@@ -718,70 +718,114 @@ final class SiftHeaderCell: NSTableHeaderCell {
         band(cellFrame, fromTop: cellFrame.height - 1, height: 1, flipped: flipped).fill()
         NSRect(x: cellFrame.maxX - 1, y: cellFrame.minY, width: 1, height: cellFrame.height).fill()
 
-        let nameHeight = lineHeight(nameFont)
-        let metaHeight = lineHeight(metaFont)
-        // Anchored from the BOTTOM — the meta line sits on the bar, the name takes what is left, and
-        // the whole thing therefore fits whatever height AppKit gives the header (28 pt, measured)
-        // rather than assuming one. The bar's two points are reserved whether or not there is a bar,
-        // so a profile landing does not shunt the type line up by two points on every column at
-        // once. `max(0,)` because a header shorter than its own two lines must overlap rather than
-        // draw the name off the top edge; `theHeaderPaintsBothOfItsLines…` is what stops
-        // that from being something anyone ever sees.
-        let metaTop = cellFrame.height - 1 - barHeight - metaHeight
-        let nameTop = max(0, (metaTop - nameHeight) / 2).rounded()
-
-        let name = band(cellFrame, fromTop: nameTop, height: nameHeight, flipped: flipped)
-            .insetBy(dx: inset, dy: 0)
-        guard name.width > 0 else { return }
-        draw(stringValue, font: nameFont, color: .labelColor, in: name)
-
-        let meta = band(cellFrame, fromTop: metaTop, height: metaHeight, flipped: flipped)
-            .insetBy(dx: inset, dy: 0)
-        drawMetaLine(in: meta)
+        let box = layout(cellFrame, flipped: flipped)
+        guard box.name.width > 0 else { return }
+        drawNameLine(in: box.name)
+        drawMetaLine(in: box.meta)
 
         if decoration.missingFraction > 0 {
             // `.hbar.nul { background: var(--stale); opacity:.55 }` — the amber the whole app uses
             // for "stale/incomplete", and a system colour rather than the web's literal #b07d1e so
             // it follows a light↔dark switch.
             NSColor.systemOrange.withAlphaComponent(0.55).setFill()
-            var bar = band(cellFrame, fromTop: cellFrame.height - 1 - barHeight,
-                           height: barHeight, flipped: flipped)
+            var bar = box.bar
             bar.size.width = (cellFrame.width * decoration.missingFraction).rounded()
             bar.fill()
         }
     }
 
-    /// Type on the left, then the caret and the distinct count against the right edge.
+    /// The name, then its sort caret immediately after it.
     ///
-    /// Right-aligned as a measured group rather than with a trailing paragraph style, because the
-    /// two have different colours and therefore have to be two draws — and because the type's own
-    /// truncation width is whatever they leave behind. A type that ran under the count would put
-    /// `VARC…` and `≈4.2k` on top of each other.
+    /// 🔴 The caret is on THIS line, beside the name, and not down on the type line. `.hn` is a flex
+    /// row with `gap: 3px` (`web/index.html:618-620`), so the caret follows the text rather than
+    /// sitting against the right edge — and, measured, putting it on the second line cost about
+    /// 12 pt there and truncated a sorted `BIGINT` column at the 76-pt width floor to `BIG…`. The
+    /// name line has the room (the width formula sizes for the name and then floors at 76) and the
+    /// type line does not.
+    private func drawNameLine(in rect: NSRect) {
+        guard let caret = decoration.caret else {
+            draw(stringValue, font: nameFont, color: .labelColor, in: rect)
+            return
+        }
+        let caretWidth = measure(caret, font: metaFont)
+        let forName = NSRect(
+            x: rect.minX, y: rect.minY, width: max(0, rect.width - caretWidth - 3),
+            height: rect.height)
+        draw(stringValue, font: nameFont, color: .labelColor, in: forName)
+        // `align-items: center` — but aligned on the BASELINE rather than the box, because a 9 pt
+        // triangle centred in a 14 pt line box floats visibly above the name's own baseline.
+        let drop = (nameFont.ascender - metaFont.ascender).rounded()
+        // Immediately after the text, not at the far edge: a caret parked against the right edge of
+        // a 320 pt column reads as belonging to whatever is under it.
+        let x = forName.minX + min(measure(stringValue, font: nameFont), forName.width) + 3
+        // `.hcell .caret { color: var(--accent) }` — the one accent-coloured thing in the header,
+        // because it is the only part of it that reflects something the user did.
+        draw(caret, font: metaFont, color: .controlAccentColor,
+             in: NSRect(x: x, y: rect.minY + drop, width: caretWidth, height: rect.height - drop))
+    }
+
+    /// Type on the left, distinct count against the right edge.
+    ///
+    /// Two draws rather than one right-aligned paragraph because they are different colours — and
+    /// because the type's truncation width is whatever the count leaves behind. A type that ran
+    /// under the count would put `VARC…` and `≈4.2k` on top of each other.
     private func drawMetaLine(in rect: NSRect) {
-        var right = rect.maxX
         if !decoration.distinctLabel.isEmpty {
             let width = measure(decoration.distinctLabel, font: metaFont)
-            right -= width
             draw(decoration.distinctLabel, font: metaFont, color: .tertiaryLabelColor,
-                 in: NSRect(x: right, y: rect.minY, width: width, height: rect.height))
+                 in: NSRect(x: rect.maxX - width, y: rect.minY, width: width, height: rect.height))
         }
-        if let caret = decoration.caret {
-            let width = measure(caret, font: metaFont)
-            right -= width + 3
-            // `.hcell .caret { color: var(--accent) }` — the one accent-coloured thing in the header,
-            // because it is the only part of it that reflects something the user did.
-            draw(caret, font: metaFont, color: .controlAccentColor,
-                 in: NSRect(x: right, y: rect.minY, width: width, height: rect.height))
-        }
+        let forType = typeRect(in: rect)
+        guard forType.width > 0 else { return }
         // `text-transform: uppercase`. `uppercased()` and not `uppercased(with:)` — the locale-aware
         // one turns a Turkish `i` into `İ`, and these are DuckDB type names.
-        let width = right - rect.minX - (right < rect.maxX ? 4 : 0)
-        guard width > 0 else { return }
-        draw(typeText.uppercased(), font: metaFont, color: .tertiaryLabelColor,
-             in: NSRect(x: rect.minX, y: rect.minY, width: width, height: rect.height), kern: metaKern)
+        draw(typeText.uppercased(), font: metaFont, color: .tertiaryLabelColor, in: forType,
+             kern: metaKern)
     }
 
     // MARK: - geometry
+
+    /// The three bands of the header, with the text ones already inset.
+    ///
+    /// Anchored from the BOTTOM — the type line sits on the bar, the name takes what is left — so
+    /// the layout fits whatever height AppKit gives the header (28 pt, measured) rather than
+    /// assuming one. The bar's two points are reserved whether or not there is a bar, so a profile
+    /// landing does not shunt every type line up by two points at once. `max(0,)` because a header
+    /// shorter than its own two lines must overlap rather than draw the name off the top edge;
+    /// `theHeaderPaintsBothOfItsLines…` is what stops that from being something anyone sees.
+    ///
+    /// Returned rather than computed inside `draw` so the suite can ask where a line will land
+    /// without a bitmap — `theTypeSurvivesAtTheWidthFloorOfASortedColumn` measures against these.
+    func layout(_ cellFrame: NSRect, flipped: Bool) -> (name: NSRect, meta: NSRect, bar: NSRect) {
+        let nameHeight = lineHeight(nameFont)
+        let metaHeight = lineHeight(metaFont)
+        let metaTop = cellFrame.height - 1 - barHeight - metaHeight
+        let nameTop = max(0, (metaTop - nameHeight) / 2).rounded()
+        return (
+            band(cellFrame, fromTop: nameTop, height: nameHeight, flipped: flipped)
+                .insetBy(dx: inset, dy: 0),
+            band(cellFrame, fromTop: metaTop, height: metaHeight, flipped: flipped)
+                .insetBy(dx: inset, dy: 0),
+            band(cellFrame, fromTop: cellFrame.height - 1 - barHeight, height: barHeight,
+                 flipped: flipped)
+        )
+    }
+
+    /// The type's share of the second line: everything the distinct count did not take.
+    ///
+    /// No gap between the two. There was a 4 pt one, invented here — the web floats the count right
+    /// *inside* the type's own element (`.dcount { float:right }`), so the type runs up to it and
+    /// `.ht`'s `text-overflow: ellipsis` does the rest. Those 4 points are the difference between
+    /// `BIGINT` and `BIG…` in a 76 pt column, which is a bad trade for whitespace nobody asked for.
+    ///
+    /// Not `private`, because "does `BIGINT` still fit here" is the assertion that moved the caret
+    /// off this line in the first place.
+    func typeRect(in rect: NSRect) -> NSRect {
+        guard !decoration.distinctLabel.isEmpty else { return rect }
+        let taken = measure(decoration.distinctLabel, font: metaFont)
+        return NSRect(
+            x: rect.minX, y: rect.minY, width: rect.width - taken, height: rect.height)
+    }
 
     /// A band `fromTop` points down from the top edge. Everything above is expressed this way so the
     /// layout reads top-to-bottom the way it looks; `NSTableHeaderView` is flipped, and the
