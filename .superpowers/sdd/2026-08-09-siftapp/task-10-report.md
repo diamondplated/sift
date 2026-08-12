@@ -51,12 +51,13 @@ overlay on the grid only.
 Twenty-one mutations run against them; **19 killed, and the 2 that survived were my own tests being
 vacuous, both now fixed**:
 
-* **A pixel digest cannot be used on this view at all.** MEASURED: rendering the *same* `FilterBar`
-  three times produced digests `A, A, B` — an `ImageRenderer` bitmap containing an AppKit-backed
-  `Button` is not byte-stable between renders. So `digest(x) != digest(y)` passes for two renders of
-  *identical* content: written that way first, the SQL-mode check passed with the SQL-mode branch
-  deleted. Replaced with channel-ratio ink counts, which were bit-identical across every repeat, and
-  asserted only as relationships (this state has more chip ink than that one), never as magnitudes.
+* **The capture route has to be `cacheDisplay`, not `ImageRenderer`.** MEASURED, 20 renders of
+  identical content each way: `ImageRenderer` produced **two** distinct bitmaps, `cacheDisplay` on an
+  `NSHostingView` produced **one**. An unstable capture makes every "these two renders differ"
+  assertion vacuous — written on `ImageRenderer` first, the SQL-mode check passed with the SQL-mode
+  branch deleted. (First written up here as "a pixel digest cannot be used on a view containing an
+  AppKit `Button`", then as row padding; both wrong. It is the renderer, and the fix is to stop using
+  it. See the correction below.)
 * **No fixed-sleep timing assertions.** `Task.sleep(80ms)` then `#expect(busy.visible)` passed alone
   and failed in the full suite: the timer is `MainActor`-bound and 107 parallel tests starve it for
   far longer than the delay. `waitFor` polls for the signal instead, and the negative case uses an
@@ -83,6 +84,45 @@ window brings an `NSVisualEffectView` that cannot be captured), over a real 300,
 `ImageRenderer` was used for the bar's four states (it draws SwiftUI text that `cacheDisplay` drops,
 and vice versa — the two are mirror images): the no-filters hint, one chip, two chips on one column,
 and the amber `SQL mode — filters frozen` chip in place of the chips.
+
+## Correction: the render test went red on CI, and why the replacement cannot
+
+The first version counted pixels "leaning amber" in one render and compared that count against a
+render of **different content**. It passed here and inverted on the macos-15 runner
+(`amber 2486 > amber 3861`): `Color.accentColor` resolves to a different hue there, so the blue
+chips themselves counted as amber and two of them out-ambered the one amber chip. **A count compared
+across two different contents measures the renderer as much as the code.** The ink-ratio idea was
+stable across repeats *here*, which is exactly what made it look safe — repeat-stability on one
+machine says nothing about agreement between two.
+
+It now uses the technique the histogram task already established, rather than a fourth invention:
+
+* **`cacheDisplay` on an `NSHostingView`, pinned to `NSAppearance(.aqua)`** — no appearance variance,
+  and the stable capture route measured above.
+* **A control first.** The same model is rendered twice and the two buffers must be identical. Every
+  later assertion is an inequality, which is only evidence if the renderer reproduces itself; a
+  renderer too unstable to compare now fails the *control*, with a message saying so, instead of
+  flaking on the real assertion. Verified by injecting a random opacity into `FilterBar`: the control
+  is what goes red, at its own line.
+* **Digest over every pixel byte, walked by hand, row padding excluded.** `Hasher.combine(someData)`
+  hashes at most the first 80 bytes — blank margin on this strip.
+
+**Why this is environment-independent, by construction:** both sides of every comparison come out of
+one rasterizer, in one process, at one scale, in one appearance, microseconds apart. A runner with
+different fonts, a different backing scale, different antialiasing or a different accent colour moves
+*both* buffers the same way, so it cannot flip an equality or an inequality — the only thing that
+differs between the two renders is the model, which is the thing under test. Nothing asserts a
+magnitude, a colour, a coordinate, or a `* scale` term; the only numeric literals left in the file
+are in the digest loop itself.
+
+Two extra guards came out of re-running mutation on the rewrite: with `Text(filterChipLabel(filter))`
+replaced by `Text("")` the whole test stayed green, because a chip of a different *width* is still a
+different picture. Two filters that differ in exactly one string — same op, same geometry — now pin
+that the chip draws its label and its column name.
+
+**Also found, and not mine:** `SQLModeTests.theStatusLineRedrawsWhenTheBoxIsClaimed` fails its own
+control roughly one full-suite run in one at `577056f` (pristine, twice). It is green at `8b1b7be`,
+so a sibling has already fixed it; this patch is rebased onto that tip.
 
 ## Concerns
 

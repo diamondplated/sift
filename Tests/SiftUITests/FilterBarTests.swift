@@ -14,51 +14,65 @@ import TestSupport
 // smoke checks — they catch a bar that lays out blank or ignores its filters, not one that is ugly.
 
 // MARK: - helpers
+//
+// A third private copy of `render`/`digest` (`InspectorRenderTests`, `HistogramRenderTests`), for
+// the same reason those two are separate: both are file-private, and a test target cannot export to
+// itself without a shared file every render task would then contend on. Kept byte-identical in
+// behaviour to `HistogramRenderTests`', deliberately — a render helper that differs subtly between
+// files is how one of them ends up with the padding bug again.
 
-@MainActor
-private func renderBar(_ view: some View, _ width: CGFloat, _ height: CGFloat) throws -> CGImage {
-    let renderer = ImageRenderer(
-        content: view.frame(width: width, height: height, alignment: .topLeading))
-    return try #require(renderer.cgImage, "ImageRenderer produced no image at all")
-}
-
-/// Pixels that lean blue, and pixels that lean amber — the filter chip's accent tint and the SQL
-/// chip's warning tint. By the RATIO between two channels rather than by an absolute level, so a
-/// pale 12%-opacity fill still counts and a different renderer's gamma does not decide the answer.
+/// Draw a view through AppKit and hand back its pixels.
 ///
-/// 🔴 **This exists because a pixel digest cannot be used on this view at all.** MEASURED here:
-/// rendering the *same* `FilterBar` three times in a row produced digests `A, A, B` — an
-/// `ImageRenderer` bitmap containing an AppKit-backed `Button` is not byte-stable between renders.
-/// A `digest(x) != digest(y)` assertion therefore passes for two renders of *identical* content,
-/// which is a vacuous test that looks like a strong one: written that way first, this file's
-/// SQL-mode check passed with the SQL-mode branch deleted. These counts, over the same four
-/// renders, were identical every time.
-private func tintedPixels(_ image: CGImage) -> (blue: Int, amber: Int) {
-    let rep = NSBitmapImageRep(cgImage: image)
-    var blue = 0
-    var amber = 0
-    for x in 0..<rep.pixelsWide {
-        for y in 0..<rep.pixelsHigh {
-            guard let colour = rep.colorAt(x: x, y: y)?.usingColorSpace(.deviceRGB),
-                colour.alphaComponent > 0.2
-            else { continue }
-            let lean = colour.blueComponent - colour.redComponent
-            if lean > 0.08 { blue += 1 }
-            if -lean > 0.08 { amber += 1 }
-        }
+/// 🔴 **`cacheDisplay` on an `NSHostingView`, NOT `ImageRenderer`, and that is a correctness
+/// requirement here rather than a preference.** MEASURED on this view, 20 renders of identical
+/// content each way: `ImageRenderer` produced **two** distinct bitmaps, `cacheDisplay` produced
+/// **one**. (Not row padding, which was my first guess — both routes report `bytesPerRow` exactly
+/// equal to the row's real width. `ImageRenderer` also rasterizes at 1x where `cacheDisplay` uses
+/// the 2x backing scale.) An unstable capture makes every "these two renders differ" assertion
+/// vacuous, which is exactly how this file's SQL-mode check once passed with the SQL-mode branch
+/// deleted.
+///
+/// 🔴 **Pinned to Aqua.** Without it the render follows whatever appearance the machine happens to
+/// be in, so every comparison below means something different on a laptop in dark mode than on the
+/// runner.
+@MainActor
+private func renderBar(_ view: some View, _ tag: String, _ width: CGFloat = 620) throws
+    -> NSBitmapImageRep
+{
+    _ = NSApplication.shared   // AppKit wants an app object before any NSView exists, even headless
+    let host = NSHostingView(
+        rootView: view.frame(width: width, height: 34, alignment: .topLeading))
+    host.appearance = NSAppearance(named: .aqua)
+    host.frame = NSRect(x: 0, y: 0, width: width, height: 34)
+    host.layoutSubtreeIfNeeded()
+    let rep = try #require(host.bitmapImageRepForCachingDisplay(in: host.bounds))
+    host.cacheDisplay(in: host.bounds, to: rep)
+    if let dir = ProcessInfo.processInfo.environment["SIFT_RENDER_DUMP"],
+        let png = rep.representation(using: .png, properties: [:]) {
+        try? png.write(to: URL(fileURLWithPath: dir).appendingPathComponent("\(tag).png"))
     }
-    return (blue, amber)
+    return rep
 }
 
-@discardableResult
-private func writeBarPNG(_ image: CGImage, _ name: String) throws -> String {
-    let data = try #require(
-        NSBitmapImageRep(cgImage: image).representation(using: .png, properties: [:]))
-    let path = ProcessInfo.processInfo.environment["SIFT_RENDER_OUT"]
-        .map { ($0 as NSString).appendingPathComponent("\(name).png") }
-        ?? TestTemp.path("p4t10-\(name)", ".png")
-    try data.write(to: URL(fileURLWithPath: path))
-    return path
+/// Every pixel byte, walked by hand, row padding excluded.
+///
+/// 🔴 Walked by hand because `Hasher.combine(someData)` — the obvious spelling — hashes the count
+/// and **at most the first 80 bytes**, which on a 620-point strip is blank left margin, and reports
+/// two visibly different pictures as identical. That trap has now bitten this branch three times.
+///
+/// 🔴 Padding excluded because `bytesPerRow` may exceed the row's real width and the slack is never
+/// initialized, so a digest over the whole backing store can differ from itself. It happens not to
+/// bite at this size (measured: no padding either way) — it is excluded so that it cannot start to
+/// at a different width, which is precisely the kind of thing that only shows up on the runner.
+private func digest(_ rep: NSBitmapImageRep) -> UInt64 {
+    guard let data = rep.bitmapData else { return 0 }
+    let perRow = rep.pixelsWide * rep.samplesPerPixel
+    var hash: UInt64 = 0xcbf2_9ce4_8422_2325
+    for y in 0..<rep.pixelsHigh {
+        let row = data + y * rep.bytesPerRow
+        for i in 0..<perRow { hash = (hash ^ UInt64(row[i])) &* 0x0100_0000_01b3 }
+    }
+    return hash
 }
 
 // MARK: - the chip labels
@@ -171,26 +185,59 @@ private func writeBarPNG(_ image: CGImage, _ name: String) throws -> String {
 
 // MARK: - the bar itself
 
-/// Four states of the same bar, compared to each other. Every claim is a *relationship* between two
-/// renders — never an absolute pixel count, which is a number tuned on whichever machine wrote the
-/// test and a CI failure on any other.
+/// Four states of the same bar, each required to draw differently from the last.
+///
+/// 🔴 **The control comes first, and it is what makes the rest mean anything.** Every assertion here
+/// is "these two renders differ", which is only evidence if the renderer produces the same bytes for
+/// the same input — so the first thing this test does is render one model twice and require the two
+/// buffers to be identical. Both pictures come out of one rasterizer in one process, so a runner
+/// with different fonts, a different backing scale or different antialiasing moves both sides of
+/// every comparison the same way and cancels.
+///
+/// 🔴 **What this replaced, and why it was wrong.** This test used to count pixels "leaning amber"
+/// in one render and compare that count against another render *of different content*. It passed
+/// here and inverted on the macos-15 runner — `Color.accentColor` resolves to a different hue there,
+/// so the chips themselves counted as amber and two blue chips out-ambered the amber one. A count
+/// compared across two different contents measures the renderer as much as the code. Nothing below
+/// asserts a magnitude, a colour, or a coordinate.
 @MainActor
 @Test func theFilterBarDrawsItsFiltersAndNotJustItsChrome() async throws {
     let (state, model) = try await openedFixture(rows: 12)
     var showSQL = false
     let binding = Binding(get: { showSQL }, set: { showSQL = $0 })
-    func bar() -> FilterBar { FilterBar(model: model, showSQL: binding) { _ in } }
+    func bar(_ tag: String) throws -> UInt64 {
+        digest(try renderBar(FilterBar(model: model, showSQL: binding) { _ in }, tag))
+    }
 
-    let empty = try renderBar(bar(), 620, 34)
-    try writeBarPNG(empty, "filter-bar-empty")
+    // THE CONTROL: the same model, twice.
+    let empty = try bar("filter-bar-empty")
+    #expect(
+        empty == (try bar("filter-bar-empty-control")),
+        "the renderer does not reproduce itself, so no comparison below this line means anything")
 
     try await model.setFilters([Filter(col: "label", op: .inList, values: [.text("row1")])])
     #expect(model.table.qspec.filters.count == 1)
-    let one = try renderBar(bar(), 620, 34)
-    try writeBarPNG(one, "filter-bar-one")
+    let one = try bar("filter-bar-one")
+    #expect(one != empty, "a filter drew no chip — the bar shows the no-filters hint either way")
+
+    // 🔴 A chip that draws but ignores what it was handed. Both pairs below differ in exactly one
+    // string and are otherwise the same chip in the same place, so a bar that drew empty chips — or
+    // the same chip for every filter — renders the two identically. MEASURED by mutation: with
+    // `Text(filterChipLabel(filter))` replaced by `Text("")`, everything else in this test stayed
+    // green, because a chip of a different WIDTH is still a different picture.
+    try await model.setFilters([Filter(col: "label", op: .inList, values: [.text("row2")])])
+    let otherValue = try bar("filter-bar-one-other-value")
     #expect(
-        tintedPixels(one).blue > tintedPixels(empty).blue,
-        "a filter drew no chip — the bar is showing the no-filters hint either way")
+        otherValue != one,
+        "the chip is not drawing filterChipLabel — two different values render identically")
+
+    // Same op, same value, different column: the bold column name has to be on screen too.
+    try await model.setFilters([Filter(col: "note", op: .inList, values: [.text("row2")])])
+    #expect(
+        (try bar("filter-bar-one-other-column")) != otherValue,
+        "the chip is not drawing its column name")
+
+    try await model.setFilters([Filter(col: "label", op: .inList, values: [.text("row1")])])
 
     // Two filters on ONE column. `applyDistinctClick` replaces per (column, op), so a column can
     // carry several at once, and each has to be its own chip with its own ×.
@@ -198,25 +245,16 @@ private func writeBarPNG(_ image: CGImage, _ name: String) throws -> String {
         Filter(col: "label", op: .inList, values: [.text("row1")]),
         Filter(col: "label", op: .notNull),
     ])
-    let two = try renderBar(bar(), 620, 34)
-    try writeBarPNG(two, "filter-bar-two-on-one-column")
-    #expect(
-        tintedPixels(two).blue > tintedPixels(one).blue,
-        "a column's second filter drew nothing of its own")
+    let two = try bar("filter-bar-two-on-one-column")
+    #expect(two != one, "a column's second filter drew nothing of its own")
 
     // SQL mode REPLACES the chips rather than hiding them: the filters are still in the catalog and
-    // still describe nothing on screen. Both halves are asserted, because "the amber chip is there"
-    // alone would pass for a bar that drew the frozen filters beside it.
+    // still describe nothing on screen, so drawing them would be the app lying about the grid.
     model.typeSQL(try await state.session.renderedSQL(model.name))
     try await model.runSQL()
     #expect(model.table.sqlMode)
     #expect(!model.table.qspec.filters.isEmpty, "the filters are frozen, not cleared")
-    let sql = try renderBar(bar(), 620, 34)
-    let path = try writeBarPNG(sql, "filter-bar-sql-mode")
     #expect(
-        tintedPixels(sql).amber > tintedPixels(two).amber,
-        "no frozen-filters chip in SQL mode — see \(path)")
-    #expect(
-        tintedPixels(sql).blue < tintedPixels(two).blue,
-        "SQL mode drew the frozen filters as well — see \(path)")
+        (try bar("filter-bar-sql-mode")) != two,
+        "SQL mode drew the frozen filters instead of the frozen-filters chip")
 }
