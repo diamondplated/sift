@@ -1,4 +1,5 @@
 import Observation
+import SiftCore
 import SiftEngine
 import SwiftUI
 
@@ -106,4 +107,142 @@ public final class AppState {
     }
 
     public func stopPolling() { pollTask?.cancel(); pollTask = nil }
+
+    // MARK: - what the menus, the toolbar and the keyboard ask for
+    //
+    // Every menu item and every toolbar button is one call into this section. Nothing in `SiftApp`
+    // may decide anything: a test target cannot import an `executableTarget`, so a decision made
+    // there is a decision nothing will ever check.
+
+    /// The one modal the window is showing, or `nil`.
+    ///
+    /// Set here, rendered by `RootView`'s sheet presentation. One optional rather than five
+    /// booleans, because two modals up at once is not a state this app has — and five booleans is
+    /// exactly how it would become one.
+    public enum ModalSheet: Equatable, Sendable {
+        case export
+        case merge
+        case staged
+        /// The rows `ignore_errors` dropped. Reachable at last: in the shell the web topbar is
+        /// hidden (`body.native`), so the count was shown with nothing to click.
+        case badRows
+        /// A workbook on its way in, waiting for a sheet to be chosen. See `needsSheetPicker`.
+        case workbook(path: String)
+    }
+
+    public var modalSheet: ModalSheet?
+
+    /// ⌘1–⌘9. Out-of-range is a no-op, not a crash: ⌘7 with three tables open is a thing a user
+    /// does by accident constantly.
+    public func selectTable(atIndex index: Int) {
+        guard tables.indices.contains(index) else { return }
+        activeName = tables[index].name
+    }
+
+    /// View > Toggle Sidebar. The split is SwiftUI's now, so this is a binding flip rather than the
+    /// shell's `NSSplitViewController.toggleSidebar`.
+    ///
+    /// `.all` is the way back rather than `.automatic`: `.automatic` lets SwiftUI pick, and what it
+    /// picks in a two-column split is `.all` — so spelling it means the second ⌘S is not a guess.
+    public func toggleSidebar() {
+        sidebarVisibility = sidebarVisibility == .detailOnly ? .all : .detailOnly
+    }
+
+    /// View > Toggle Inspector.
+    public func toggleInspector() { inspectorVisible.toggle() }
+
+    /// File > Export…, Data > Merge Tables…, Data > Manage Staged Data…, and the toolbar's
+    /// "N dropped". Export and bad rows are about the open table, so they refuse when there is not
+    /// one — the menu disables them for the same reason, and this is the half that is checkable.
+    public func presentExport() {
+        guard active != nil else { return }
+        modalSheet = .export
+    }
+
+    public func presentMerge() { modalSheet = .merge }
+
+    public func presentStaged() { modalSheet = .staged }
+
+    public func presentBadRows() {
+        guard let active, active.badRows > 0 else { return }
+        modalSheet = .badRows
+    }
+
+    /// File > Close Table (⌘W). Closes the open table, not the window — `close(_:)` moves the
+    /// selection, and `applicationShouldTerminateAfterLastWindowClosed` means closing the window
+    /// would quit.
+    public func closeActive() async {
+        guard let activeName else { return }
+        await close(activeName)
+    }
+
+    /// Everything that arrives as a filesystem path: the open panel, a Dock-icon drop, Finder
+    /// "Open With", `open -a Sift.app file`.
+    ///
+    /// ponytail: one workbook at a time. The picker is a single modal, so a batch carrying several
+    /// opens the first and says so rather than silently dropping the rest. If picking sheets for a
+    /// pile of workbooks in one go ever becomes a real request, queue them here — the banner is the
+    /// place that will have to change.
+    public func open(paths: [String]) async {
+        var workbooks: [String] = []
+        for path in paths {
+            if needsSheetPicker(path) { workbooks.append(path) } else { await open(path: path) }
+        }
+        guard let first = workbooks.first else { return }
+        modalSheet = .workbook(path: first)
+        if workbooks.count > 1 {
+            banner =
+                "Opened the sheet picker for \((first as NSString).lastPathComponent). "
+                + "Open the other \(workbooks.count - 1) workbook(s) one at a time."
+        }
+    }
+
+    /// The toolbar's live row count, or "" when nothing is open.
+    public var rowSummary: String { active.map { rowSummaryText($0) } ?? "" }
+}
+
+/// The toolbar's row-count phrase: `rowText` (`web/index.html:958-963`) wrapped in
+/// `pushNativeState`'s `summary` (`:1570-1589`), one decision tree, both halves.
+///
+/// A free function taking a `Table` rather than a method on `AppState`, so every branch is
+/// reachable from a test with a planted table — "counting…" in particular cannot be produced by
+/// opening a real file small enough for a test to wait on.
+///
+/// Digits are grouped by `SiftCore.groupDigits`, the same function the row-number gutter and the
+/// CLI use. Not `NumberFormatter`: without an explicit locale the same count renders four ways.
+public func rowSummaryText(_ table: SiftEngine.Table) -> String {
+    let rows: String
+    // `r.value === null || t.counting` first, exactly as the web has it. An exact count already in
+    // flight makes the estimate a number about to be replaced, and "counting…" is the honest thing
+    // to say about it — this app's whole premise is not putting a number on screen it is unsure of.
+    if let known = table.displayRows, !table.counting {
+        // `r.filtered && r.unfiltered` — both, so a filtered table whose unfiltered count has not
+        // landed yet reads as a plain count rather than "12 of 0 rows".
+        if !table.qspec.filters.isEmpty, let unfiltered = table.gridRows {
+            rows = "\(groupDigits(String(known))) of \(groupDigits(String(unfiltered))) rows"
+        } else {
+            rows = "\(table.rowsAreExact ? "" : "≈ ")\(groupDigits(String(known))) rows"
+        }
+    } else {
+        rows = "counting…"
+    }
+    var summary = "\(rows) · \(table.spec.columns.count) cols"
+    if table.badRows > 0 { summary += " · \(groupDigits(String(table.badRows))) dropped" }
+    return summary
+}
+
+/// Whether a path goes to the sheet picker instead of straight to `open(path:)`.
+///
+/// EVERY `.xlsx`/`.xlsm`, not only multi-sheet workbooks — `siftOpenPaths`
+/// (`web/index.html:1533-1537`) routes on the extension alone, because which sheet a one-sheet
+/// workbook contains is still a thing the user is entitled to see named before it opens.
+///
+/// `.xls` deliberately does not route here even though the web's regex (`/\.xlsx?$/i`) caught it:
+/// the engine refuses a legacy `.xls` with a sentence explaining why, and a sheet picker failing to
+/// read a file that is not a zip would replace that sentence with a worse one.
+///
+/// `SiftCore.xlsxExt` rather than a second list: the set the engine detects a workbook by and the
+/// set the picker fires on are the same fact, and two copies is how `.xlsm` ends up in only one.
+public func needsSheetPicker(_ path: String) -> Bool {
+    xlsxExt.contains("." + (path as NSString).pathExtension.lowercased())
 }
