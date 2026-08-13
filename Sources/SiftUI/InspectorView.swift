@@ -5,8 +5,7 @@ import SwiftUI
 // The inspector: the tab strip, the Schema tab, and the number formatting both tabs share.
 // Ported from `renderInspector`/`renderSchema` (`web/index.html:1045-1080`).
 
-/// The three inspector tabs. `source` is declared here and rendered by Task 9 — the enum is the
-/// contract between the two, so the picker below already has the segment.
+/// The three inspector tabs.
 public enum InspectorTab: String, CaseIterable, Sendable {
     case schema, column, source
 
@@ -28,10 +27,17 @@ public enum InspectorTab: String, CaseIterable, Sendable {
 /// crossed the same boundary.
 public struct InspectorView: View {
     private let state: AppState
-    @State private var tab: InspectorTab = .schema
+    @State private var tab: InspectorTab
 
-    public init(state: AppState) {
+    /// `initialTab` exists so `CompositionTests` can render THIS view — not its panels — with a
+    /// given tab forward. 🔴 That is not test scaffolding for its own sake: `SourceTab` shipped
+    /// finished, tested and unreachable for a whole task because every test that touched it
+    /// rendered the panel directly, and a panel-level test is green whether or not anything mounts
+    /// it. The tab is still `@State` and still nobody else's business; only its starting value is
+    /// nameable from outside.
+    public init(state: AppState, initialTab: InspectorTab = .schema) {
         self.state = state
+        _tab = State(initialValue: initialTab)
     }
 
     public var body: some View {
@@ -82,9 +88,10 @@ public struct InspectorView: View {
                     Note("Click a column.")
                 }
             case .source:
-                // Task 9 owns `SourceTab`. Said out loud rather than left blank, because a tab that
-                // renders nothing at all reads as a bug rather than as unfinished.
-                Note("The source panel arrives with Task 9.")
+                // 🔴 `model.table`, not `state.active`: the two are the same table, and this is the
+                // one the panel above it is already drawing. `refresh()` keeps it current
+                // (`models[t.name]?.apply(t)`), so the stats grid ticks along with the catalog.
+                SourceTab(state: state, table: model.table)
             }
         } else {
             Note("Nothing open.")
