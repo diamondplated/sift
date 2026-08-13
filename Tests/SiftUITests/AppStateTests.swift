@@ -173,6 +173,140 @@ import Testing
     #expect(Set(glyphs).count == 3)
 }
 
+// MARK: - the two escape hatches
+//
+// 🔴 `Session.openPath(nullPadding:skipPreamble:)` has existed and been tested since the engine was
+// written, the `sift` CLI has had both switches, and both notes end by telling the user to
+// "re-open with null padding" / "re-open without skipping" — while `AppState.open`, the only way a
+// path reaches the engine from the window, could pass NEITHER. The instruction on screen was one no
+// Mac user had any way to follow. These drive the whole route: the note the engine attaches, the
+// affordance `reopenFix` decides to show beside it, and the re-open recovering the real data.
+
+/// A ragged file. The sniffer can find no consistent field count, settles on a delimiter the file
+/// does not contain, and the whole thing reads as ONE column whose name is the header.
+/// `SourceProbeTests` pins the engine half of this; these are the window half.
+private let raggedCSVText = """
+    order_id,region,amount
+    1,Midwest,10
+    2,West,20
+    3,South,30,EXTRA,FIELDS
+    4,East,40
+    5,North,50,BOOM
+    6,West,60
+
+    """
+
+/// Three lines of prose. The sniffer throws the first two away as a preamble and lands on a header
+/// that matches no data at all, so the grid is empty and the file is not.
+private let preambleCSVText = "notes\nthis is prose, with a comma\nanother line; semicolon too\n"
+
+@discardableResult
+private func write(_ text: String, _ name: String, in dir: URL) throws -> String {
+    let path = dir.appendingPathComponent(name).path
+    try text.write(toFile: path, atomically: true, encoding: .utf8)
+    return path
+}
+
+@MainActor
+@Test func theRaggedNotesButtonReallyRecoversTheColumns() async throws {
+    let state = AppState(session: try Session(home: tempHome()))
+    await state.open(path: try write(raggedCSVText, "orders.csv", in: tempDir()))
+
+    let collapsed = try #require(state.active)
+    #expect(collapsed.spec.columns.map(\.name) == ["order_id,region,amount"], "not collapsed, so this tests nothing")
+    let note = try #require(collapsed.notes.first)
+    #expect(reopenFix(for: note, spec: collapsed.spec) == .nullPadding)
+
+    await state.reopen(collapsed, with: .nullPadding)
+
+    let fixed = try #require(state.active)
+    #expect(state.banner == nil)
+    // A REPLACEMENT. Opening without closing first would leave the collapsed `orders` sitting
+    // beside a recovered `orders_2` for the user to tidy up.
+    #expect(state.tables.count == 1, "the re-open sat beside the broken table instead of replacing it")
+    #expect(fixed.name == "orders", "the recovered table lost the name the user already knows")
+    #expect(fixed.spec.columns.map(\.name) == ["order_id", "region", "amount", "column3", "column4"])
+    #expect(fixed.notes.isEmpty, "the note outlived its own fix")
+}
+
+@MainActor
+@Test func thePreambleNotesButtonReallyGetsTheRowsBack() async throws {
+    let state = AppState(session: try Session(home: tempHome()))
+    await state.open(path: try write(preambleCSVText, "prose.csv", in: tempDir()))
+
+    let eaten = try #require(state.active)
+    #expect(eaten.rowCount == 0, "the preamble did not eat the file, so this tests nothing")
+    let note = try #require(eaten.notes.first)
+    #expect(reopenFix(for: note, spec: eaten.spec) == .keepAllLines)
+
+    await state.reopen(eaten, with: .keepAllLines)
+
+    let fixed = try #require(state.active)
+    #expect(state.banner == nil)
+    #expect(state.tables.count == 1)
+    #expect(fixed.name == "prose")
+    #expect(fixed.spec.columns.map(\.name) == ["notes"])
+    #expect(fixed.rowCount == 2, "the rows the preamble ate did not come back")
+    #expect(fixed.notes.isEmpty)
+}
+
+/// The affordance appears beside the note that names it and nowhere else.
+///
+/// 🔴 The mapping is identity against the function that PRODUCES the note, not a keyword scan.
+/// `Table.notes` is a flat `[String]` — sheet, folder, Delta and these two all arrive in one array
+/// with nothing to tell them apart — so a `contains("null padding")` would offer a null-padded
+/// re-open on a table whose spec never collapsed, and would stop firing silently the day the
+/// sentence is reworded.
+@MainActor
+@Test func onlyTheNoteThatNamesAFixOffersOne() async throws {
+    let dir = tempDir()
+    let folder = dir.appendingPathComponent("parts")
+    try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+    try write("a,b\n1,2\n3,4\n", "one.csv", in: folder)
+    try write("a,b\n5,6\n7,8\n", "two.csv", in: folder)
+
+    let state = AppState(session: try Session(home: tempHome()))
+    await state.open(path: folder.path)
+    let table = try #require(state.active)
+    let note = try #require(table.notes.first)
+    #expect(note.contains("Folder read as one table"), "the fixture stopped producing a folder note")
+    #expect(reopenFix(for: note, spec: table.spec) == nil, "a folder note offered an escape hatch")
+
+    // A string that says the words is still not the note this table is showing.
+    #expect(reopenFix(for: "Not every row has the same number of fields — re-open with null "
+        + "padding to see all 5", spec: table.spec) == nil)
+    #expect(reopenFix(for: "re-open without skipping to see them", spec: table.spec) == nil)
+    #expect(reopenFix(for: "", spec: table.spec) == nil)
+}
+
+/// A close the engine refuses leaves ONE table, not two.
+///
+/// `close` reports the refusal on the banner and carries on, which is right — but a `reopen` that
+/// then opened anyway would put a second copy of the file on screen under `orders_2` with the
+/// engine's sentence sitting above it, which is the app doing something other than what the button
+/// said.
+@MainActor
+@Test func aReopenWhoseCloseIsRefusedDoesNotOpenASecondCopy() async throws {
+    let dir = tempDir()
+    let state = AppState(session: try Session(home: tempHome()))
+    let path = try write(raggedCSVText, "orders.csv", in: dir)
+    await state.open(path: path)
+    await state.open(path: path)
+    #expect(state.tables.map(\.name) == ["orders", "orders_2"])
+
+    _ = try await state.session.merge("orders", "orders_2", on: ["order_id,region,amount"])
+    await state.refresh()
+    #expect(state.tables.count == 3)
+
+    let collapsed = try #require(state.tables.first { $0.name == "orders" })
+    await state.reopen(collapsed, with: .nullPadding)
+
+    #expect(state.tables.count == 3, "the refused close still let a second copy in")
+    #expect(state.tables.first { $0.name == "orders" }?.spec.columns.count == 1)
+    let banner = try #require(state.banner, "the refusal was swallowed")
+    #expect(banner.contains("is merged into"))
+}
+
 /// The engine is polled, not subscribed. This opens a table *behind `AppState`'s back*, so the
 /// only thing that can make it appear in the mirror is the poll loop actually running.
 ///

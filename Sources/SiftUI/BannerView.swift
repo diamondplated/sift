@@ -74,6 +74,49 @@ func missingExtensionsBanner(_ extensions: [String: Bool]) -> (message: String, 
     )
 }
 
+// MARK: - the two escape hatches
+
+/// The way out of a mis-sniffed file, for the note that names it.
+///
+/// `Session.openPath(nullPadding:skipPreamble:)` has had both since it was written and they are
+/// ALTERNATIVES rather than options that combine (pinning `skip` is what defeats `null_padding` —
+/// measured, and `openPath` throws on the pair), which is exactly the shape of an enum with two
+/// cases rather than two booleans on a button.
+public enum ReopenFix: Equatable, Sendable {
+    /// `SiftCore.raggedCollapseNote` — the rows carry inconsistent field counts, so the sniffer
+    /// settled on a delimiter the file does not contain and the whole file read as one column.
+    case nullPadding
+    /// `SiftCore.preambleNote` — the sniffer threw the file's own data away as a preamble and
+    /// landed on a header matching no rows at all.
+    case keepAllLines
+
+    /// What the button says. The verb is the note's own: it ends "— re-open with null padding to
+    /// see all 5" / "— re-open without skipping to see them", and a button that said something else
+    /// would read as a second, different offer.
+    public var title: String {
+        switch self {
+        case .nullPadding: return "Re-open with Null Padding"
+        case .keepAllLines: return "Re-open Keeping All Lines"
+        }
+    }
+}
+
+/// Which fix this note is the note for, or `nil` for every other note.
+///
+/// 🔴 **Matched by REPRODUCING the note, not by reading words out of it.** `Table.notes` is a flat
+/// `[String]`: the sheet note, the folder note, the Delta note and these two all arrive in the same
+/// array with nothing on them to say which is which. So the only honest question is "is this string
+/// the one `raggedCollapseNote` would produce for THIS table's spec", and the answer comes from
+/// calling it. A `note.contains("null padding")` would fire on any future note that mentions the
+/// phrase, would offer a null-padded re-open on a table whose spec never collapsed, and would stop
+/// firing silently the day the sentence is reworded — which is precisely the failure that leaves an
+/// instruction on screen with nothing behind it.
+public func reopenFix(for note: String, spec: SourceSpec) -> ReopenFix? {
+    if note == raggedCollapseNote(spec) { return .nullPadding }
+    if note == preambleNote(spec) { return .keepAllLines }
+    return nil
+}
+
 // MARK: - the stack
 
 /// Everything the app has to say about the active table, stacked above the grid.
@@ -148,7 +191,18 @@ public struct BannerStack: View {
         // Indexed rather than `id: \.self`: two notes are just strings and a file that produced the
         // same note twice would collide into one row.
         ForEach(Array(table.notes.enumerated()), id: \.offset) { _, note in
-            BannerRow(.info) { Text(note) }
+            BannerRow(.info) {
+                Text(note)
+                // 🔴 The note ends by telling the user to re-open the file a particular way. This
+                // is the first thing in the window that can actually do it — and it appears ONLY on
+                // the note that names it, which is what `reopenFix` decides. A file with a sheet
+                // note and a ragged note shows one button, beside the sentence it answers.
+                if let fix = reopenFix(for: note, spec: table.spec) {
+                    Spacer(minLength: 12)
+                    Button(fix.title) { Task { await state.reopen(table, with: fix) } }
+                        .controlSize(.small)
+                }
+            }
         }
         if table.sortTruncated, let rows = table.displayRows {
             BannerRow(.warning) { Text(sortTruncationText(rows: rows)) }

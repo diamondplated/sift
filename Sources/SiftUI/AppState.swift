@@ -55,14 +55,51 @@ public final class AppState {
 
     public var active: SiftEngine.Table? { tables.first { $0.name == activeName } }
 
-    public func open(path: String, sheet: String? = nil) async {
+    /// 🔴 `nullPadding`/`skipPreamble` are threaded through, and until 2026-08-13 they were not.
+    /// `Session.openPath` has carried both since it was written, the `sift` CLI has had both
+    /// switches, and `raggedCollapseNote`/`preambleNote` end by telling the user in as many words to
+    /// "re-open with null padding" / "re-open without skipping" — while this method, the ONLY way a
+    /// path reaches the engine from the window, could pass neither. The instruction on screen was
+    /// one no Mac user had any way to follow. `BannerView`'s note row is the affordance; see
+    /// `reopen(_:with:)`.
+    ///
+    /// The defaults are the engine's own, so every existing call site is unchanged.
+    public func open(
+        path: String, sheet: String? = nil, nullPadding: Bool = false, skipPreamble: Bool = true
+    ) async {
         do {
-            let t = try await session.openPath(path, sheet: sheet)
+            let t = try await session.openPath(
+                path, sheet: sheet, nullPadding: nullPadding, skipPreamble: skipPreamble)
             await refresh()
             activeName = t.name
         } catch {
             banner = error.localizedDescription
         }
+    }
+
+    /// Close this table and open its file again with one of the two escape hatches on — what the
+    /// note's own "re-open …" means.
+    ///
+    /// A REPLACEMENT, not a second table, and the close is what makes it one: `openPath` uniquifies
+    /// a taken name, so opening first would leave the collapsed `orders` sitting beside the
+    /// recovered `orders_2` for the user to tidy up, with the broken one still selected. Closing
+    /// frees the name, so the recovered table keeps the one the user already knows.
+    ///
+    /// `sheet:` is carried but not exercised, stated plainly: both of today's fixes are CSV-only
+    /// (`preambleAteTheFile` requires `fmt == .csv`, and `raggedColumns` is only ever set on a CSV
+    /// or a folder of them), so `spec.sheet` is nil on every table that can reach here. It is
+    /// passed anyway because dropping it is the one mistake this must not make if a third fix ever
+    /// applies to a workbook — re-opening one without its sheet lands on whichever sheet
+    /// `buildSource` auto-picks and serves a different sheet's rows under the same name.
+    public func reopen(_ table: SiftEngine.Table, with fix: ReopenFix) async {
+        await close(table.name)
+        // `close` puts a refusal on the banner and carries on — a live merge reading this table is
+        // the one that happens. Opening a second copy on top of that sentence would be the app
+        // doing something other than what the button said.
+        guard !tables.contains(where: { $0.name == table.name }) else { return }
+        await open(
+            path: table.spec.key.path, sheet: table.spec.sheet,
+            nullPadding: fix == .nullPadding, skipPreamble: fix != .keepAllLines)
     }
 
     public func close(_ name: String) async {
