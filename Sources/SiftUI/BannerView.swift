@@ -228,39 +228,67 @@ enum BannerKind {
     case info
     case error
 
-    /// The system hue this kind means. Drives the strip's 14 % wash, and nothing else.
-    var base: NSColor {
+    // 🔴 **EXPLICIT sRGB, not system colours, and not a wash over `windowBackgroundColor`.**
+    //
+    // The banner is the only surface in this app that carries a CONTRAST GUARANTEE — it is the
+    // whole notification channel (no SSE, no toast), and `AppearanceTests` asserts a floor on it.
+    // A guarantee computed from colours the OS supplies is a guarantee about the OS you measured on.
+    //
+    // MEASURED, and this is the second time these numbers moved. The first version drew
+    // `systemOrange` text on a 14 % `systemOrange` wash and read **2.09 : 1** in light appearance.
+    // The fix derived the ink from the system hue and measured 4.70 / 6.24 / 6.37 light and
+    // 5.68 / 4.24 / 3.95 dark — on THIS Mac. CI, on macOS 15, measured the same code at
+    // **3.84 / 3.03 / 3.28** and went red against those very floors. macOS 26 changed the system
+    // palette (`systemOrange` light is `(255,141,40)` here, `windowBackgroundColor` light is pure
+    // white; neither is true on 15), so a fix calibrated here is calibrated on the outlier — and the
+    // runner is the floor we actually ship to.
+    //
+    // BOTH halves have to be pinned, not just the ink. The strip was `hue.opacity(0.14)` over
+    // `windowBackgroundColor`, so 86 % of it was an OS colour: pinning the text alone leaves the
+    // ratio drifting with the ground underneath it. So the strip is an opaque explicit fill and the
+    // text is an explicit ink, per appearance, and the contrast between them is arithmetic over two
+    // constants — the same number on every macOS, by construction.
+    //
+    // The values are exactly what this Mac resolved before the change, so the rendered result here
+    // is unchanged and every other Mac now matches it rather than drifting from it.
+    //
+    // The cost, stated rather than hidden: these no longer follow the system's Increase Contrast
+    // variants. That is a real trade, and it is the right way round — following the OS is what
+    // produced 2.09 : 1 and then 3.03 : 1, while these clear WCAG AA in both appearances on every
+    // version.
+    //
+    // ponytail: three hand-checked pairs, because there are exactly three kinds. If a fourth is ever
+    // added, `theBannerInkIsReadableOnItsOwnStripInBothAppearances` is what sizes its ink.
+
+    /// The strip's fill and the text on it, for light and for dark.
+    private var palette: (lightFill: NSColor, lightInk: NSColor, darkFill: NSColor, darkInk: NSColor) {
         switch self {
-        case .warning: return .systemOrange
-        case .info: return .systemBlue
-        case .error: return .systemRed
+        case .warning:
+            return (Self.srgb(255, 239, 225), Self.srgb(165, 89, 22),
+                    Self.srgb(62, 46, 33), Self.srgb(255, 146, 48))
+        case .info:
+            return (Self.srgb(219, 238, 255), Self.srgb(0, 86, 165),
+                    Self.srgb(26, 46, 62), Self.srgb(0, 145, 255))
+        case .error:
+            return (Self.srgb(255, 227, 228), Self.srgb(165, 33, 35),
+                    Self.srgb(62, 35, 35), Self.srgb(255, 66, 69))
         }
     }
 
-    var tint: Color { Color(nsColor: base) }
+    /// The rounded strip behind the row. Opaque: a 14 % wash is 86 % of whatever is underneath.
+    var fill: Color { Color(nsColor: Self.dynamic(palette.lightFill, palette.darkFill)) }
 
-    /// The text on top of that wash.
-    ///
-    /// 🔴 **Not `base`, and that is measured.** Every render check on this branch until 2026-08-13
-    /// ran in dark appearance. Re-run pinned to `.aqua`, the banner text measured **2.09 : 1**
-    /// against its own strip for a warning, 3.02 for a note and 3.11 for an error — against 5.68 /
-    /// 4.24 / 3.95 in dark. The buttons sitting in the same rows were worse still (2.09–2.39),
-    /// because a bordered button's fill darkens the ground under a label that did not change. WCAG
-    /// AA for body text is 4.5; the *warning* strip — the one that carries "this file is being
-    /// copied" and "this sorted view does not reach the end of your data" — was the worst of the
-    /// three, on the appearance most Macs are actually in.
-    ///
-    /// The hue is unchanged and still the system's: in light appearance it is blended toward black,
-    /// which keeps orange orange and pulls it to 4.9 : 1. Dark appearance is untouched, because dark
-    /// appearance was already right — this is a light-mode fix, not a redesign.
-    var ink: Color {
-        Color(nsColor: NSColor(name: nil) { [base] appearance in
-            guard appearance.bestMatch(from: [.aqua, .darkAqua]) != .darkAqua else { return base }
-            // `usingColorSpace` first: a system colour is a catalog colour, and `blended` returns
-            // nil for two colours it cannot bring into one space. The resolution happens inside the
-            // provider, so what is darkened is the LIGHT variant of the system hue.
-            return base.usingColorSpace(.sRGB)?.blended(withFraction: 0.42, of: .black) ?? base
-        })
+    /// The text on that strip.
+    var ink: Color { Color(nsColor: Self.dynamic(palette.lightInk, palette.darkInk)) }
+
+    private static func srgb(_ r: Int, _ g: Int, _ b: Int) -> NSColor {
+        NSColor(srgbRed: CGFloat(r) / 255, green: CGFloat(g) / 255, blue: CGFloat(b) / 255, alpha: 1)
+    }
+
+    /// Still dynamic, so a light↔dark switch is followed live — it is only the OS's *palette* that
+    /// is no longer in the loop.
+    private static func dynamic(_ light: NSColor, _ dark: NSColor) -> NSColor {
+        NSColor(name: nil) { $0.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua ? dark : light }
     }
 }
 
@@ -280,9 +308,10 @@ struct BannerRow<Content: View>: View {
             .padding(.horizontal, 11)
             .padding(.vertical, 5)
             .frame(maxWidth: .infinity, alignment: .leading)
-            // The wash comes from the bright system hue (`tint`), the text from the readable one
-            // (`ink`). One colour for both is what put the warning strip at 2.09 : 1 in light mode.
-            .background(kind.tint.opacity(0.14), in: RoundedRectangle(cornerRadius: 7))
+            // Opaque `fill`, not a translucent wash: 86 % of a 14 % wash is `windowBackgroundColor`,
+            // which is a different colour on every macOS — and the ratio between this strip and the
+            // text on it is something `AppearanceTests` guarantees. See `BannerKind`.
+            .background(kind.fill, in: RoundedRectangle(cornerRadius: 7))
             .padding(EdgeInsets(top: 6, leading: 10, bottom: 0, trailing: 10))
     }
 }

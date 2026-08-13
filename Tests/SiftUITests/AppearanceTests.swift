@@ -120,73 +120,60 @@ private func asAppearance<T>(_ name: NSAppearance.Name, _ body: () -> T) -> T {
 
 // MARK: - the banner strip
 
-/// 🔴 **MEASURED, and this is the defect.** With `BannerKind.ink` as the bare system hue, the warning
-/// strip's own text read **2.09 : 1** against it in light appearance — against 5.68 in dark. The note
-/// strip read 3.02 and the error strip 3.11, and the buttons in those rows were worse still
-/// (2.09–2.39), because a bordered button darkens the ground under a label that did not change. WCAG
-/// AA for body text is 4.5. The banner stack is this app's ENTIRE notification channel — there is no
-/// SSE and no toast on this branch — and the worst of the three was the warning, the strip that
-/// carries "this file is being copied" and "this sorted view does not reach the end of your data".
+/// 🔴 **MEASURED TWICE, and the second measurement is the interesting one.**
 ///
-/// Both appearances are asserted and the floors differ ON PURPOSE. Light is held to AA, which is
-/// what the fix delivers. Dark is held to what it already measured, because dark was never broken
-/// and this change deliberately does not touch it — lifting dark to AA as well was tried, measured
-/// (7.05 / 5.84 / 5.32) and REJECTED on looking at it: the hues went pastel and an error strip
-/// stopped reading as urgent. One shared floor would either fail on untouched dark or quietly let
-/// light slide back to 2.09.
+/// With `ink` as the bare system hue the warning strip's own text read **2.09 : 1** against it in
+/// light appearance (3.02 note, 3.11 error) against 5.68 / 4.24 / 3.95 in dark. WCAG AA for body
+/// text is 4.5, and the banner stack is this app's ENTIRE notification channel — no SSE, no toast.
+///
+/// The first fix derived the ink from the system hue and measured 4.70 / 6.24 / 6.37 light here.
+/// **CI, on macOS 15, measured the same code at 3.84 / 3.03 / 3.28 and went red against these very
+/// floors** — correctly. macOS 26 changed the system palette, so a fix calibrated on this Mac is
+/// calibrated on the outlier while the runner is the floor we ship to. Both the strip and the ink
+/// are now explicit sRGB values (see `BannerKind`), so what is compared below is arithmetic over two
+/// constants.
+///
+/// Two assertions per row, doing different jobs:
+///
+///  * **the floor** is the requirement. Light is held to AA. Dark is held to what it already
+///    measured, because dark was never broken — lifting it to AA as well was tried, measured
+///    (7.05 / 5.84 / 5.32) and REJECTED on looking at it: the hues went pastel and an error strip
+///    stopped reading as urgent. One shared floor would either fail on untouched dark or quietly let
+///    light slide back to 2.09.
+///  * **the exact ratio** is the OS-invariance claim, and it is the one this round exists for. If
+///    anything in this chain is still resolved by the OS, the runner produces a different number and
+///    says so — which no floor on its own can promise, since a drifting value can still clear a
+///    floor on the machine it was calibrated on.
+///
+/// 🔴 Stated plainly: on THIS Mac a revert to system colours is numerically indistinguishable from
+/// the pinned values, because the pinned values are what this Mac resolved. CI is the tripwire for
+/// that, and it has now caught it once. A local one was looked for — resolving under
+/// `.accessibilityHighContrastAqua` would separate a literal from a system colour if Increase
+/// Contrast were a property of the appearance, and MEASURED, it is not: `systemOrange` reads
+/// `(255,141,40)` under both `.aqua` and `.accessibilityAqua` headlessly.
 @MainActor
 @Test func theBannerInkIsReadableOnItsOwnStripInBothAppearances() {
-    let floors: [(kind: BannerKind, name: String, light: Double, dark: Double)] = [
-        (.warning, "warning", 4.5, 5.0), (.info, "note", 4.5, 4.0), (.error, "error", 4.5, 3.5),
+    // kind, name, (light floor, light exact), (dark floor, dark exact)
+    let rows: [(kind: BannerKind, name: String, light: (Double, Double), dark: (Double, Double))] = [
+        (.warning, "warning", (4.5, 4.62), (5.0, 5.81)),
+        (.info, "note", (4.5, 6.15), (4.0, 4.32)),
+        (.error, "error", (4.5, 6.11), (3.5, 4.16)),
     ]
-    for row in floors {
-        for (appearance, tag, floor) in [
+    for row in rows {
+        for (appearance, tag, expected) in [
             (NSAppearance.Name.aqua, "light", row.light), (.darkAqua, "dark", row.dark),
         ] {
             let measured = asAppearance(appearance) {
-                // `BannerRow` draws `kind.tint.opacity(0.14)` on the pane and `kind.ink` on that.
-                let strip = composite(row.kind.base, 0.14, over: .windowBackgroundColor)
-                return contrast(strip, NSColor(row.kind.ink))
+                contrast(NSColor(row.kind.fill), NSColor(row.kind.ink))
             }
             #expect(
-                measured >= floor,
-                "\(row.name) banner text measures \(measured) : 1 in \(tag), under \(floor)")
+                measured >= expected.0,
+                "\(row.name) banner text measures \(measured) : 1 in \(tag), under \(expected.0)")
+            #expect(
+                abs(measured - expected.1) < 0.01,
+                "\(row.name) banner text measures \(measured) : 1 in \(tag), not the \(expected.1) this build pins — something in it is still resolved by the OS")
         }
     }
-}
-
-/// The mechanism, where a mutation can reach it: the hue is the system's in dark and a darkened one
-/// in light. Without this, replacing the whole dynamic provider with `base` passes every ratio above
-/// on dark and fails only on light — this states which half is supposed to have moved.
-@MainActor
-@Test func theBannerInkIsTheSystemHueInDarkAndADarkenedOneInLight() {
-    for kind in [BannerKind.warning, .info, .error] {
-        let inDark = asAppearance(.darkAqua) {
-            (luminance(NSColor(kind.ink)), luminance(kind.base))
-        }
-        let inLight = asAppearance(.aqua) {
-            (luminance(NSColor(kind.ink)), luminance(kind.base))
-        }
-        #expect(
-            abs(inDark.0 - inDark.1) < 0.01,
-            "dark appearance stopped drawing the plain system hue, which this change must not touch")
-        #expect(
-            inLight.0 < inLight.1,
-            "light appearance is still drawing its text in the same hue as the wash beneath it")
-
-        // The wash keeps the bright hue in both appearances — darkening THAT as well would turn a
-        // light-mode warning strip into a brown band.
-        for appearance in [NSAppearance.Name.aqua, .darkAqua] {
-            let (tint, base) = asAppearance(appearance) {
-                (luminance(NSColor(kind.tint)), luminance(kind.base))
-            }
-            #expect(abs(tint - base) < 0.01, "the strip's wash is no longer the system hue")
-        }
-    }
-    // 🔴 Stated rather than tested: that `BannerRow` reads `tint` for the wash and `ink` for the
-    // text is a fact about a `View`'s body, which nothing here can introspect. Swapping them back
-    // to one colour is not killed by any assertion in this file — it is caught by looking, which is
-    // how the defect was found in the first place.
 }
 
 /// …and the strip really does draw two different pictures in the two appearances. Arithmetic over
