@@ -207,11 +207,30 @@ public final class AppState {
     /// View > Toggle Inspector.
     public func toggleInspector() { inspectorVisible.toggle() }
 
+    // MARK: - what can be done right now
+    //
+    // 🔴 ONE authority per rule, read by all three consumers: `AppDelegate.validateMenuItem` (which
+    // greys the menu item), `RootView`'s toolbar (which greys the button) and the `present*` guard
+    // below (which refuses the action however it was reached). Until the toolbar existed, the first
+    // and third were two separate spellings of the same sentence in two different targets — one of
+    // which no test can import. That is how a menu item and a toolbar button start disagreeing about
+    // whether the same thing can be done.
+
+    /// Export and Close Table both act on the open table.
+    public var canExport: Bool { active != nil }
+
+    /// A merge needs two tables to merge.
+    public var canMerge: Bool { tables.count >= 2 }
+
+    /// Whether the toolbar's row phrase is a way into the bad-rows sheet. A count with nothing to
+    /// click is the bug this restores: in the shell the web topbar is hidden (`body.native`), so
+    /// "12 dropped" was drawn as text and the panel behind it was unreachable inside Sift.app.
+    public var canShowBadRows: Bool { (active?.badRows ?? 0) > 0 }
+
     /// File > Export…, Data > Merge Tables…, Data > Manage Staged Data…, and the toolbar's
-    /// "N dropped". Export and bad rows are about the open table, so they refuse when there is not
-    /// one — the menu disables them for the same reason, and this is the half that is checkable.
+    /// "N dropped".
     public func presentExport() {
-        guard active != nil else { return }
+        guard canExport else { return }
         modalSheet = .export
     }
 
@@ -220,7 +239,7 @@ public final class AppState {
     public func presentStaged() { modalSheet = .staged }
 
     public func presentBadRows() {
-        guard let active, active.badRows > 0 else { return }
+        guard canShowBadRows else { return }
         modalSheet = .badRows
     }
 

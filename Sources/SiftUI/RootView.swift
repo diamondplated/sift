@@ -44,6 +44,28 @@ public struct RootView: View {
                     NothingOpenYet(onOpen: onOpen)
                 }
             }
+            // 🔴 **`.toolbar` HERE, and not an `NSToolbarDelegate` in `SiftApp`.** Task 13 measured
+            // the reason and then had to work around it: `NavigationSplitView` inside an
+            // `NSHostingView` REPLACES `window.toolbar` with an `NSToolbar` of its own, whose
+            // delegate is `SwiftUI.ToolbarPlatformDelegate`. The shell's
+            // `toolbarDefaultItemIdentifiers` was called and its items were built — and then the
+            // whole toolbar was swapped out from under them, so Open and the row count ended up in
+            // an `NSTitlebarAccessoryViewController` (the one strip SwiftUI does not manage) with
+            // its frame re-fitted by hand on every catalog change.
+            //
+            // 🔴 **On the DETAIL column, not on the `NavigationSplitView`.** MEASURED against the
+            // running app, 1480 pt wide with room to spare: attached to the split view, every
+            // trailing item was pushed into the "more toolbar items" overflow popup and Merge landed
+            // at x=215 — inside the sidebar's own toolbar region, ahead of the sidebar toggle. The
+            // split view's toolbar is divided per column, so `.primaryAction` there is trailing OF
+            // THE SIDEBAR. Attached to the detail column the same items lay out at x=1473/1510/1547,
+            // at the window's trailing edge, with no overflow.
+            //
+            // The bare `NSToolbar` assigned at window creation must stay: `.fullSizeContentView`
+            // needs a toolbar to exist at t=0 or the content view covers the title bar, swallows
+            // every mouse event and the window cannot be moved at all. SwiftUI replaces it a moment
+            // later with this one.
+            .toolbar { toolbarItems }
         }
         .inspector(isPresented: $state.inspectorVisible) { InspectorView(state: state) }
         // The whole window is the drop target. It publishes `\.sourceDragHot`, which is how the
@@ -78,6 +100,96 @@ public struct RootView: View {
                 }
             }
         }
+    }
+
+    /// Open at the leading edge beside SwiftUI's own sidebar toggle, and at the trailing edge the
+    /// live row count followed by the three sheets that used to be reachable only from the menu bar.
+    ///
+    /// Every one of them is `state.can*` or one `present*` call — nothing here decides anything, for
+    /// the same reason `AppDelegate`'s actions are one line each: a `View`'s body cannot be tested,
+    /// so a rule written in one is a rule nothing checks. The greying reads the SAME properties
+    /// `validateMenuItem` does, so the menu item and the button cannot disagree.
+    @ToolbarContentBuilder
+    private var toolbarItems: some ToolbarContent {
+        ToolbarItem(placement: .navigation) {
+            Button(action: onOpen) { Label("Open", systemImage: ToolbarSymbol.open) }
+                .help("Open a file or folder")
+        }
+        // One `ToolbarItem` each rather than a `ToolbarItemGroup`: a group is one indivisible unit
+        // to the overflow logic, so all four go behind the » the moment SwiftUI thinks any of them
+        // is tight. Separate items are placed and overflowed individually.
+        ToolbarItem(placement: .primaryAction) { RowSummaryItem(state: state) }
+        ToolbarItem(placement: .primaryAction) {
+            Button { state.presentMerge() } label: {
+                Label("Merge Tables", systemImage: ToolbarSymbol.merge)
+            }
+            .disabled(!state.canMerge)
+            .help("Merge two open tables on a shared key")
+        }
+        ToolbarItem(placement: .primaryAction) {
+            Button { state.presentExport() } label: {
+                Label("Export", systemImage: ToolbarSymbol.export)
+            }
+            .disabled(!state.canExport)
+            .help("Write the open table out as CSV, Parquet, JSON or XLSX")
+        }
+        ToolbarItem(placement: .primaryAction) {
+            Button { state.presentStaged() } label: {
+                Label("Staged Data", systemImage: ToolbarSymbol.staged)
+            }
+            .help("Manage the native copies Sift is holding on disk")
+        }
+    }
+}
+
+// MARK: - the toolbar's pieces
+
+/// The SF Symbols the toolbar draws.
+///
+/// 🔴 Named here rather than written inline so `theToolbarsSymbolsAllResolve` can prove each one
+/// exists on the floor version. `Label(_, systemImage:)` given a name macOS does not know draws
+/// NOTHING and reports nothing — a toolbar button that is present, enabled, hit-testable and
+/// invisible, which is a worse bug than the one this toolbar is replacing.
+enum ToolbarSymbol {
+    static let open = "plus"
+    static let merge = "arrow.triangle.merge"
+    static let export = "square.and.arrow.down"
+    static let staged = "internaldrive"
+
+    static let all = [open, merge, export, staged]
+}
+
+/// The live row count — and, when rows were dropped, the way into the bad-rows sheet.
+///
+/// 🔴 The click target is the whole reason this is not a plain `Text`. "12 dropped" drawn with no
+/// way to ask what it means is the defect Task 13 was fixing when it put a click recognizer on an
+/// `NSTextField` in the title bar; the phrase carries the product's headline claim and the panel
+/// behind it was otherwise unreachable inside `Sift.app`. The underline is the only affordance it
+/// gets, and it appears only when there is something to show — an underlined phrase that does
+/// nothing would be worse than none.
+///
+/// Not `.disabled()` on a single button: greying the phrase would dim the row COUNT, which is
+/// information rather than a control, on every clean file in the product.
+private struct RowSummaryItem: View {
+    let state: AppState
+
+    var body: some View {
+        if state.canShowBadRows {
+            Button { state.presentBadRows() } label: { phrase.underline() }
+                .buttonStyle(.plain)
+                .help("Show the rows that were dropped")
+        } else {
+            phrase
+        }
+    }
+
+    /// `monospacedDigit`, matching the title-bar label this replaces: the count changes every poll
+    /// while a background count runs, and proportional digits make the whole phrase twitch.
+    private var phrase: some View {
+        Text(state.rowSummary)
+            .font(.system(size: 12).monospacedDigit())
+            .foregroundStyle(.secondary)
+            .lineLimit(1)
     }
 }
 

@@ -19,21 +19,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var state: AppState?
     private var window: NSWindow?
 
-    /// The live row count — the shell's `rowLabel`, with a click recognizer on it.
-    ///
-    /// The "N dropped" half of the phrase is the way into the bad-rows sheet: in the shell the web
-    /// topbar is hidden (`body.native`), so that count was drawn with nothing to click and the
-    /// panel was unreachable inside Sift.app. A label with a recognizer rather than a borderless
-    /// `NSButton`, because MEASURED an `NSButton`'s `intrinsicContentSize` under-reports an
-    /// `attributedTitle` badly (66 pt for a phrase `sizeToFit` measures at 136), and the stack view
-    /// it sits in lays out from the intrinsic size — so the count was silently truncated.
-    private let rowLabel = NSTextField(labelWithString: "")
-    /// Holds the row count and the Open button. Kept, because its frame has to be re-fitted every
-    /// time the row phrase changes: a title-bar accessory is laid out from its view's *frame*, and
-    /// an `NSStackView` left to size itself inside one measures 2 pt wide (MEASURED: the controls
-    /// were present, in the right place, and invisible).
-    private let titlebarStack = NSStackView()
-
     /// Paths that arrived before the window existed. LaunchServices can deliver a Dock drop's
     /// `open` event before `applicationDidFinishLaunching` has returned, and the shell carried the
     /// same buffer for the same reason.
@@ -69,6 +54,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             // region. WITHOUT one the content view covers the title bar, swallows every mouse
             // event, and the window cannot be moved at all. Task 1 was given the plain style mask
             // for exactly that reason; the toolbar arrives four lines below, in the same breath.
+            // 🔴 That bare `NSToolbar` must stay even though `NavigationSplitView` replaces it a
+            // moment later with its own: the replacement happens when the hosting view lays out,
+            // and between window creation and that moment there would be no toolbar at all.
             styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView],
             backing: .buffered,
             defer: false
@@ -82,7 +70,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         window.contentView = NSHostingView(
             rootView: RootView(state: state, onOpen: { [weak self] in self?.showOpenPanel() })
         )
-        installTitlebarControls(in: window)
 
         window.center()
         window.makeKeyAndOrderFront(nil)
@@ -238,7 +225,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     @objc private func exportAction() { state?.presentExport() }
     @objc private func mergeAction() { state?.presentMerge() }
     @objc private func stagedAction() { state?.presentStaged() }
-    @objc private func badRowsAction() { state?.presentBadRows() }
+    // `badRowsAction` is gone with the title-bar accessory that was its only caller. The way into
+    // the bad-rows sheet is the toolbar's row phrase (`RootView.RowSummaryItem`), which calls
+    // `presentBadRows()` directly — a dead `@objc` selector kept "in case" is how a menu ends up
+    // wired to a method nothing reaches.
     @objc private func closeTableAction() {
         guard let state else { return }
         Task { await state.closeActive() }
@@ -282,56 +272,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     // MARK: - title bar
 
-    /// Open and the live row count, in the title bar.
-    ///
-    /// 🔴 An `NSTitlebarAccessoryViewController` and NOT an `NSToolbarDelegate`, and that is
-    /// MEASURED rather than a preference. `NavigationSplitView` inside an `NSHostingView`
-    /// **replaces** `window.toolbar` with an `NSToolbar` of its own, whose delegate is
-    /// `SwiftUI.ToolbarPlatformDelegate`. The shell's `toolbarDefaultItemIdentifiers` *was* called
-    /// and the items *were* built — and then the whole toolbar was swapped out from under them,
-    /// leaving only SwiftUI's `…navigationSplitView.toggleSidebar` and a separator behind.
-    /// `insertItem` into the replacement is refused, because its delegate has never heard of
-    /// `siftAdd`. A title-bar accessory is the one strip in that window SwiftUI does not manage.
-    ///
-    /// The layout the shell's toolbar described survives intact: SwiftUI's own sidebar toggle sits
-    /// at the leading edge where `.toggleSidebar` was, and these two sit at the trailing edge,
-    /// which is where `.flexibleSpace` put them. `.sidebarTrackingSeparator` is gone for the reason
-    /// the plan gives — it tracks an `NSSplitViewController`'s divider, and the split is SwiftUI's.
-    private func installTitlebarControls(in window: NSWindow) {
-        rowLabel.addGestureRecognizer(
-            NSClickGestureRecognizer(target: self, action: #selector(badRowsAction)))
-
-        let open = NSButton(
-            image: NSImage(systemSymbolName: "plus", accessibilityDescription: "Open") ?? NSImage(),
-            target: self, action: #selector(showOpenPanel))
-        open.bezelStyle = .texturedRounded
-        open.isBordered = true
-        open.toolTip = "Open a file or folder"
-
-        titlebarStack.orientation = .horizontal
-        titlebarStack.alignment = .centerY
-        titlebarStack.spacing = 10
-        titlebarStack.edgeInsets = NSEdgeInsets(top: 0, left: 8, bottom: 0, right: 10)
-        titlebarStack.setViews([rowLabel, open], in: .leading)
-        titlebarStack.translatesAutoresizingMaskIntoConstraints = true
-        fitTitlebarStack()
-
-        let accessory = NSTitlebarAccessoryViewController()
-        accessory.view = titlebarStack
-        accessory.layoutAttribute = .right
-        window.addTitlebarAccessoryViewController(accessory)
-    }
-
-    private func fitTitlebarStack() {
-        titlebarStack.frame = NSRect(origin: .zero, size: titlebarStack.fittingSize)
-    }
-
-    /// Keep the title, the proxy icon and the row count following the catalog.
+    /// Keep the window title and the proxy icon following the catalog.
     ///
     /// `withObservationTracking` re-arms itself: `onChange` fires once, *before* the write lands,
     /// so the re-read is hopped to the next main-actor turn and re-registers for whatever
     /// `applyChrome` touches next time. AppKit has no `@Observable` binding of its own, and a timer
     /// polling `AppState` would be a second poll loop on top of the one it already runs.
+    ///
+    /// 🔴 The Open button and the row count are NOT here any more. They lived in an
+    /// `NSTitlebarAccessoryViewController` because Task 13 measured `NavigationSplitView` replacing
+    /// `window.toolbar` wholesale and could not reach the replacement from this target; the accessory
+    /// was the one strip in the window SwiftUI does not manage, and it cost an `NSStackView` whose
+    /// frame had to be re-fitted by hand on every catalog change (left to itself it measured 2 pt
+    /// wide — present, in the right place, invisible). The toolbar is now `RootView`'s, built with
+    /// `.toolbar {}` inside SwiftUI, so all of that goes.
     private func trackChrome() {
         withObservationTracking {
             applyChrome()
@@ -351,21 +305,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         window.representedURL = path.flatMap {
             FileManager.default.fileExists(atPath: $0) ? URL(fileURLWithPath: $0) : nil
         }
-
-        let clickable = (active?.badRows ?? 0) > 0
-        var attributes: [NSAttributedString.Key: Any] = [
-            .font: NSFont.monospacedDigitSystemFont(ofSize: NSFont.systemFontSize, weight: .regular),
-            .foregroundColor: NSColor.secondaryLabelColor,
-        ]
-        // The only affordance the phrase gets. Without it "12 dropped" reads as text — which is
-        // exactly the bug being fixed: a number with no way to ask what it means.
-        if clickable { attributes[.underlineStyle] = NSUnderlineStyle.single.rawValue }
-        rowLabel.attributedStringValue = NSAttributedString(
-            string: state.rowSummary, attributes: attributes)
-        rowLabel.toolTip = clickable ? "Show the rows that were dropped" : nil
-        // "counting…" and "1,048,576 of 2,000,000 rows · 12 cols · 4 dropped" are very different
-        // widths, and the accessory does not re-measure itself.
-        fitTitlebarStack()
     }
 
     // MARK: - keyboard
@@ -547,13 +486,19 @@ extension AppDelegate: NSMenuDelegate {
 extension AppDelegate: NSMenuItemValidation {
     /// Grey out what cannot be done rather than letting the click do nothing. Reached because the
     /// File and Data items are nil-targeted, and this delegate is the end of the responder chain.
+    ///
+    /// 🔴 The rules are `AppState`'s properties, not restated here. The toolbar's Merge and Export
+    /// buttons read the SAME two, which is what makes "greyed exactly as the menu items grey" a fact
+    /// rather than a hope — and it puts the rule in the target a test can import, which this one is
+    /// not.
     func validateMenuItem(_ menuItem: NSMenuItem) -> Bool {
         guard let state else { return false }
         switch menuItem.action {
+        // Both act on the open table, which is what `canExport` is.
         case #selector(exportAction), #selector(closeTableAction):
-            return state.active != nil
+            return state.canExport
         case #selector(mergeAction):
-            return state.tables.count >= 2   // a merge needs two tables to merge
+            return state.canMerge
         default:
             return true
         }

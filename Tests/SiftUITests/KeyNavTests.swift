@@ -408,3 +408,50 @@ private func plantedTable(
     #expect(recentDocuments([web, custom]).isEmpty)
     #expect(recentDocuments([]).isEmpty)
 }
+
+// MARK: - the toolbar
+
+/// 🔴 The menu item and the toolbar button read the SAME property, which is the whole reason these
+/// two exist. The rule used to be written twice — once in `AppDelegate.validateMenuItem`, in a
+/// target no test can import, and once as a guard inside `presentExport` — and two spellings of one
+/// sentence is how a greyed menu item ends up beside a live toolbar button.
+@MainActor
+@Test func exportAndMergeSayTheSameThingToTheMenuAndToTheToolbar() async throws {
+    let dir = tempDir()
+    let state = AppState(session: try Session(home: tempHome()))
+    #expect(state.canExport == false)
+    #expect(state.canMerge == false)
+    #expect(state.canShowBadRows == false)
+
+    await state.open(path: try makeCSV(in: dir, name: "one.csv", rows: 3))
+    #expect(state.canExport)
+    #expect(state.canMerge == false, "one table is not two")
+
+    await state.open(path: try makeCSV(in: dir, name: "two.csv", rows: 3))
+    #expect(state.canExport)
+    #expect(state.canMerge)
+
+    // …and back down again as the tables close, so the toolbar greys on the way out too.
+    await state.closeActive()
+    #expect(state.canMerge == false)
+    await state.closeActive()
+    #expect(state.canExport == false)
+}
+
+/// 🔴 `Label(_, systemImage:)` handed a symbol name macOS does not know draws NOTHING and reports
+/// nothing: a toolbar button that is present, enabled, hit-testable and invisible — a worse bug than
+/// the title-bar accessory this toolbar replaced. `NSImage(systemSymbolName:)` answers for the
+/// system the test is actually running on, which matters here more than usual: this Mac has only the
+/// macOS 26 SDK while CI runs macos-15, so "it looked right here" has already twice been no evidence
+/// at all about the floor.
+@MainActor
+@Test func theToolbarsSymbolsAllResolve() {
+    for name in ToolbarSymbol.all {
+        #expect(
+            NSImage(systemSymbolName: name, accessibilityDescription: nil) != nil,
+            "the toolbar draws \(name), which this system does not have")
+    }
+    #expect(ToolbarSymbol.all.count == 4, "a button was added or removed without its symbol")
+    // …and the check is not vacuous: a name macOS does not know really does come back nil.
+    #expect(NSImage(systemSymbolName: "sift.not.a.symbol", accessibilityDescription: nil) == nil)
+}

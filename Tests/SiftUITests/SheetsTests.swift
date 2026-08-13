@@ -468,3 +468,25 @@ private func redFraction(_ colours: [NSColor]) -> Double {
     }
     return Double(reds.count) / Double(colours.count)
 }
+
+/// 🔴 The toolbar's row phrase is the only way into the bad-rows panel, and `canShowBadRows` is what
+/// decides whether that phrase is drawn as a click target at all. `KeyNavTests` pins the negative
+/// half (nothing open, and a clean file); this is the half that needs a file which really dropped a
+/// row, which only `dirtyFixture` produces.
+@MainActor
+@Test func theRowPhraseIsAWayIntoTheBadRowsPanelOnlyWhenRowsWereDropped() async throws {
+    let (state, _) = try await dirtyFixture()
+    #expect((state.active?.badRows ?? 0) > 0, "the fixture stopped dropping a row")
+    #expect(state.canShowBadRows)
+    #expect(state.rowSummary.contains("dropped"))
+    state.presentBadRows()
+    #expect(state.modalSheet == .badRows)
+
+    // …and it stops being one the moment the selection moves to a clean table.
+    state.modalSheet = nil
+    await state.open(path: try makeCSV(in: tempDir(), rows: 3))
+    #expect(state.canShowBadRows == false)
+    #expect(state.rowSummary.contains("dropped") == false)
+    state.presentBadRows()
+    #expect(state.modalSheet == nil)
+}
