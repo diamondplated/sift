@@ -15,16 +15,30 @@ import SiftCore
 
 /// Progress of an in-flight staging job. Written by `Session.stageNow` and cleared by whichever
 /// of `applyStaged`/`finishStage` ends the job (Staging.swift).
+///
+/// 🔴 **There is no `pct`, and there cannot be one.** This struct carried a `Double pct` from the
+/// Python port until 2026-08-13. It had exactly one write site — `stageNow`, which wrote `0` — and
+/// exactly one read site: a *determinate* `ProgressView(value:)` in the staging banner. So the bar
+/// rendered 0 % for the entire life of every staging job that ever ran, and read as a copy that had
+/// not started.
+///
+/// A real percentage is not available to be written. The copy is one `CREATE TABLE … AS SELECT`
+/// inside `runStage`; DuckDB's C API offers no row-level callback for it, and the obvious substitute
+/// — the store's growth, `dbBytes()` — is measured elsewhere in this file to be unusable as a
+/// per-job number: it is the WHOLE store, so two jobs in flight charge each other (`stagedBytes`'
+/// review-I4 measurement, 262,144 B alone vs 413 B beside a 30 MB copy), and it moves at CHECKPOINT
+/// rather than continuously, which would draw 0 % until the job was over anyway. The field is gone
+/// rather than left at zero: a field that only a liar can read is how the bar comes back.
 public struct StagingProgress: Sendable, Equatable {
     public let jobID: String
     public let state: String
-    public let pct: Double
+    /// The engine's own guess at how long the copy takes, from `StageDecision.estSeconds`. A FLOOR,
+    /// not a promise — see `SiftUI.stagingText`, which is what decides how coarsely to say it.
     public let estSeconds: Double
 
-    public init(jobID: String, state: String, pct: Double, estSeconds: Double) {
+    public init(jobID: String, state: String, estSeconds: Double) {
         self.jobID = jobID
         self.state = state
-        self.pct = pct
         self.estSeconds = estSeconds
     }
 }

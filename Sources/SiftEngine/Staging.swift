@@ -154,7 +154,7 @@ extension Session {
         let job = StageJob()
         stageJobs[jobID] = job
         t.staging = StagingProgress(
-            jobID: jobID, state: "running", pct: 0,
+            jobID: jobID, state: "running",
             estSeconds: (decision.estSeconds * 10).rounded() / 10   // Python's round(..., 1)
         )
         t.stagingError = nil

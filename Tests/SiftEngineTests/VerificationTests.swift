@@ -594,7 +594,7 @@ private func newHome() -> String { TestTemp.path("verification-tests") }
     // A job that will never clear itself — the shape a wedged CTAS would leave behind. Without the
     // deadline this call is an infinite loop, which in CI is a 20-minute timeout with no message.
     await session.setStagingForTest(
-        t.name, StagingProgress(jobID: "stuck", state: "running", pct: 0, estSeconds: 0)
+        t.name, StagingProgress(jobID: "stuck", state: "running", estSeconds: 0)
     )
 
     await #expect(throws: VerifyFailure.self) {

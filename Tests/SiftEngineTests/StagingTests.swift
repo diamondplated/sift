@@ -689,7 +689,7 @@ func aCopyOfOneSheetIsNeverServedAsAnother() async throws {
     let second = try await session.openPath(try makeSmallCSV(rows: 10), name: "x")
     #expect(first.openedAt != second.openedAt)
 
-    let inFlight = StagingProgress(jobID: "stage-live", state: "running", pct: 0, estSeconds: 1)
+    let inFlight = StagingProgress(jobID: "stage-live", state: "running", estSeconds: 1)
     await session.setStagingForTest("x", inFlight)
     await session.finishStage("x", jobID: "stage-1", openedAt: first.openedAt, error: "staging failed: boom")
 

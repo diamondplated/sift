@@ -89,8 +89,11 @@ public final class BusyState {
 /// live, because the thing that is blocked is one actor and not the app.
 ///
 /// Indeterminate on purpose: the engine reports no progress for a sort (`sortedRelation` is a single
-/// `CREATE TABLE … AS SELECT`), so a determinate bar here would be inventing a number. The staging
-/// banner, which has a real `pct`, is the one place a determinate bar is honest.
+/// `CREATE TABLE … AS SELECT`), so a determinate bar here would be inventing a number. 🔴 This
+/// comment used to name the staging banner as the one place a determinate bar was honest, on the
+/// strength of a `pct` field that was only ever written as `0`. There is now no determinate progress
+/// anywhere in the app, because there is nowhere the engine can honestly produce one — staging is
+/// the same single CTAS with the same absent callback (see `StagingProgress`).
 public struct BusyOverlay: View {
     private let message: String
 

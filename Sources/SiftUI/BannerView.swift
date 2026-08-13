@@ -11,14 +11,37 @@ import SwiftUI
 // branch), a `View`'s body cannot be tested, and every one of these strings has a number or a plural
 // in it.
 
-/// The staging banner's sentence. `est_seconds || "?"` (`web/index.html:1023-1024`) — a job that has
-/// not produced an estimate yet says so rather than claiming zero seconds.
+/// How long the copy will take, said as coarsely as the estimate deserves — or `nil` when there is
+/// no estimate to say.
 ///
-/// Rounded to whole seconds, which the web did not do: `estSeconds` is a Double and "about 12.4s"
-/// promises a precision the estimator does not have. No `NumberFormatter` — see `groupDigits`.
+/// 🔴 **The estimate is a FLOOR, so this rounds UP and never down.** `SiftCore.shouldStage` computes
+/// it as `sizeBytes / (250 MB/s)`, and that rate is its own comment's "measured CSV parse rate on an
+/// M-series Mac" — i.e. an internal SSD, warm. A file on a spinning disk, an SMB share or any
+/// network volume parses several times slower, so the number is the best case and nothing else.
+/// `web/index.html:1023-1024` printed it to a tenth of a second ("about 12.4s"), which is a
+/// precision claim the estimator cannot support; the first native port rounded to whole seconds,
+/// which is the same claim one digit shorter. These steps are the honest resolution: a
+/// 12.4-second guess and a 27-second guess are the same statement, and both of them are "half a
+/// minute if the disk is slow".
+///
+/// Literal strings rather than a computed number of minutes, so no `NumberFormatter` is anywhere
+/// near a sentence a user reads (see `groupDigits`).
+func stagingDuration(estSeconds: Double) -> String? {
+    guard estSeconds > 0 else { return nil }
+    let steps: [(limit: Double, said: String)] = [
+        (10, "10 seconds"), (30, "30 seconds"), (60, "a minute"), (120, "2 minutes"),
+        (300, "5 minutes"), (600, "10 minutes"), (1800, "half an hour"),
+    ]
+    return steps.first { estSeconds <= $0.limit }?.said ?? "over half an hour"
+}
+
+/// The staging banner's sentence. A job that has not produced an estimate yet says so rather than
+/// claiming a duration — the web's `est_seconds || "?"` said "about ?s", which reads as a broken
+/// template rather than as "we do not know".
 func stagingText(estSeconds: Double) -> String {
-    let seconds = estSeconds > 0 ? String(Int(estSeconds.rounded())) : "?"
-    return "Staging into native storage — the grid may be slower for about \(seconds)s."
+    let base = "Staging into native storage — the grid may be slower"
+    guard let duration = stagingDuration(estSeconds: estSeconds) else { return base + " while it runs." }
+    return base + " for about \(duration), longer on a slow or network disk."
 }
 
 /// The §13a truncation sentence: what the sorted view reaches, out of what is there, and the way
@@ -99,11 +122,16 @@ public struct BannerStack: View {
         if let staging = table.staging {
             BannerRow(.warning) {
                 Text(stagingText(estSeconds: staging.estSeconds))
-                // Determinate, unlike the busy overlay's: a staging copy reports a real `pct`, and
-                // this is the one place in the app where a progress *value* is not invented.
-                ProgressView(value: staging.pct)
-                    .progressViewStyle(.linear)
-                    .frame(width: 120)
+                // 🔴 Indeterminate, like the busy overlay's — and for the same reason, which this
+                // banner spent its whole life claiming was not true of it. A determinate
+                // `ProgressView(value: staging.pct)` stood here; `pct` was written once, as `0`,
+                // and never again, so the bar rendered empty for the entire life of every job.
+                // There is no number to put here (see `StagingProgress`), so there is no bar.
+                ProgressView()
+                    .progressViewStyle(.circular)
+                    .controlSize(.small)
+                    .scaleEffect(0.7)
+                    .frame(width: 16)
                 Spacer(minLength: 12)
                 Button("Cancel") {
                     Task { await state.session.cancel(staging.jobID) }

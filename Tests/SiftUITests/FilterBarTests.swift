@@ -117,14 +117,37 @@ private func digest(_ rep: NSBitmapImageRep) -> UInt64 {
 
 // MARK: - the banner sentences
 
-@Test func theStagingBannerSaysHowLongOrAdmitsItDoesNotKnow() {
+/// 🔴 The estimate is `size / 250 MB/s` — an internal SSD's warm parse rate — so it is a FLOOR, and
+/// every branch below rounds UP to a coarse step and names the disks it is wrong about. A sentence
+/// that says "about 12s" for a file that takes 90 on an SMB share is the product telling its one
+/// lie, in the one banner whose whole job is to say "this will be a moment".
+@Test func theStagingBannerRoundsUpHardAndAdmitsWhenItDoesNotKnow() {
     #expect(
         stagingText(estSeconds: 12.4)
-            == "Staging into native storage — the grid may be slower for about 12s.")
+            == "Staging into native storage — the grid may be slower for about 30 seconds, "
+            + "longer on a slow or network disk.",
+        "12.4s must not be reported to the tenth, or to the second")
     #expect(
         stagingText(estSeconds: 0)
-            == "Staging into native storage — the grid may be slower for about ?s.",
-        "a job with no estimate yet must not claim zero seconds")
+            == "Staging into native storage — the grid may be slower while it runs.",
+        "a job with no estimate yet must not claim a duration")
+
+    // Every step, and each one at its own boundary — `<=`, so a value landing exactly on a step
+    // takes that step rather than the next one up.
+    #expect(stagingDuration(estSeconds: 0) == nil)
+    #expect(stagingDuration(estSeconds: -1) == nil, "a negative estimate is no estimate")
+    #expect(stagingDuration(estSeconds: 0.4) == "10 seconds", "and never rounds DOWN to zero")
+    #expect(stagingDuration(estSeconds: 10) == "10 seconds")
+    #expect(stagingDuration(estSeconds: 10.1) == "30 seconds")
+    #expect(stagingDuration(estSeconds: 30) == "30 seconds")
+    #expect(stagingDuration(estSeconds: 45) == "a minute")
+    #expect(stagingDuration(estSeconds: 61) == "2 minutes")
+    #expect(stagingDuration(estSeconds: 200) == "5 minutes")
+    #expect(stagingDuration(estSeconds: 301) == "10 minutes")
+    #expect(stagingDuration(estSeconds: 900) == "half an hour")
+    // Past the last step it stops guessing rather than saying "half an hour" about three hours.
+    #expect(stagingDuration(estSeconds: 1801) == "over half an hour")
+    #expect(stagingDuration(estSeconds: 100_000) == "over half an hour")
 }
 
 @Test func theTruncationBannerNamesBothCountsAndTheWayOut() {

@@ -511,7 +511,7 @@ public actor Session {
     func setMidSwapStateForTest(_ name: String) {
         guard var t = tables[name] else { return }
         t.staged = false
-        t.staging = StagingProgress(jobID: "stage-test", state: "running", pct: 0, estSeconds: 0)
+        t.staging = StagingProgress(jobID: "stage-test", state: "running", estSeconds: 0)
         tables[name] = t
     }
 
