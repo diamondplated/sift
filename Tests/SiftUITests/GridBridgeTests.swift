@@ -144,6 +144,10 @@ private func appKitReady() { _ = NSApplication.shared }
     func ink(_ row: Int) throws -> [Int] {
         let cell = try #require(bridge.tableView(view, viewFor: note, row: row) as? GridCellView)
         cell.frame = NSRect(x: 0, y: 0, width: note.width, height: gridRowHeight)
+        // 🔴 Pinned to Aqua — the dotted empty-string rule is `tertiaryLabelColor`, a different
+        // colour in each appearance, and an unpinned render measures the machine. See
+        // `AppearanceTests`.
+        cell.appearance = NSAppearance(named: .aqua)
         cell.layoutSubtreeIfNeeded()
         let rep = try #require(cell.bitmapImageRepForCachingDisplay(in: cell.bounds))
         cell.cacheDisplay(in: cell.bounds, to: rep)
@@ -165,6 +169,7 @@ private func appKitReady() { _ = NSApplication.shared }
     // And the rule is a rule: it occupies a couple of rows of pixels, not the whole cell.
     let cell = try #require(bridge.tableView(view, viewFor: note, row: 1) as? GridCellView)
     cell.frame = NSRect(x: 0, y: 0, width: note.width, height: gridRowHeight)
+    cell.appearance = NSAppearance(named: .aqua)
     cell.layoutSubtreeIfNeeded()
     let rep = try #require(cell.bitmapImageRepForCachingDisplay(in: cell.bounds))
     cell.cacheDisplay(in: cell.bounds, to: rep)

@@ -255,6 +255,10 @@ private final class HeaderHarness {
         table.delegate = bridge
         bridge.sync(table)
         view = try #require(table.headerView)
+        // 🔴 Pinned to Aqua. `Shot.ink` measures against the header's own background colour, which
+        // is `windowBackgroundColor` — a different colour in each appearance — so an unpinned render
+        // makes every threshold in this file a fact about the machine. See `AppearanceTests`.
+        table.appearance = NSAppearance(named: .aqua)
         table.tile()
         view.frame = NSRect(
             x: 0, y: 0, width: table.tableColumns.reduce(0) { $0 + $1.width },

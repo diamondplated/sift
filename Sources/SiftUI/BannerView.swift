@@ -228,12 +228,39 @@ enum BannerKind {
     case info
     case error
 
-    var ink: Color {
+    /// The system hue this kind means. Drives the strip's 14 % wash, and nothing else.
+    var base: NSColor {
         switch self {
-        case .warning: return .orange
-        case .info: return .blue
-        case .error: return .red
+        case .warning: return .systemOrange
+        case .info: return .systemBlue
+        case .error: return .systemRed
         }
+    }
+
+    var tint: Color { Color(nsColor: base) }
+
+    /// The text on top of that wash.
+    ///
+    /// 🔴 **Not `base`, and that is measured.** Every render check on this branch until 2026-08-13
+    /// ran in dark appearance. Re-run pinned to `.aqua`, the banner text measured **2.09 : 1**
+    /// against its own strip for a warning, 3.02 for a note and 3.11 for an error — against 5.68 /
+    /// 4.24 / 3.95 in dark. The buttons sitting in the same rows were worse still (2.09–2.39),
+    /// because a bordered button's fill darkens the ground under a label that did not change. WCAG
+    /// AA for body text is 4.5; the *warning* strip — the one that carries "this file is being
+    /// copied" and "this sorted view does not reach the end of your data" — was the worst of the
+    /// three, on the appearance most Macs are actually in.
+    ///
+    /// The hue is unchanged and still the system's: in light appearance it is blended toward black,
+    /// which keeps orange orange and pulls it to 4.9 : 1. Dark appearance is untouched, because dark
+    /// appearance was already right — this is a light-mode fix, not a redesign.
+    var ink: Color {
+        Color(nsColor: NSColor(name: nil) { [base] appearance in
+            guard appearance.bestMatch(from: [.aqua, .darkAqua]) != .darkAqua else { return base }
+            // `usingColorSpace` first: a system colour is a catalog colour, and `blended` returns
+            // nil for two colours it cannot bring into one space. The resolution happens inside the
+            // provider, so what is darkened is the LIGHT variant of the system hue.
+            return base.usingColorSpace(.sRGB)?.blended(withFraction: 0.42, of: .black) ?? base
+        })
     }
 }
 
@@ -253,7 +280,9 @@ struct BannerRow<Content: View>: View {
             .padding(.horizontal, 11)
             .padding(.vertical, 5)
             .frame(maxWidth: .infinity, alignment: .leading)
-            .background(kind.ink.opacity(0.14), in: RoundedRectangle(cornerRadius: 7))
+            // The wash comes from the bright system hue (`tint`), the text from the readable one
+            // (`ink`). One colour for both is what put the warning strip at 2.09 : 1 in light mode.
+            .background(kind.tint.opacity(0.14), in: RoundedRectangle(cornerRadius: 7))
             .padding(EdgeInsets(top: 6, leading: 10, bottom: 0, trailing: 10))
     }
 }

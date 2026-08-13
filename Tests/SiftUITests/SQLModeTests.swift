@@ -398,6 +398,10 @@ private func appKitReady() { _ = NSApplication.shared }
     try await model.mirrorRenderedSQL()
 
     let host = NSHostingView(rootView: SQLConsole(model: model, onError: { _ in }))
+    // 🔴 Pinned to Aqua — and for this view that is more than hygiene: the console is deliberately
+    // dark in BOTH appearances, so an unpinned render here would have been passing in dark while
+    // the same pane in light appearance drew invisible buttons (`AppearanceTests`).
+    host.appearance = NSAppearance(named: .aqua)
     host.frame = NSRect(x: 0, y: 0, width: 900, height: 130)
     host.layoutSubtreeIfNeeded()
     let rep = try #require(host.bitmapImageRepForCachingDisplay(in: host.bounds))

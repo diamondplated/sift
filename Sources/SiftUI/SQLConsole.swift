@@ -99,6 +99,16 @@ public struct SQLConsole: View {
             .overlay(alignment: .top) { Divider().opacity(0.35) }
         }
         .background(consoleBackground)
+        // 🔴 **The console is a dark REGION, not a dark rectangle.** MEASURED, light appearance:
+        // `Reset to filters` and `Run ⌘↵` rendered at a contrast ratio of **1.03** against the
+        // console — a dark bezel and near-black label on a near-black panel, invisible. The panel is
+        // deliberately dark in both appearances (see `consoleBackground`), but every control inside
+        // it was still resolving `.aqua`, so it drew light-mode chrome onto a dark-mode surface.
+        // In dark appearance the same two buttons measure 9.52. Declaring the subtree dark makes the
+        // controls, the divider and the editor's caret and selection resolve against the surface
+        // they are actually on; both appearances now measure the same, because the console IS the
+        // same in both.
+        .environment(\.colorScheme, .dark)
         // `id:` so switching tabs re-mirrors against the newly selected table, and the error is
         // surfaced rather than swallowed — `RootView`'s own `.task(id:)` makes the same call.
         .task(id: model.name) {

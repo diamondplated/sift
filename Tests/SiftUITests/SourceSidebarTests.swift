@@ -272,8 +272,13 @@ private func fileProvider(_ path: String) -> NSItemProvider {
 
 @MainActor
 private func render(_ view: some View, _ width: CGFloat, _ height: CGFloat) throws -> CGImage {
+    // 🔴 Pinned light. `ImageRenderer` has no `appearance`, so the appearance comes from the
+    // environment — and unset, that is whatever the machine is in. Every render check on this branch
+    // had always run in dark, which is how two light-mode defects survived eight suites
+    // (`AppearanceTests`).
     let renderer = ImageRenderer(
-        content: view.frame(width: width, height: height, alignment: .topLeading))
+        content: view.frame(width: width, height: height, alignment: .topLeading)
+            .environment(\.colorScheme, .light))
     return try #require(renderer.cgImage, "ImageRenderer produced no image at all")
 }
 

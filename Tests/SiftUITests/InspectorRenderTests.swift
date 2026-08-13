@@ -32,8 +32,12 @@ import TestSupport
 private func render(_ view: some View, _ width: CGFloat, _ height: CGFloat) throws -> CGImage {
     // `.topLeading`, so a short panel sits where the pane would put it rather than floating in the
     // middle of the bitmap — these PNGs get looked at.
+    // 🔴 Pinned light. `ImageRenderer` has no `appearance`, so it follows the environment — unset,
+    // that is whatever the machine is in, and this branch's machine is in dark. See
+    // `AppearanceTests` for the two defects that survived because of it.
     let renderer = ImageRenderer(
-        content: view.frame(width: width, height: height, alignment: .topLeading))
+        content: view.frame(width: width, height: height, alignment: .topLeading)
+            .environment(\.colorScheme, .light))
     return try #require(renderer.cgImage, "ImageRenderer produced no image at all")
 }
 

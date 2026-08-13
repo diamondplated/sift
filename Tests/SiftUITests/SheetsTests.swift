@@ -441,6 +441,12 @@ private func ink<V: View>(_ view: V, width: CGFloat = 120, height: CGFloat = 20)
     host.frame = NSRect(x: 0, y: 0, width: width, height: height)
     let window = NSWindow(
         contentRect: host.frame, styleMask: [.borderless], backing: .buffered, defer: false)
+    // 🔴 Pinned to Aqua, on the window as well as the view — a hosting view inherits its window's
+    // appearance for anything AppKit draws. Without it this render follows whatever appearance the
+    // machine is in, and every render check on this branch had always run in dark, which is how two
+    // light-mode defects survived eight suites (see `AppearanceTests`).
+    window.appearance = NSAppearance(named: .aqua)
+    host.appearance = NSAppearance(named: .aqua)
     window.contentView?.addSubview(host)
     host.layoutSubtreeIfNeeded()
 
