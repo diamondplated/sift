@@ -109,7 +109,11 @@ public struct BadRowsSheet: View {
         .padding(16)
         .frame(width: 760)
         .task {
-            do { panel = try await session.badRows(table) } catch { self.error = "\(error)" }
+            do {
+                panel = try await session.badRows(table)
+            } catch {
+                self.error = error.localizedDescription
+            }
         }
     }
 }

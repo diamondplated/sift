@@ -100,8 +100,18 @@ public struct MergeSheet: View {
     @State private var error: String?
 
     /// `tables` is the open catalog's names in the order the sidebar shows them. Two are the
-    /// minimum; the presenting view is what refuses to open this sheet with fewer (the web's
-    /// "Open at least two tables to merge them.").
+    /// minimum; the presenting view is what refuses to open this sheet with fewer
+    /// (`AppState.presentMerge`'s `canMerge` guard, the web's "Open at least two tables to merge
+    /// them.").
+    ///
+    /// 🔴 **Captured by value at presentation, and left that way deliberately.** A table closed
+    /// while this sheet is up stays listed and selectable, and picking it fails with the engine's
+    /// own "No open table named …" rather than doing something silent. Not fixed here because a
+    /// live list is not a one-line change: `left`/`right` are `@State` initialised from this array,
+    /// so a table vanishing out of it has to move a selection the user made, mid-probe, and the
+    /// two `.task(id:)` re-runs that follow are a re-query against a catalog that just changed.
+    /// The list also cannot simply be re-read from `AppState` — this sheet does not reach into it
+    /// (that is the seam `onMerged` exists to keep). Filed rather than fudged.
     public init(
         session: Session, tables: [String], initialLeft: String? = nil,
         onMerged: @escaping (SiftEngine.Table) -> Void
@@ -226,7 +236,7 @@ public struct MergeSheet: View {
             candidates = try await session.joinCandidates(left, right)
         } catch {
             candidates = []
-            self.error = "\(error)"
+            self.error = error.localizedDescription
         }
     }
 
@@ -244,7 +254,7 @@ public struct MergeSheet: View {
             error = nil
         } catch {
             probe = nil
-            self.error = "\(error)"
+            self.error = error.localizedDescription
         }
     }
 
@@ -259,7 +269,7 @@ public struct MergeSheet: View {
             onMerged(merged)
             dismiss()
         } catch {
-            self.error = "\(error)"
+            self.error = error.localizedDescription
         }
     }
 }

@@ -162,7 +162,14 @@ public struct ExportSheet: View {
             onExported(exportToast(result))
             dismiss()
         } catch {
-            self.error = "\(error)"
+            // 🔴 `localizedDescription`, and the same in the other four sheets — they all used to
+            // interpolate the error instead, while the other eleven files in `SiftUI` did not. For
+            // `DuckDBError` the two differ: `description` is the full multi-line parser dump,
+            // `errorDescription` is its first line capped at 400 characters. Inert today only
+            // because `Session` wraps every DuckDB failure into a `SessionError` at its public
+            // boundary — one missed throw site and the sheets print the dump while the banner
+            // prints the sentence. That exact bug class was already fixed once at that boundary.
+            self.error = error.localizedDescription
         }
     }
 }

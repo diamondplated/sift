@@ -152,8 +152,12 @@ private func appKitReady() { _ = NSApplication.shared }
 /// 🔴 Design spec §9 in the sample list: `Cell.display` renders a NULL and an empty string
 /// identically as `""`, so a sample built from it would show two blank rows and imply they are the
 /// same value.
+///
+/// Both sentinels come from the engine's constants and neither is spelled here. The null used to be
+/// the literal `␀ NULL` — the distinct panel's SQL-built label — beside an empty string that was
+/// already routed properly, in a window where the grid drew a third spelling.
 @Test func aNullSampleSaysSoAndAnEmptyStringIsStillNotTheSameThing() {
-    #expect(HighCardView.sampleLabel(.null, kind: .text) == "␀ NULL")
+    #expect(HighCardView.sampleLabel(.null, kind: .text) == SiftEngine.nullGlyph)
     #expect(HighCardView.sampleLabel(.text(""), kind: .text) == SiftEngine.emptyStringGlyph)
     #expect(HighCardView.sampleLabel(.text("NULL"), kind: .text) == "NULL", "the literal text")
     #expect(HighCardView.sampleLabel(.int(42), kind: .number) == "42")

@@ -156,7 +156,7 @@ public struct StagedDataSheet: View {
             // The engine's own sentence, unwrapped. A `try?` here would leave the panel claiming
             // "Nothing staged." about a store it could not read — the exact shape of lie this
             // whole sheet exists to prevent.
-            self.error = "\(error)"
+            self.error = error.localizedDescription
         }
         loaded = true
     }
@@ -168,7 +168,7 @@ public struct StagedDataSheet: View {
         do {
             _ = try await session.purgeStaged(tables: tables, all: all)
         } catch {
-            self.error = "\(error)"
+            self.error = error.localizedDescription
         }
         await reload()
     }

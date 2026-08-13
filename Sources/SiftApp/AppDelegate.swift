@@ -92,6 +92,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
 
     func applicationWillTerminate(_ notification: Notification) {
+        // The poll loop's only caller, and the reason `stopPolling()` had none until now: the
+        // process is going away, so nothing NEEDS stopping — but a `refresh()` in flight against a
+        // session whose store is about to be dropped is work with no reader, and cancelling first
+        // is one line.
+        state?.stopPolling()
         // `dropPrivateStore()`, not `shutdown()`: `shutdown()` is actor-isolated, so calling it
         // needs an `await`, and a `Task {}` spawned at terminate is not guaranteed to run before
         // the process exits. `dropPrivateStore()` is `nonisolated`, is exactly the cleanup that

@@ -42,7 +42,8 @@ private func render(_ view: some View, _ width: CGFloat, _ height: CGFloat) thro
     -> NSBitmapImageRep
 {
     _ = NSApplication.shared   // AppKit wants an app object before any NSView exists, even headless
-    let host = NSHostingView(rootView: view.frame(width: width, height: height, alignment: .topLeading))
+    let host = NSHostingView(
+        rootView: view.frame(width: width, height: height, alignment: .topLeading))
     host.frame = NSRect(x: 0, y: 0, width: width, height: height)
     let window = NSWindow(
         contentRect: host.frame, styleMask: [.borderless], backing: .buffered, defer: false)

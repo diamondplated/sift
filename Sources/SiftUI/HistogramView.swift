@@ -344,7 +344,13 @@ public struct HighCardView: View {
         // overload.
         let routed: CellGlyph = glyph(for: cell, kind: kind)
         switch routed {
-        case .null: return "␀ NULL"
+        // 🔴 `SiftEngine.nullGlyph`, not a literal. This said `␀ NULL` while the line below it
+        // correctly used `SiftEngine.emptyStringGlyph` and the grid two panes over drew `null` —
+        // three spellings of NULL in one window. `␀ NULL` is the DISTINCT PANEL's label, built in
+        // SQL by `SQLGenPanels` for a `GROUP BY` result; a sample is a raw `Cell` and renders the
+        // way every other raw cell in the app renders. Exporting these two constants is the whole
+        // point of `CellDisplay.swift`.
+        case .null: return SiftEngine.nullGlyph
         case .empty: return SiftEngine.emptyStringGlyph
         case .text(let text), .number(let text): return text
         case .bool(let value): return value ? "true" : "false"

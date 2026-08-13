@@ -119,7 +119,7 @@ public struct SheetPickerSheet: View {
         } catch {
             // `listSheets` refuses loudly rather than reporting 0×0 for a worksheet it could not
             // read, and its sentence is the one the user needs. Passed through as itself.
-            self.error = "\(error)"
+            self.error = error.localizedDescription
         }
         loaded = true
     }

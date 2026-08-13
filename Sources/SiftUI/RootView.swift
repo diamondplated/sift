@@ -76,10 +76,11 @@ public struct RootView: View {
         // menu — sets `AppState.modalSheet` and stops; until this modifier existed they all set a
         // value nothing read, so five finished features were unreachable.
         // 🔴 Every `if let` here has an `else`, and that is the belt rather than the fix: `AppState`
-        // clears `modalSheet` when its subject table leaves the catalog (`dismissSheetWithoutASubject`),
-        // and this is what the user gets if a subject ever goes missing by some route nobody thought
-        // of. What used to be here was `if let t = state.active` with no else, which renders a body
-        // painting ZERO pixels — a blank window-modal sheet with no button on it. Force-quit.
+        // clears `modalSheet` when its subject table leaves the catalog — see
+        // `dismissSheetWithoutASubject`. This is what the user gets if a subject ever goes missing
+        // by some route nobody thought of. What used to be here was `if let t = state.active` with
+        // no else, which renders a body painting ZERO pixels — a blank window-modal sheet with no
+        // button on it. Force-quit.
         .sheet(item: $state.modalSheet) { which in
             switch which {
             case .export(let name):
