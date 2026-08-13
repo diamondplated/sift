@@ -412,3 +412,25 @@ private func writePNG(_ image: CGImage, _ name: String) throws -> String {
 
     await state.session.shutdown()
 }
+
+// MARK: - the engine, in the window
+
+/// 🔴 The web build showed engine and version in-window; the native port showed it only in About
+/// Sift. "Which DuckDB is this" is the first question of every report about a file that read wrong,
+/// and a version behind a modal is a version nobody quotes.
+///
+/// Pinned against a REAL session, so the line carries the version this build is actually linked
+/// against rather than one anybody typed. Mutating the function to drop the version, or to name a
+/// different engine, goes red here.
+@Test func theSidebarFootNamesTheEngineThisSessionIsActuallyUsing() throws {
+    let engine = try Session(home: tempHome()).engineInfo()
+    let line = engineFooterText(engine)
+
+    #expect(engine.duckdbVersion.count > 1, "the session reported no version at all")
+    #expect(line.hasPrefix("DuckDB "), "the line stopped naming the engine")
+    #expect(line.contains(engine.duckdbVersion), "the line stopped carrying the live version")
+    // About Sift prints the same field the same way, and DuckDB supplies its own leading `v` — so
+    // this must not add a second one.
+    #expect(!line.contains("vv"))
+    #expect(line == "DuckDB \(engine.duckdbVersion)")
+}

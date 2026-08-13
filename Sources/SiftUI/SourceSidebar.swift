@@ -56,6 +56,19 @@ public func rowText(_ t: SiftEngine.Table) -> String {
     return (t.rowsAreExact ? "" : "≈ ") + "\(groupDigits(String(rows))) rows"
 }
 
+/// The engine and its version, for the sidebar's last line.
+///
+/// 🔴 The web build showed engine and version **in-window**; the native port showed it only in
+/// About Sift, behind a menu item nobody opens. "Which DuckDB is this" is the first question of
+/// every report about a file that read wrong — a delimiter sniffed differently, an extension
+/// missing, a type widened — and a version behind a modal is a version nobody ever quotes. The
+/// sidebar's foot is the cheapest honest place: always on screen, never in the way, and selectable
+/// so it can be pasted into the report it exists for.
+///
+/// `EngineInfo.duckdbVersion` already carries DuckDB's own leading `v` (`v1.5.5`), so this does not
+/// add one — About Sift reads the same field and prints it the same way.
+public func engineFooterText(_ engine: EngineInfo) -> String { "DuckDB \(engine.duckdbVersion)" }
+
 /// The chip: an SF Symbol and a tint per format. Ported from `SourceCell.symbol(for:)` /
 /// `.tint(for:)`, which could only ever be Swift.
 ///
@@ -178,7 +191,22 @@ public struct SourceSidebar: View {
             dropzone
             pathBox
             dropNote
+            engineLine
         }
+    }
+
+    /// The engine, named in the window. See `engineFooterText`.
+    private var engineLine: some View {
+        Text(engineFooterText(state.engine))
+            .font(.system(size: 10, design: .monospaced))
+            .foregroundStyle(.tertiary)
+            // Selectable, because the whole point of it being on screen is that it can be pasted
+            // into a bug report without anyone hunting through the About box for it.
+            .textSelection(.enabled)
+            .help("The DuckDB build Sift is reading your files with")
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.horizontal, 12)
+            .padding(.bottom, 8)
     }
 
     /// `web/index.html:342` — the dashed target, and the one place a drag anywhere in the window
