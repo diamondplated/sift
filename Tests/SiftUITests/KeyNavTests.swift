@@ -265,6 +265,27 @@ import Testing
 /// all along. `validateMenuItem` greyed File > Merge and the toolbar read `canMerge`, but the method
 /// itself would put up a sheet with one table in both pickers — and Phase 1 adds call sites that go
 /// through neither.
+/// 🔴 **I6.** The sidebar row's ⤓ used to open an `NSSavePanel` and then write with
+/// `overwrite: true` unconditionally — a second, poorer export UI reached from the MORE
+/// discoverable of the two places. It goes to the same sheet ⌘E does now, naming ITS OWN row, so
+/// exporting the third table in the list does not first require selecting it.
+@MainActor
+@Test func theSidebarsExportNamesItsOwnRowAndRefusesATableThatIsNotOpen() async throws {
+    let dir = tempDir()
+    let state = AppState(session: try Session(home: tempHome()))
+    await state.open(path: try makeCSV(in: dir, name: "one.csv", rows: 3))
+    let one = try #require(state.activeName)
+    await state.open(path: try makeCSV(in: dir, name: "two.csv", rows: 3))
+    #expect(state.activeName != one)
+
+    state.presentExport(table: one)
+    #expect(state.modalSheet == .export(table: one), "⤓ exported the selected table, not its row")
+
+    state.modalSheet = nil
+    state.presentExport(table: "never-opened")
+    #expect(state.modalSheet == nil)
+}
+
 @MainActor
 @Test func stagedIsAlwaysReachableAndMergeNeedsTwoTables() async throws {
     let dir = tempDir()

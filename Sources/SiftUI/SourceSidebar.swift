@@ -325,7 +325,7 @@ struct SourceRow: View {
             if table.rowCount == nil {
                 ProgressView().controlSize(.small).scaleEffect(0.6).frame(width: 14)
             }
-            exportMenu
+            exportButton
             closeButton
         }
         .padding(.vertical, 3)
@@ -335,16 +335,17 @@ struct SourceRow: View {
         .contextMenu { menu }
     }
 
-    private var exportMenu: some View {
-        Menu {
-            ForEach(exportFormats, id: \.key) { format in
-                Button(exportLabel(forKey: format.key)) { export(format) }
-            }
-        } label: {
+    /// 🔴 One export UI, and it is `ExportSheet`. This used to be a six-format `Menu` that opened an
+    /// `NSSavePanel` and then wrote with `overwrite: true` unconditionally — a second, poorer export
+    /// reached from the MORE discoverable of the two places: no format explanation, no "the only
+    /// thing Sift ever writes" sentence, and a failure that closed the panel and bannered rather
+    /// than staying open so the destination could be fixed without retyping it. `presentExport`
+    /// names this row's table, so ⤓ on a row that is not the selected one still exports that row.
+    private var exportButton: some View {
+        Button { state.presentExport(table: table.name) } label: {
             Image(systemName: "square.and.arrow.down")
         }
-        .menuStyle(.borderlessButton)
-        .menuIndicator(.hidden)
+        .buttonStyle(.plain)
         .frame(width: 20)
         .help("Export…")
         .opacity(hovering ? 1 : 0)
@@ -363,11 +364,7 @@ struct SourceRow: View {
 
     @ViewBuilder
     private var menu: some View {
-        Menu("Export as") {
-            ForEach(exportFormats, id: \.key) { format in
-                Button(exportLabel(forKey: format.key)) { export(format) }
-            }
-        }
+        Button("Export…") { state.presentExport(table: table.name) }
         if table.staged {
             Button("Read from Source (unstage)") { stage(false) }
         } else if stageableFormat(table.spec.fmt) {
@@ -400,26 +397,6 @@ struct SourceRow: View {
             // Slightly past the window, so the red × never outlives the decision it stands for.
             try? await Task.sleep(nanoseconds: UInt64((armedCloseSeconds + 0.1) * 1_000_000_000))
             if armedAt == stamp { armedAt = nil }
-        }
-    }
-
-    /// Pick a destination, then write. Ports the shell's `exportViaSavePanel` — the panel has
-    /// already asked about overwriting by the time it returns `.OK`, which is why `overwrite: true`
-    /// here is not a second silent decision.
-    private func export(_ format: ExportFormat) {
-        let panel = NSSavePanel()
-        panel.nameFieldStringValue = "\(table.name)_export.\(format.ext)"
-        panel.canCreateDirectories = true
-        if let type = UTType(filenameExtension: format.ext) { panel.allowedContentTypes = [type] }
-        guard panel.runModal() == .OK, let url = panel.url else { return }
-        Task {
-            do {
-                let result = try await state.session.export(
-                    table.name, dest: url.path, format: format.key, overwrite: true)
-                state.banner = exportToast(result)
-            } catch {
-                state.banner = error.localizedDescription
-            }
         }
     }
 
