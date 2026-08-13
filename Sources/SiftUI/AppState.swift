@@ -119,19 +119,34 @@ public final class AppState {
     /// `models[name]` is cleared only on success, so a refused close keeps its page cache.
     public func close(_ name: String) async {
         let wasActive = activeName
+        let wasShowing = modalSheet
         tables.removeAll { $0.name == name }
         // The selection moves HERE as well as in `refresh()`: with the row gone from the mirror and
         // `activeName` still naming it, `active` is nil for the length of the engine call and the
         // detail pane flashes its no-file-open state on the way to the next table.
         if activeName == name { activeName = tables.first?.name }
+        dismissSheetWithoutASubject()
         do {
             try await session.closeTable(name)
             models[name] = nil
         } catch {
             banner = error.localizedDescription
             activeName = wasActive
+            modalSheet = wasShowing
         }
         await refresh()
+    }
+
+    /// Close a modal whose subject table has left the catalog.
+    ///
+    /// 🔴 The fix for a force-quit, and it belongs on `AppState` rather than in a view: ⌘W closes
+    /// the open TABLE, a SwiftUI `.sheet` is window-modal rather than app-modal (so the menu bar
+    /// stays live behind it), and `validateMenuItem` answers "yes" because the table is still open
+    /// at the moment it is asked. Open Export, press ⌘W, and the sheet that is left has no subject,
+    /// no content and — before this — no button.
+    private func dismissSheetWithoutASubject() {
+        guard let subject = modalSheet?.subject else { return }
+        if !tables.contains(where: { $0.name == subject }) { modalSheet = nil }
     }
 
     public func refresh() async {
@@ -143,6 +158,11 @@ public final class AppState {
         if let activeName, !tables.contains(where: { $0.name == activeName }) {
             self.activeName = tables.first?.name
         }
+        // …and beside it, the same reconciliation for an open modal. Here as well as in `close(_:)`
+        // because a table can leave the catalog without going through it: `purgeStaged` skips open
+        // tables today, and Phase 1's dropped connection is a table vanishing with no user action
+        // behind it at all.
+        dismissSheetWithoutASubject()
         for t in tables { models[t.name]?.apply(t) }
     }
 
@@ -190,13 +210,22 @@ public final class AppState {
     /// `Identifiable` so one `.sheet(item:)` in `RootView` presents all five. The id is the
     /// case, not the payload: presenting `.workbook` for a second file while the first picker
     /// is up should replace it, not stack.
+    ///
+    /// 🔴 **`.export` and `.badRows` NAME their table.** Both are about one open table, and both
+    /// used to be bare cases whose subject `RootView` re-derived as `state.active` at render time.
+    /// That is how closing a table under an open sheet produced a blank, undismissable, window-modal
+    /// sheet: `if let t = state.active` with no else drew a body that paints ZERO pixels, ⌘W is a
+    /// live main-menu key equivalent while a SwiftUI sheet is up, and neither sheet carried a
+    /// `.cancelAction` button, so Escape did nothing either. Force-quit, on two keystrokes. Naming
+    /// the subject is what lets `refresh()` know which sheets a vanished table takes with it — and
+    /// it stops a tab switch from silently re-pointing an open Export sheet at another table.
     public enum ModalSheet: Equatable, Sendable, Identifiable {
-        case export
+        case export(table: String)
         case merge
         case staged
         /// The rows `ignore_errors` dropped. Reachable at last: in the shell the web topbar is
         /// hidden (`body.native`), so the count was shown with nothing to click.
-        case badRows
+        case badRows(table: String)
         /// A workbook on its way in, waiting for a sheet to be chosen. See `needsSheetPicker`.
         case workbook(path: String)
         public var id: String {
@@ -206,6 +235,19 @@ public final class AppState {
             case .staged: return "staged"
             case .badRows: return "badRows"
             case .workbook: return "workbook"
+            }
+        }
+
+        /// The open table this sheet is about, if it is about one.
+        ///
+        /// 🔴 Subject-aware and not blanket. `.staged` is about the store on disk and `.workbook` is
+        /// about a file that is not open yet — neither has a table in the catalog, and a blanket
+        /// "close the sheet when the catalog changes" would dismiss both out from under the user.
+        /// `.merge` is about the whole catalog; see `MergeSheet`'s captured `tables:` list.
+        public var subject: String? {
+            switch self {
+            case .export(let table), .badRows(let table): return table
+            case .merge, .staged, .workbook: return nil
             }
         }
     }
@@ -253,18 +295,28 @@ public final class AppState {
 
     /// File > Export…, Data > Merge Tables…, Data > Manage Staged Data…, and the toolbar's
     /// "N dropped".
-    public func presentExport() {
-        guard canExport else { return }
-        modalSheet = .export
+    /// `table:` names the subject when it is not the selected one — the sidebar row's ⤓ exports the
+    /// row it is on. Nil means the open table, which is what the File menu and the toolbar mean.
+    public func presentExport(table: String? = nil) {
+        guard let subject = table ?? activeName,
+            tables.contains(where: { $0.name == subject })
+        else { return }
+        modalSheet = .export(table: subject)
     }
 
-    public func presentMerge() { modalSheet = .merge }
+    public func presentMerge() {
+        // 🔴 The guard its menu-item twin has had all along. `validateMenuItem` greys File > Merge
+        // and the toolbar reads `canMerge`, but the method itself would put up a sheet with one
+        // table in both pickers — and Phase 1 adds call sites that go through neither.
+        guard canMerge else { return }
+        modalSheet = .merge
+    }
 
     public func presentStaged() { modalSheet = .staged }
 
     public func presentBadRows() {
-        guard canShowBadRows else { return }
-        modalSheet = .badRows
+        guard canShowBadRows, let subject = activeName else { return }
+        modalSheet = .badRows(table: subject)
     }
 
     /// File > Close Table (⌘W). Closes the open table, not the window — `close(_:)` moves the

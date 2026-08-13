@@ -249,21 +249,39 @@ import Testing
     #expect(state.modalSheet == nil)
 
     await state.open(path: try makeCSV(in: tempDir(), rows: 3))
+    let opened = try #require(state.activeName)
     state.presentExport()
-    #expect(state.modalSheet == .export)
+    // The sheet NAMES its table rather than re-deriving it from the selection at render time —
+    // see `ModalSheet.subject`, and C2, which was a blank undismissable modal.
+    #expect(state.modalSheet == .export(table: opened))
     // A clean CSV drops no rows, so there is still nothing for the bad-rows sheet to show.
     state.modalSheet = nil
     state.presentBadRows()
     #expect(state.modalSheet == nil)
 }
 
+/// Staged is always reachable — it is about the store on disk, and "nothing staged" is an answer.
+/// Merge is not: 🔴 `presentMerge()` refuses under two tables, the guard its menu-item twin has had
+/// all along. `validateMenuItem` greyed File > Merge and the toolbar read `canMerge`, but the method
+/// itself would put up a sheet with one table in both pickers — and Phase 1 adds call sites that go
+/// through neither.
 @MainActor
-@Test func mergeAndStagedAreAlwaysReachable() {
-    let state = AppState(session: try! Session(home: tempHome()))
-    state.presentMerge()
-    #expect(state.modalSheet == .merge)
+@Test func stagedIsAlwaysReachableAndMergeNeedsTwoTables() async throws {
+    let dir = tempDir()
+    let state = AppState(session: try Session(home: tempHome()))
     state.presentStaged()
     #expect(state.modalSheet == .staged)
+
+    state.modalSheet = nil
+    state.presentMerge()
+    #expect(state.modalSheet == nil, "a merge sheet with nothing to merge")
+    await state.open(path: try makeCSV(in: dir, name: "one.csv", rows: 3))
+    state.presentMerge()
+    #expect(state.modalSheet == nil, "one table is not two")
+
+    await state.open(path: try makeCSV(in: dir, name: "two.csv", rows: 3))
+    state.presentMerge()
+    #expect(state.modalSheet == .merge)
 }
 
 /// ⌘W closes the open TABLE, not the window — closing the window quits the app

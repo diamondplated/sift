@@ -98,7 +98,12 @@ public struct BadRowsSheet: View {
             }
             HStack {
                 Spacer()
-                Button("Close") { dismiss() }.keyboardShortcut(.defaultAction)
+                // 🔴 `.cancelAction`, not `.defaultAction`, and the same swap is in
+                // `StagedDataSheet`. These two were the only sheets Escape did not close — and this
+                // one is raised by a SINGLE CLICK on a title-bar label, so an accidental click put
+                // up a modal that the reflex key would not dismiss. Export, Merge and the sheet
+                // picker have always spelled their way out this way; five sheets, one convention.
+                Button("Close") { dismiss() }.keyboardShortcut(.cancelAction)
             }
         }
         .padding(16)

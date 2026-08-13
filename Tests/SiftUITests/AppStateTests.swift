@@ -403,6 +403,7 @@ private func write(_ text: String, _ name: String, in dir: URL) throws -> String
     let staying = try #require(state.tables.last?.name)
     state.activeName = going
 
+    state.presentExport()
     let closing = Task { await state.close(going) }
     await Task.yield()
 
@@ -410,6 +411,10 @@ private func write(_ text: String, _ name: String, in dir: URL) throws -> String
     // …and the selection moved with it, so the detail pane never flashes its no-file-open state on
     // the way to the table that is still there.
     #expect(state.activeName == staying)
+    // …and so did the sheet. `refresh()` reconciles it too, so this is the half of C2's first leg
+    // that only the window can show: without the dismissal in `close(_:)` the sheet spends the
+    // engine call with a subject that is not in the catalog, and `RootView` flashes its fallback.
+    #expect(state.modalSheet == nil)
     await closing.value
     #expect(state.tables.map(\.name) == [staying])
 }
@@ -442,4 +447,82 @@ private func write(_ text: String, _ name: String, in dir: URL) throws -> String
     #expect(state.tables.contains { $0.name == "orders" })
     #expect(state.activeName == "orders", "a close that did not happen must not move the selection")
     #expect(state.model(for: "orders") != nil)
+}
+
+// MARK: - a sheet whose table went away
+
+/// 🔴 **C2, and it is a force-quit on two keystrokes.** ⌘W is a live main-menu key equivalent while
+/// a SwiftUI sheet is up (a sheet is window-modal, not app-modal, so the menu bar stays live —
+/// unlike `runModal`), and `validateMenuItem` answers "yes" because the table is still open at the
+/// moment it is asked. Open Export, press ⌘W: the sheet's `if let t = state.active` body had no
+/// else, painted zero pixels, and carried no `.cancelAction`, so Escape did nothing either.
+///
+/// The review's probe, verbatim: present, close, and the sheet must be gone.
+///
+/// Mutation: drop `dismissSheetWithoutASubject()` from `close(_:)` and the first assertion goes red.
+@MainActor
+@Test func closingTheTableUnderASheetTakesTheSheetWithIt() async throws {
+    let dir = tempDir()
+    let state = AppState(session: try Session(home: tempHome()))
+    await state.open(path: try makeCSV(in: dir, name: "one.csv", rows: 3))
+    let one = try #require(state.activeName)
+
+    state.presentExport()
+    #expect(state.modalSheet == .export(table: one))
+    await state.closeActive()
+    #expect(state.modalSheet == nil, "a sheet with no subject is a blank modal with no way out")
+
+    // …and the same for the bad-rows sheet, which is raised by a single click on a title-bar label
+    // and is therefore the one an accident puts up.
+    await state.open(path: try makeCSV(in: dir, name: "two.csv", rows: 3))
+    let two = try #require(state.activeName)
+    state.modalSheet = .badRows(table: two)
+    await state.close(two)
+    #expect(state.modalSheet == nil)
+}
+
+/// Subject-aware, not blanket — which is the whole reason `ModalSheet` names its table.
+///
+/// Mutation: replace `dismissSheetWithoutASubject`'s body with `modalSheet = nil` and both halves
+/// go red; make it compare against `activeName` instead of the catalog and the first half goes red.
+@MainActor
+@Test func aSheetAboutAnotherTableAndASheetAboutNoTableBothSurviveAClose() async throws {
+    let dir = tempDir()
+    let state = AppState(session: try Session(home: tempHome()))
+    await state.open(path: try makeCSV(in: dir, name: "keep.csv", rows: 3))
+    let keep = try #require(state.activeName)
+    await state.open(path: try makeCSV(in: dir, name: "drop.csv", rows: 3))
+    let drop = try #require(state.activeName)
+
+    // Raised from the sidebar's ⤓ on a row that is not the selected one.
+    state.presentExport(table: keep)
+    #expect(state.modalSheet == .export(table: keep))
+    await state.close(drop)
+    #expect(state.modalSheet == .export(table: keep), "the wrong sheet was dismissed")
+
+    // `.staged` is about the store on disk and has no table at all. A blanket dismissal would
+    // close the one panel that tells the user where their copied data lives, mid-read.
+    state.presentStaged()
+    await state.close(keep)
+    #expect(state.modalSheet == .staged)
+}
+
+/// The other half of the reconciliation: a table can leave the catalog without going through
+/// `close(_:)` — `purgeStaged` skips open tables today, and Phase 1's dropped connection is a table
+/// vanishing with no user action behind it at all. `refresh()` is the poll loop's own entry point,
+/// so this is the leg that catches those.
+///
+/// Mutation: drop `dismissSheetWithoutASubject()` from `refresh()` and this goes red.
+@MainActor
+@Test func refreshAlsoDismissesASheetWhoseTableLeftTheCatalog() async throws {
+    let (state, _) = try await openedFixture(rows: 12)
+    let name = try #require(state.activeName)
+    state.presentExport()
+    #expect(state.modalSheet != nil)
+
+    // Behind `AppState`'s back, the way a connection drops.
+    try await state.session.closeTable(name)
+    await state.refresh()
+
+    #expect(state.modalSheet == nil)
 }

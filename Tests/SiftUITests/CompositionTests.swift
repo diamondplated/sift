@@ -178,3 +178,19 @@ private func inspector(_ state: AppState, _ table: String, _ tab: InspectorTab) 
     #expect(Set(drawn).count == 1, "the inspector drew a panel with no table open")
 }
 
+
+// MARK: - a sheet whose table went away
+
+/// 🔴 **C2's belt, measured.** The `.sheet` content was `if let t = state.active` with no else, and
+/// that body with a nil subject paints ZERO pixels — a blank window-modal sheet with no button on
+/// it, over an app whose menu bar is still live. Force-quit.
+///
+/// `AppState` is what makes the fallback unreachable in practice (`dismissSheetWithoutASubject`,
+/// pinned in `AppStateTests`); this is the assertion that if it IS reached, something is drawn.
+/// Delete the `Text` and the `Button` and the ink collapses to the empty render's.
+@MainActor
+@Test func theSheetFallbackPaintsRatherThanRenderingABlankModal() throws {
+    let painted = inkCount(try render(SheetSubjectGone(), 400, 140))
+    let blank = inkCount(try render(Color.clear, 400, 140))
+    #expect(painted > blank, "the fallback drew nothing — this is the blank sheet, again")
+}

@@ -75,11 +75,18 @@ public struct RootView: View {
         // the toolbar, the clickable dropped-rows chip, a dropped workbook, the sidebar's context
         // menu — sets `AppState.modalSheet` and stops; until this modifier existed they all set a
         // value nothing read, so five finished features were unreachable.
+        // 🔴 Every `if let` here has an `else`, and that is the belt rather than the fix: `AppState`
+        // clears `modalSheet` when its subject table leaves the catalog (`dismissSheetWithoutASubject`),
+        // and this is what the user gets if a subject ever goes missing by some route nobody thought
+        // of. What used to be here was `if let t = state.active` with no else, which renders a body
+        // painting ZERO pixels — a blank window-modal sheet with no button on it. Force-quit.
         .sheet(item: $state.modalSheet) { which in
             switch which {
-            case .export:
-                if let t = state.active {
+            case .export(let name):
+                if let t = state.tables.first(where: { $0.name == name }) {
                     ExportSheet(session: state.session, table: t) { state.banner = $0 }
+                } else {
+                    SheetSubjectGone()
                 }
             case .merge:
                 MergeSheet(
@@ -90,9 +97,11 @@ public struct RootView: View {
                 }
             case .staged:
                 StagedDataSheet(session: state.session)
-            case .badRows:
-                if let t = state.active {
-                    BadRowsSheet(session: state.session, table: t.name)
+            case .badRows(let name):
+                if state.tables.contains(where: { $0.name == name }) {
+                    BadRowsSheet(session: state.session, table: name)
+                } else {
+                    SheetSubjectGone()
                 }
             case .workbook(let path):
                 SheetPickerSheet(path: path) { picked in
@@ -139,6 +148,26 @@ public struct RootView: View {
             }
             .help("Manage the native copies Sift is holding on disk")
         }
+    }
+}
+
+/// What a sheet shows when the table it was raised for is no longer open.
+///
+/// 🔴 It dismisses itself, and it still draws a sentence and a button. That is not belt-and-braces
+/// for its own sake: the defect this replaces was a body that painted nothing at all in a
+/// window-modal sheet, so if the `.task` below ever fails to run there must still be a way out that
+/// does not involve Force Quit. `.cancelAction`, so Escape — the reflex key — is that way out.
+struct SheetSubjectGone: View {
+    @Environment(\.dismiss) private var dismiss
+
+    var body: some View {
+        VStack(spacing: 10) {
+            Text("That table is no longer open.").font(.system(size: 13))
+            Button("Close") { dismiss() }.keyboardShortcut(.cancelAction)
+        }
+        .padding(16)
+        .frame(width: 400)
+        .task { dismiss() }
     }
 }
 

@@ -486,7 +486,7 @@ private func redFraction(_ colours: [NSColor]) -> Double {
     #expect(state.canShowBadRows)
     #expect(state.rowSummary.contains("dropped"))
     state.presentBadRows()
-    #expect(state.modalSheet == .badRows)
+    #expect(state.modalSheet == .badRows(table: try #require(state.activeName)))
 
     // …and it stops being one the moment the selection moves to a clean table.
     state.modalSheet = nil

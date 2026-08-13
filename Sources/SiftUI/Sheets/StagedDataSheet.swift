@@ -138,7 +138,8 @@ public struct StagedDataSheet: View {
                 Button("Clear all staged data") { Task { await purge(all: true) } }
                     .disabled(entries.isEmpty)
                 Spacer()
-                Button("Close") { dismiss() }.keyboardShortcut(.defaultAction)
+                // `.cancelAction` — see `BadRowsSheet` for why these two moved off `.defaultAction`.
+                Button("Close") { dismiss() }.keyboardShortcut(.cancelAction)
             }
         }
         .padding(16)
