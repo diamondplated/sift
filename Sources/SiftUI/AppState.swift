@@ -102,11 +102,35 @@ public final class AppState {
             nullPadding: fix == .nullPadding, skipPreamble: fix != .keepAllLines)
     }
 
+    /// 🔴 **The mirror drops the table BEFORE the first await, not after `refresh()` catches up.**
+    /// This used to be `await closeTable` → `models[name] = nil` → `await refresh()`, which left
+    /// `tables` still naming a table across two suspension points. `model(for:)` guards on the
+    /// mirror and on nothing else, and the 250 ms poll writes `tables` unconditionally — so every
+    /// `@Observable` reader is invalidated inside that window, `RootView.body` and
+    /// `BannerStack.tableBanners` both call `model(for:)` there, and a view model gets REBUILT for a
+    /// table the engine has already closed. Its `loadFirstPage()` then throws, and the sentence
+    /// `No open table named 'x'.` lands on the banner immediately after a close the user asked for.
+    ///
+    /// Removing the row first is also the honest reading of what the click means: the user asked
+    /// for this table to go away. The one case where it does not go away is a refused close — the
+    /// engine refuses while a live merge reads the table — and every optimistic change is put back
+    /// in the `catch`, with `refresh()` restoring the mirror row itself.
+    ///
+    /// `models[name]` is cleared only on success, so a refused close keeps its page cache.
     public func close(_ name: String) async {
-        do { try await session.closeTable(name) } catch { banner = error.localizedDescription }
-        models[name] = nil
-        // `refresh()` moves the selection off a table that is no longer in the catalog, which
-        // covers closing the active one — there is deliberately no second check here.
+        let wasActive = activeName
+        tables.removeAll { $0.name == name }
+        // The selection moves HERE as well as in `refresh()`: with the row gone from the mirror and
+        // `activeName` still naming it, `active` is nil for the length of the engine call and the
+        // detail pane flashes its no-file-open state on the way to the next table.
+        if activeName == name { activeName = tables.first?.name }
+        do {
+            try await session.closeTable(name)
+            models[name] = nil
+        } catch {
+            banner = error.localizedDescription
+            activeName = wasActive
+        }
         await refresh()
     }
 

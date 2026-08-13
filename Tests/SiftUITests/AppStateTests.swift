@@ -346,3 +346,100 @@ private func write(_ text: String, _ name: String, in dir: URL) throws -> String
     #expect(await waitFor(3) { state.tables.count == 2 } == false)
     #expect(state.tables.map(\.name) == ["seen"])
 }
+
+// MARK: - a closed table stays closed
+
+/// 🔴 **I4.** `close(_:)` used to be `await closeTable` → `models[name] = nil` → `await refresh()`,
+/// so `tables` still named the table across two suspension points. Nothing here is hypothetical:
+/// the poll loop writes `tables` unconditionally every 250 ms–2 s, which invalidates every
+/// `@Observable` reader whether or not the value moved, and both `RootView.body` and
+/// `BannerStack.tableBanners` call `model(for:)` — which guards on the mirror and on nothing else.
+/// A model rebuilt in that window throws `No open table named 'x'.` out of `loadFirstPage()`, onto
+/// the banner, immediately after a close the user asked for.
+///
+/// This is the review's probe: put the mirror in exactly that state and show that the resurrection
+/// is real, then show that a close the user asked for does not end in one.
+///
+/// 🔴 Stated so nobody trusts it for more than it is worth: the FIRST half is a standing statement
+/// about a stale mirror — it survives any ordering, and it is what Phase 1 turns from a race into a
+/// routine event, since a dropped remote connection is a table leaving the catalog with no user
+/// action behind it. The ordering itself is pinned by
+/// `closeDropsTheTableFromTheMirrorBeforeItAwaitsTheEngine` below, which is the mutation-sensitive
+/// one.
+@MainActor
+@Test func aTableTheEngineHasClosedIsNotHandedBackAsAViewModel() async throws {
+    let (state, _) = try await openedFixture(rows: 12)
+    let name = try #require(state.activeName)
+
+    // The window, reproduced: the engine has closed the table and the mirror has not caught up.
+    try await state.session.closeTable(name)
+    let resurrected = try #require(
+        state.model(for: name), "precondition: a stale mirror is what makes this possible at all")
+    await #expect(throws: (any Error).self, "the sentence that used to reach the banner") {
+        try await resurrected.loadFirstPage()
+    }
+
+    // …and the same state reached the way a user reaches it — through `close(_:)` — leaves nothing
+    // to resurrect.
+    let (other, _) = try await openedFixture(rows: 12, name: "other.csv")
+    let closing = try #require(other.activeName)
+    await other.close(closing)
+    #expect(other.model(for: closing) == nil)
+    #expect(!other.tables.contains { $0.name == closing })
+}
+
+/// The half a completed `close(_:)` cannot show: the mirror has to be right *at the suspension
+/// point*, not only afterwards. `Task.yield()` hands the actor to the enqueued close, which runs
+/// until it awaits the engine — everything it has done by then is the fix.
+///
+/// Mutation: move `tables.removeAll` back below the `await` and this goes red.
+@MainActor
+@Test func closeDropsTheTableFromTheMirrorBeforeItAwaitsTheEngine() async throws {
+    let dir = tempDir()
+    let state = AppState(session: try Session(home: tempHome()))
+    await state.open(path: try makeCSV(in: dir, name: "going.csv", rows: 3))
+    await state.open(path: try makeCSV(in: dir, name: "staying.csv", rows: 3))
+    let going = try #require(state.tables.first?.name)
+    let staying = try #require(state.tables.last?.name)
+    state.activeName = going
+
+    let closing = Task { await state.close(going) }
+    await Task.yield()
+
+    #expect(state.model(for: going) == nil, "the mirror still offered a model for a closing table")
+    // …and the selection moved with it, so the detail pane never flashes its no-file-open state on
+    // the way to the table that is still there.
+    #expect(state.activeName == staying)
+    await closing.value
+    #expect(state.tables.map(\.name) == [staying])
+}
+
+/// A refused close changes NOTHING. `assertNoLiveMerge` throws while a merge reads the table, and
+/// the optimistic mirror drop above must not survive that — the row comes back through `refresh()`
+/// and the selection is put back in the `catch`.
+@MainActor
+@Test func aRefusedCloseLeavesTheCatalogAndTheSelectionExactlyWhereTheyWere() async throws {
+    let dir = tempDir()
+    let state = AppState(session: try Session(home: tempHome()))
+    var orders = "order_id,amount\n"
+    for i in 1...6 { orders += "\(i),\(i * 5)\n" }
+    var returns = "order_id,reason\n"
+    for i in 1...3 { returns += "\(i),damaged\n" }
+    try orders.write(
+        toFile: dir.appendingPathComponent("orders.csv").path, atomically: true, encoding: .utf8)
+    try returns.write(
+        toFile: dir.appendingPathComponent("returns.csv").path, atomically: true, encoding: .utf8)
+    await state.open(path: dir.appendingPathComponent("orders.csv").path)
+    await state.open(path: dir.appendingPathComponent("returns.csv").path)
+    _ = try await state.session.merge("orders", "returns", on: ["order_id"], how: .inner)
+    await state.refresh()
+    state.activeName = "orders"
+
+    await state.close("orders")
+
+    let banner = try #require(state.banner, "a refusal the user cannot see is a silent failure")
+    #expect(banner.contains("Close 'orders_returns' first."))
+    #expect(state.tables.contains { $0.name == "orders" })
+    #expect(state.activeName == "orders", "a close that did not happen must not move the selection")
+    #expect(state.model(for: "orders") != nil)
+}
