@@ -360,3 +360,51 @@ private func plantedTable(
     await waitForCatalog(state, "the exact row count") { state.tables.first?.rowsAreExact == true }
     #expect(state.rowSummary == "12 rows · 3 cols")
 }
+
+// MARK: - what LaunchServices hands over
+
+/// 🔴 `application(_:open:)` did `urls.map(\.path)`, which is right for a `file:` URL and wrong for
+/// every other scheme: `URL.path` is the path COMPONENT, so the scheme, host, query and fragment are
+/// discarded and what is left is a plausible-looking local path. The refusal then names a file the
+/// user never mentioned — or, on a machine where the stripped path happens to exist, Sift opens the
+/// wrong file and says nothing.
+@Test func aFileURLOpensByPathAndEverythingElseKeepsItsWholeURL() {
+    #expect(openArguments([URL(fileURLWithPath: "/data/orders.csv")]) == ["/data/orders.csv"])
+
+    // A custom scheme. `.path` leaves `/open/Users/andrew/orders.csv` — a real-looking path.
+    #expect(
+        openArguments([URL(string: "sift://open/Users/andrew/orders.csv")!])
+            == ["sift://open/Users/andrew/orders.csv"])
+    // …and https leaves `/data.csv`, which on plenty of machines exists.
+    #expect(
+        openArguments([URL(string: "https://example.com/data.csv")!])
+            == ["https://example.com/data.csv"])
+    // The query is part of what was handed over and part of what a refusal has to quote back.
+    #expect(
+        openArguments([URL(string: "s3://bucket/key.parquet?versionId=7")!])
+            == ["s3://bucket/key.parquet?versionId=7"])
+
+    // Order is the order they arrived in, and a mixed batch keeps both rules.
+    #expect(
+        openArguments([
+            URL(string: "https://example.com/a.csv")!, URL(fileURLWithPath: "/data/b.csv"),
+        ]) == ["https://example.com/a.csv", "/data/b.csv"])
+    #expect(openArguments([]).isEmpty)
+
+    // A file URL with a space is decoded, which is exactly why `.path` is right for this one case:
+    // the engine wants bytes on disk, not percent-encoding.
+    #expect(openArguments([URL(fileURLWithPath: "/data/my file.csv")]) == ["/data/my file.csv"])
+}
+
+/// Open Recent is the OS's documents list — drawn with a file icon, resolved against the
+/// filesystem, persisted across launches. A non-file URL in it is an entry that can never re-open
+/// anything.
+@Test func onlyFileURLsAreRecordedAsRecentDocuments() {
+    let file = URL(fileURLWithPath: "/data/orders.csv")
+    let web = URL(string: "https://example.com/data.csv")!
+    let custom = URL(string: "sift://open/x.csv")!
+
+    #expect(recentDocuments([file, web, custom]) == [file])
+    #expect(recentDocuments([web, custom]).isEmpty)
+    #expect(recentDocuments([]).isEmpty)
+}

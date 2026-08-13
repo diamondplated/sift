@@ -116,7 +116,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// arrive here with real filesystem URLs, the thing a browser can never provide.
     func application(_ application: NSApplication, open urls: [URL]) {
         note(urls)
-        let paths = urls.map(\.path)
+        // `openArguments`, not `urls.map(\.path)` — see its doc comment in `SiftUI`. `.path` on a
+        // non-file URL throws the scheme and host away and leaves a plausible-looking local path.
+        let paths = openArguments(urls)
         guard let state else {
             pending.append(contentsOf: paths)
             return
@@ -126,8 +128,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     /// Every path the app opens goes through here, so File > Open Recent is populated by the act of
     /// opening rather than by a second list kept in parallel with it.
+    ///
+    /// The file-URL filter is `recentDocuments`', applied HERE rather than at the one call site that
+    /// can currently pass a non-file URL, so the open panel, a Dock drop, Finder "Open With" and
+    /// Open Recent itself all get the rule from the same place.
     private func note(_ urls: [URL]) {
-        urls.forEach { NSDocumentController.shared.noteNewRecentDocumentURL($0) }
+        recentDocuments(urls).forEach { NSDocumentController.shared.noteNewRecentDocumentURL($0) }
     }
 
     // MARK: - menu

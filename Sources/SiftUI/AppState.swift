@@ -293,3 +293,40 @@ public func rowSummaryText(_ table: SiftEngine.Table) -> String {
 public func needsSheetPicker(_ path: String) -> Bool {
     xlsxExt.contains("." + (path as NSString).pathExtension.lowercased())
 }
+
+// MARK: - what LaunchServices hands over
+//
+// Pure functions here, in `SiftUI`, rather than inline in `AppDelegate`. `SiftApp` is an
+// `executableTarget` and no SwiftPM test target can import one, so a decision made there is a
+// decision nothing will ever check — which is precisely how `urls.map(\.path)` shipped.
+
+/// What each URL means to the engine.
+///
+/// 🔴 **`URL.path` is the right accessor for a `file:` URL and the wrong one for every other
+/// scheme**, and `application(_:open:)` used it on all of them. `URL.path` is documented to be the
+/// path COMPONENT — so scheme, host, query and fragment are simply discarded:
+/// `sift://open/Users/andrew/orders.csv` arrives as `/open/Users/andrew/orders.csv`, and
+/// `https://example.com/data.csv` arrives as `/data.csv`. Both of those are perfectly plausible
+/// local paths, so the best case is the engine refusing a file the user never named, and the worst
+/// case is a machine where the stripped path happens to exist and Sift opens the WRONG FILE with
+/// nothing on screen suggesting anything went sideways.
+///
+/// Anything that is not a file keeps its whole `absoluteString`, so the engine's own
+/// "No such file or folder: …" names back exactly what it was handed. This is not a claim that Sift
+/// can open a URL — it cannot, `openPath` stats the path — it is a claim that a refusal quotes the
+/// thing that was refused.
+public func openArguments(_ urls: [URL]) -> [String] {
+    urls.map { $0.isFileURL ? $0.path : $0.absoluteString }
+}
+
+/// Which of them belong in File > Open Recent: the file URLs, and nothing else.
+///
+/// `NSDocumentController.noteNewRecentDocumentURL` is the OS's own documents list — drawn with a
+/// file icon, resolved against the filesystem, persisted across launches. A non-file URL recorded in
+/// it is a menu entry that can never re-open anything.
+///
+/// Applied inside `AppDelegate.note(_:)` rather than at one call site, so the open panel, a Dock
+/// drop, Finder "Open With" and Open Recent itself all get the same rule from the same place.
+public func recentDocuments(_ urls: [URL]) -> [URL] {
+    urls.filter(\.isFileURL)
+}
