@@ -385,6 +385,12 @@ public func rowSummaryText(_ table: SiftEngine.Table) -> String {
 ///
 /// `SiftCore.xlsxExt` rather than a second list: the set the engine detects a workbook by and the
 /// set the picker fires on are the same fact, and two copies is how `.xlsm` ends up in only one.
+///
+/// 🔴 **The third collision on this branch, and the survivor of it.** `SheetPickerSheet` carried a
+/// byte-identical `offersSheetPicker(path:)` with ZERO production callers and its own copy of these
+/// six test cases in a second file, so the suite was green whichever of the two you edited and
+/// neither test would have noticed them drifting apart. `compactCount` and `humanBytes` got here
+/// first; only this one had shipped with the loser still alive.
 public func needsSheetPicker(_ path: String) -> Bool {
     xlsxExt.contains("." + (path as NSString).pathExtension.lowercased())
 }

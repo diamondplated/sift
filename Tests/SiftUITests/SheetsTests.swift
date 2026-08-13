@@ -330,17 +330,10 @@ private func appKitReady() { _ = NSApplication.shared }
 
 // MARK: - the workbook sheet picker
 
-/// 🔴 `SiftCore.xlsxExt`, not the web's `/\.xlsx?$/i`. That regex routes a legacy `.xls` — an OLE2
-/// file, not a zip — into a picker that cannot read it, and misses `.xlsm`, which this engine
-/// reads perfectly well. The engine's own set is the authority on what a workbook is.
-@Test func thePickerIsOfferedForEveryWorkbookAndNotForALegacyXls() {
-    #expect(offersSheetPicker(path: "/d/book.xlsx"))
-    #expect(offersSheetPicker(path: "/d/BOOK.XLSX"))
-    #expect(offersSheetPicker(path: "/d/macros.xlsm"))
-    #expect(!offersSheetPicker(path: "/d/old.xls"), "a legacy .xls gets its own refusal, not this")
-    #expect(!offersSheetPicker(path: "/d/orders.csv"))
-    #expect(!offersSheetPicker(path: "/d/xlsx"))
-}
+// Which paths reach this picker is `needsSheetPicker`, pinned once in
+// `KeyNavTests.workbooksRouteThroughTheSheetPickerAndNothingElseDoes`. The six cases used to be
+// here too, against a byte-identical `offersSheetPicker` that nothing called — two spellings of one
+// rule, either of which could be edited with the suite still green.
 
 /// A single-sheet workbook still gets the picker — parity with `siftOpenPaths`, which routes every
 /// workbook through it unconditionally. Shortcutting one sheet straight to open is a visible

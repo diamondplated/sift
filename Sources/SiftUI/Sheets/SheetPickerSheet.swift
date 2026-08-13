@@ -13,17 +13,9 @@ import SwiftUI
 // flow, and is deliberately NOT done here: this is a parity release, and a one-sheet picker is a
 // visible behaviour change, not an implementation detail.
 
-/// Should opening this path go through the picker?
-///
-/// 🔴 `SiftCore.xlsxExt` (`.xlsx`, `.xlsm`) and not the web's `/\.xlsx?$/i`, and the divergence is
-/// deliberate in both directions. That regex matches `.xls` — a legacy OLE2 file that is not a zip,
-/// so `listSheets` cannot read it and the picker fails with an unzip error instead of the
-/// "re-save it as .xlsx" sentence `detectFormat` already spells. And it MISSES `.xlsm`, a macro
-/// workbook this engine reads perfectly well. One authority for what a workbook is, and it is the
-/// engine's.
-public func offersSheetPicker(path: String) -> Bool {
-    xlsxExt.contains("." + (path as NSString).pathExtension.lowercased())
-}
+// Which paths go through this picker is `AppState.needsSheetPicker` and lives there, beside the
+// `open(paths:)` that routes on it. The byte-identical `offersSheetPicker` that used to sit here had
+// no production caller and its own six-case test in another file — see that function's note.
 
 /// `1,204 × 7`, or `empty`. `cols` is ungrouped, matching the web's `${fmtInt(s.rows)} × ${s.cols}`
 /// — a workbook with a thousand columns is not the case worth a separator.
