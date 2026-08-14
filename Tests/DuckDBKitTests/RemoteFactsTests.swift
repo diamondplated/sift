@@ -28,6 +28,17 @@ private func db(_ extensions: [String]) throws -> Database {
     return d
 }
 
+/// `db(_:)` plus a short GLOBAL http timeout, for the tests that talk to the loopback oracle.
+/// Every server here is on 127.0.0.1, so 5 s is generous — and it is the difference between a
+/// broken environment failing in seconds and burning the default 30 s timeout across four attempts
+/// and thirteen parallel tests. MEASURED on the first CI canary run: 244 s to report nothing.
+/// Fact 8 deliberately keeps `db(["httpfs"])`, because it pins the shipped default of 30.
+private func remoteDB(_ extensions: [String] = ["httpfs"]) throws -> Database {
+    let d = try db(extensions)
+    try d.connect().execute("SET GLOBAL http_timeout=5")
+    return d
+}
+
 /// The error text DuckDB produced, or `"no error"` when the statement unexpectedly succeeded.
 private func failure(_ c: Connection, _ sql: String) -> String {
     do { _ = try c.query(sql).allRows(); return "no error" } catch { return "\(error)" }
@@ -130,7 +141,7 @@ func remoteFact3_deltaScanOverHttpFailsInsideTheKernel() throws {
 
     // Over http it fails inside delta-kernel-rs's own object_store — which is NOT httpfs, so
     // loading httpfs does not help — while looking for `_delta_log/_last_checkpoint`.
-    let remote = try db(["delta", "httpfs"]).connect()
+    let remote = try remoteDB(["delta", "httpfs"]).connect()
     server.clearLog()
     let text = failure(remote, "SELECT count(*) FROM delta_scan('\(server.base)/dtable')")
     #expect(text.contains("ObjectStoreError"), "\(text)")
@@ -151,7 +162,7 @@ func remoteFact3_deltaScanOverHttpFailsInsideTheKernel() throws {
 func remoteFact4_httpGlobsAreRefusedNotExpanded() throws {
     let server = try LoopbackServer(files: try parquetPair())
     defer { server.stop() }
-    let c = try db(["httpfs"]).connect()
+    let c = try remoteDB().connect()
 
     #expect(try c.query("SELECT current_setting('allow_asterisks_in_http_paths')")
         .allRows()[0][0] == .bool(false))
@@ -196,7 +207,7 @@ func remoteFact5_readBlobOverHttpIsByteExactAndUnchunked() throws {
 
     let server = try LoopbackServer(files: ["/blob.bin": blob])
     defer { server.stop() }
-    let c = try db(["httpfs"]).connect()
+    let c = try remoteDB().connect()
 
     let remote = try c.query(
         "SELECT octet_length(content), md5(content) FROM read_blob('\(server.base)/blob.bin')").allRows()[0]
@@ -332,7 +343,7 @@ func remoteFact7a_csvOverHttpDownloadsTheWholeObjectWhateverTheSampleSize() thro
     // therefore not a convenience, it is the only way to pay for the download once.
     for sql in ["SELECT Columns::VARCHAR FROM sniff_csv('\(server.base)/data.csv')",
                 "SELECT Columns::VARCHAR FROM sniff_csv('\(server.base)/data.csv', sample_size=20)"] {
-        let c = try db(["httpfs"]).connect()
+        let c = try remoteDB().connect()
         server.clearLog()
         _ = try c.query(sql).allRows()
         let gets = server.log.filter { $0.method == "GET" }
@@ -341,7 +352,7 @@ func remoteFact7a_csvOverHttpDownloadsTheWholeObjectWhateverTheSampleSize() thro
     }
 
     // A plain `read_csv … LIMIT 5` fetches the object TWICE — sniff pass, then scan pass.
-    let c = try db(["httpfs"]).connect()
+    let c = try remoteDB().connect()
     server.clearLog()
     _ = try c.query("SELECT * FROM read_csv('\(server.base)/data.csv') LIMIT 5").allRows()
     #expect(server.log.filter { $0.method == "GET" }.reduce(0) { $0 + $1.sent } == 2 * csv.count,
@@ -356,7 +367,7 @@ func remoteFact7b_aServerThatRefusesRangesFailsButOneThatIgnoresThemWorks() thro
     // down so the pin costs milliseconds rather than the default 100/400/1600 ms backoff.
     let rejecting = try LoopbackServer(files: ["/data.csv": csv], mode: .reject)
     defer { rejecting.stop() }
-    let strict = try db(["httpfs"]).connect()
+    let strict = try remoteDB().connect()
     try strict.execute("SET http_retry_wait_ms=1")
     let text = failure(strict, "SELECT count(*) FROM read_csv('\(rejecting.base)/data.csv')")
     #expect(text.contains("416"), "\(text)")
@@ -366,7 +377,7 @@ func remoteFact7b_aServerThatRefusesRangesFailsButOneThatIgnoresThemWorks() thro
     // transparently — no error, right answer. Only an outright refusal breaks the read.
     let lenient = try LoopbackServer(files: ["/data.csv": csv], mode: .ignore)
     defer { lenient.stop() }
-    let relaxed = try db(["httpfs"]).connect()
+    let relaxed = try remoteDB().connect()
     #expect(try relaxed.query("SELECT count(*) FROM read_csv('\(lenient.base)/data.csv')")
         .allRows()[0][0] == .int(2000))
     #expect(lenient.log.allSatisfy { $0.status == 200 }, "\(lenient.log)")
@@ -387,7 +398,7 @@ func remoteFact7c_parquetOverHttpReallyDoesRangeRead() throws {
     let server = try LoopbackServer(files: ["/big.parquet": bytes])
     defer { server.stop() }
 
-    let c = try db(["httpfs"]).connect()
+    let c = try remoteDB().connect()
     #expect(try c.query("SELECT count(*) FROM read_parquet('\(server.base)/big.parquet')")
         .allRows()[0][0] == .int(2_000_000))
     let transferred = server.log.reduce(0) { $0 + $1.sent }
@@ -597,12 +608,23 @@ final class LoopbackServer: @unchecked Sendable {
         fd = sock
         port = UInt16(bigEndian: me.sin_port)
 
-        DispatchQueue.global().async { [self] in
+        // MEASURED on the macos-15 runner: with the accept loop on `DispatchQueue.global()`, every
+        // server-backed test timed out with an EMPTY request log — nothing was ever accepted, and
+        // the suite burned 244 s on http_timeout. Two causes, both fixed here: a blocking accept()
+        // on the global concurrent queue is the classic thread-starvation antipattern (13 parallel
+        // tests, 13 blocked pool threads), and `accept` returning -1 with EINTR was being treated
+        // as fatal, killing the listener for good. Real threads, and only a genuinely dead socket
+        // ends the loop.
+        Thread.detachNewThread { [self] in
             while true {
                 let client = accept(fd, nil, nil)
                 lock.lock(); let done = stopped; lock.unlock()
-                if done || client < 0 { if client >= 0 { close(client) }; return }
-                DispatchQueue.global().async { [self] in handle(client) }
+                if done { if client >= 0 { close(client) }; return }
+                if client < 0 {
+                    if errno == EINTR || errno == ECONNABORTED { continue }
+                    return
+                }
+                Thread.detachNewThread { [self] in handle(client) }
             }
         }
     }
@@ -623,6 +645,7 @@ final class LoopbackServer: @unchecked Sendable {
                 if !sendAll(client, respond(to: head)) { return }
             }
             let n = chunk.withUnsafeMutableBytes { recv(client, $0.baseAddress, $0.count, 0) }
+            if n < 0 && errno == EINTR { continue }
             if n <= 0 { return }
             buffer.append(contentsOf: chunk[0..<n])
         }
@@ -633,6 +656,7 @@ final class LoopbackServer: @unchecked Sendable {
             var offset = 0
             while offset < raw.count {
                 let n = send(client, raw.baseAddress!.advanced(by: offset), raw.count - offset, 0)
+                if n < 0 && errno == EINTR { continue }
                 if n <= 0 { return false }
                 offset += n
             }
