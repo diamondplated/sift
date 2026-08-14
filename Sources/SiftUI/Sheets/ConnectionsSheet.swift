@@ -203,6 +203,33 @@ public func connectionRowState(
     }
 }
 
+/// May a clean save be read as proof that the connection's DuckDB extension is loaded?
+///
+/// How this screen's extension snapshot learns about a load that happened after launch, WITHOUT a
+/// second LOAD→INSTALL: `addConnection` installs the extension itself and reports only its FAILURE,
+/// into `connectionIssues()` — so a clean save is proof, and a launch snapshot still saying
+/// `.unavailable` (a machine that was offline when Sift started) can be corrected from it. Calling
+/// `installExtension` again from the sheet would instead double the network cost of every FAILED
+/// save, which is the one case where the call is expensive.
+///
+/// Three conditions, and each rules out a different way of being wrong:
+///
+///  * `saved` — a save that THREW leaves no issue either, because there is no connection to have
+///    one, and an absent issue must not read as proof of anything.
+///  * `usableNow` — the POSTURE, never `config.allowRemote`, which is the switch in the file that
+///    this very save just turned on. `addConnection` installs nothing on a session that started
+///    strict (that would be the outbound request the strict posture forbids), so a clean save there
+///    is proof of a credential and of nothing whatever about an extension.
+///  * no `issue` — `addConnection` routes the extension's failure through `connectionIssues()`, so
+///    an issue is the counter-evidence.
+///
+/// Pure and separate from the sheet for this file's usual reason: a `private func` on a `View`
+/// cannot be tested, and `theExtensionSnapshotIsOnlyUpdatedByASaveThatProvesSomething` is what
+/// stands between this rule and the sheet quietly recording a fact nothing established.
+public func aSaveProvesTheExtensionLoaded(saved: Bool, usableNow: Bool, issue: String?) -> Bool {
+    saved && usableNow && issue == nil
+}
+
 /// The identity half of a row: what kind of connection it is and which account, key or bucket it
 /// reaches. Every value here is already in `connections.json` in the clear and is redacted the same
 /// way by `duckdb_secrets()` — the secret half is in the Keychain and appears nowhere on this screen.
@@ -426,17 +453,8 @@ public struct ConnectionsSheet: View {
             self.notice = nil
         }
         await reload()
-        // 🔴 How this screen's extension snapshot learns about a load that happened after launch,
-        // WITHOUT a second LOAD→INSTALL. `addConnection` installs the extension itself and reports
-        // only its FAILURE, into `connectionIssues()` — so a save that comes back clean on a
-        // permissive config is proof the extension loaded, and a launch snapshot still saying
-        // `.unavailable` (a machine that was offline when Sift started) can be corrected from that
-        // proof. Calling `installExtension` again here would instead double the network cost of
-        // every FAILED save, which is the one case where the call is expensive.
-        //
-        // `saved` and not `issues[spec.id] == nil` alone: a save that THREW leaves no issue either,
-        // because there is no connection to have one — and that must not read as proof of anything.
-        if saved, config.allowRemote, issues[spec.id] == nil {
+        if aSaveProvesTheExtensionLoaded(saved: saved, usableNow: usableNow,
+                                         issue: issues[spec.id]) {
             extensions[duckDBExtension(for: spec.kind)] = .loaded
         }
     }

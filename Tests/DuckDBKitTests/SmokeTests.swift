@@ -4,6 +4,10 @@ import Foundation
 import TestSupport
 @testable import DuckDBKit
 
+/// `SIFT_REMOTE_FACTS=1`, CI's separate canary step — the same `private let` five other test files
+/// carry. One test below must `INSTALL` to reach the state it pins, so it lives behind this.
+private let remoteFacts = ProcessInfo.processInfo.environment["SIFT_REMOTE_FACTS"] == "1"
+
 // Forces an actual link against libduckdb (module autolink only fires on import)
 // and pins that the loaded library is genuinely the 1.5.5 build we checksummed.
 @Test func linkedLibraryIsThePinnedDuckDBVersion() {
@@ -213,15 +217,31 @@ private let deniedFilesystems = ["HTTPFileSystem", "S3FileSystem",
 ///
 /// Both names go through ONE `loadExtensions` call on purpose — two separate calls could pass with
 /// the two states swapped, or with the guard rejecting everything, and nothing would notice.
-@Test func loadExtensionsTellsAMissingBinaryApartFromARejectedName() throws {
+///
+/// 🔴 **GATED, and it was not.** Reaching `.unavailable` at all means `LOAD` failed and `INSTALL`
+/// ran, and `INSTALL no_such_extension_zzz` is a real request to `extensions.duckdb.org` that comes
+/// back 404 — so this test lived in the default suite while AGENTS.md said that run makes none. By
+/// its own rule the gated set is where a test that must `INSTALL` belongs.
+///
+/// It is also the CONTROL for every `networkInstalls.isEmpty` assertion in the repo. Those are
+/// worth nothing if the array is never written, and on a machine with a warm extension cache
+/// nothing in the default run CAN write it — every `LOAD` succeeds from disk and the `INSTALL`
+/// branch is never reached. `no_such_extension_zzz` is the one name guaranteed to miss that cache
+/// on every machine, warm or cold.
+@Test(.enabled(if: remoteFacts))
+func remoteFact_loadExtensionsTellsAMissingBinaryApartFromARejectedName() throws {
     let db = try Database.inMemory()
     db.harden()
+    #expect(db.networkInstalls.isEmpty)
     db.loadExtensions(["no_such_extension_zzz", "httpfs; ATTACH 'evil.db'"])
 
     let missing = db.loadedExtensions["no_such_extension_zzz"]
     let rejected = db.loadedExtensions["httpfs; ATTACH 'evil.db'"]
 
     #expect(rejected == .rejectedName)
+    // The act, separately from the state: the legal-but-absent name cost an outbound INSTALL and
+    // the name the guard threw out never reached DuckDB at all.
+    #expect(db.networkInstalls == ["no_such_extension_zzz"])
     guard case .unavailable(let why) = missing else {
         Issue.record("a legal-but-absent extension recorded \(String(describing: missing))")
         return

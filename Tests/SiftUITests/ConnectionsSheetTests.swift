@@ -20,10 +20,17 @@ import TestSupport
 //  3. **The engine's sentences are rendered, never paraphrased.** `connectionIssues()` comes back
 //     from a real engine and lands in the row byte for byte.
 //
-// Nothing here needs the network. Every session below launches STRICT — `remoteExtensions(for:)`
-// returns `[]` in that posture, so no `INSTALL` is attempted — and the one that flips the switch
-// uses `setAllowRemote`, which issues secrets and does not touch an extension. `CREATE SECRET`
-// parses, binds and registers on a bare 1.5.5 with nothing loaded (MEASURED, Task 4).
+// Nothing here makes a request. Every session below launches STRICT — `remoteExtensions(for:)`
+// returns `[]` in that posture, so no `INSTALL` is attempted, and `addConnection` no longer makes
+// one either (it gates the install AND the secret on `remoteUsableNow`).
+//
+// ⚠️ The claim this replaced added "…and `CREATE SECRET` parses, binds and registers on a bare 1.5.5
+// with nothing loaded (MEASURED, Task 4)". RE-MEASURED on a `harden()`ed engine: it does not — every
+// `TYPE s3`/`TYPE azure` shape is refused with `Secret type … does not exist, but it exists in the
+// <name> extension` (see `Tests/SiftCoreTests/RemoteTests.swift`'s header for the full correction).
+// The one test below that reaches issuance, `aRowRendersTheEnginesOwnSentence…`, is unaffected
+// because its s3 spec has no Keychain item at all: `createSecretSQL` returns `nil` and the sentence
+// is Sift's own, decided before DuckDB is asked anything.
 //
 // Nothing is `.serialized`, and every credential written here would go under a test-only Keychain
 // service (`Session.keychainService`) — the same split `ConnectionsTests` makes, so no test run can
@@ -116,8 +123,8 @@ private func chainSpec(name: String = "acct") -> ConnectionSpec {
 /// `.activeAfterRelaunch` (the file changed; this `Database` did not). Asserting only against
 /// hand-built enum values would pass for a screen wired to neither.
 ///
-/// Offline by construction: a strict launch loads no remote extension, and `setAllowRemote` issues
-/// secrets without touching one.
+/// Offline by construction: a strict launch loads no remote extension, and this session has no
+/// saved connection for `setAllowRemote` to issue a secret for.
 @Test func aRealStrictSessionProducesBothOutcomesAndTheCopyFollowsThem() async throws {
     let session = try plantedSession(allowRemote: false)
 
@@ -414,4 +421,28 @@ private func chainSpec(name: String = "acct") -> ConnectionSpec {
     #expect(state.tables.isEmpty)
     state.presentConnections()
     #expect(state.modalSheet == .connections)
+}
+
+// MARK: - what a clean save is evidence of
+
+/// 🔴 **The sheet may not record a fact nothing established.** `save()` corrects its launch snapshot
+/// of `EngineInfo.extensions` from a save that came back clean — that is the only way this screen
+/// learns about an extension that loaded after launch without paying for a second LOAD→INSTALL. The
+/// condition used to be the switch in the FILE (`config.allowRemote`), which the save itself had
+/// just turned on, so the first connection saved on a strict session marked its extension `.loaded`
+/// having installed nothing at all. `connectionRowState` hides that today (a relaunch outranks an
+/// extension state), which is exactly why it needs a test rather than a reader's confidence.
+@Test(arguments: [
+    // saved, usableNow, issue, expected
+    (true, true, String?.none, true),      // the one shape that is evidence
+    (false, true, String?.none, false),    // a save that threw leaves no issue either
+    (true, false, String?.none, false),    // strict: addConnection installed nothing to be proof of
+    (true, true, String?.some("no credential is saved"), false),   // the counter-evidence
+    (false, false, String?.some("boom"), false),
+])
+func theExtensionSnapshotIsOnlyUpdatedByASaveThatProvesSomething(
+    c: (saved: Bool, usableNow: Bool, issue: String?, expected: Bool)
+) {
+    #expect(aSaveProvesTheExtensionLoaded(saved: c.saved, usableNow: c.usableNow, issue: c.issue)
+        == c.expected)
 }

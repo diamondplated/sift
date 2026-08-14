@@ -10,11 +10,29 @@ import DuckDBKit
 //   2. every credential rides as a bound `?` parameter and never appears in SQL text;
 //   3. a token without a server-supplied identity is different on every fetch, by construction.
 //
-// Three tests reach a real in-memory DuckDB. MEASURED: `CREATE SECRET` with `TYPE s3` and
-// `TYPE azure` parses, binds and registers on a bare 1.5.5 with **no extension loaded and no
-// network** — the extensions are needed to *use* a secret, not to create one. That keeps the
-// strongest available assertion (the engine accepted this SQL and the value landed verbatim) in the
-// default offline suite.
+// Three tests reach a real in-memory DuckDB, through `secretEngine()`.
+//
+// 🔴 **CORRECTED MEASUREMENT.** This header used to say `CREATE SECRET` with `TYPE s3`/`TYPE azure`
+// "parses, binds and registers on a bare 1.5.5 with no extension loaded and no network — the
+// extensions are needed to *use* a secret, not to create one." **It does not.** RE-MEASURED against
+// the vendored 1.5.5 with `harden()` applied:
+//
+//     TYPE s3    -> Invalid Input Error: Secret type 's3' does not exist, but it exists in the
+//                   httpfs extension.
+//     TYPE azure -> Invalid Input Error: Secret type 'azure' does not exist, but it exists in the
+//                   azure extension.
+//
+// The original measurement was taken on a `Database.inMemory()` with **no `harden()`**, whose
+// `autoload_known_extensions` is DuckDB's default `true`: the engine quietly autoloaded the
+// extension the statement needed — and on a machine that did not have it, autoINSTALLED it from
+// `extensions.duckdb.org`, which is exactly the outbound request the default `swift test` is
+// contracted not to make. Sift's own engine sets that setting to `false` in EVERY posture, so the
+// product never gets that rescue, and a comment claiming otherwise is how a strict session came to
+// register secrets it had no business holding (`Session.addConnection`).
+//
+// So `secretEngine()` does what the product does — `harden()`, then a bare `LOAD` — and these three
+// are gated on the two binaries already being present. Same strong assertion, no autoload, no
+// packets.
 
 // MARK: - classification
 
@@ -312,8 +330,31 @@ private func toDBValue(_ v: SQLValue) -> DBValue {
     }
 }
 
-@Test func everySecretShapeParsesAndBindsOnARealEngine() throws {
-    let con = try Database.inMemory().connect()
+/// Is this machine carrying the two extensions `CREATE SECRET` needs? A bare `LOAD` against a
+/// `harden()`ed database — `autoinstall_known_extensions` is off there, so this can only ever answer
+/// from what is already on disk, offline and in microseconds.
+private let secretExtensionsPresent: Bool = {
+    guard let db = try? Database.inMemory() else { return false }
+    db.harden()
+    guard let con = try? db.connect() else { return false }
+    return (try? con.execute("LOAD httpfs")) != nil && (try? con.execute("LOAD azure")) != nil
+}()
+private let secretExtensionsSkip: Comment = "duckdb httpfs/azure extensions not installed"
+
+/// A connection in the posture the PRODUCT uses: hardened (so nothing autoloads and nothing
+/// autoinstalls) with the two secret extensions loaded from disk by name.
+private func secretEngine() throws -> Connection {
+    let db = try Database.inMemory()
+    db.harden()
+    let con = try db.connect()
+    try con.execute("LOAD httpfs")
+    try con.execute("LOAD azure")
+    return con
+}
+
+@Test(.enabled(if: secretExtensionsPresent, secretExtensionsSkip))
+func everySecretShapeParsesAndBindsOnARealEngine() throws {
+    let con = try secretEngine()
     let shapes: [(ConnectionSpec, String?)] = [
         (azureSpec(.credentialChain), nil),
         (azureSpec(.connectionString), "DefaultEndpointsProtocol=https;AccountKey=abc=="),
@@ -330,8 +371,9 @@ private func toDBValue(_ v: SQLValue) -> DBValue {
     #expect(try con.query("SELECT count(*) FROM duckdb_secrets()").allRows()[0][0] == .int(0))
 }
 
-@Test func aBoundCredentialLandsVerbatimAndStaysOffDisk() throws {
-    let con = try Database.inMemory().connect()
+@Test(.enabled(if: secretExtensionsPresent, secretExtensionsSkip))
+func aBoundCredentialLandsVerbatimAndStaysOffDisk() throws {
+    let con = try secretEngine()
     // A value that would end the statement three times over if it were ever interpolated.
     let hostile = "acct'name;DROP TABLE x;--"
     let spec = azureSpec(.credentialChain, account: hostile)
@@ -352,8 +394,9 @@ private func toDBValue(_ v: SQLValue) -> DBValue {
     #expect(described.contains("chain=cli;env"), "the constant Sift chose, not user data")
 }
 
-@Test func aBoundConnectionStringIsRedactedWhenReadBack() throws {
-    let con = try Database.inMemory().connect()
+@Test(.enabled(if: secretExtensionsPresent, secretExtensionsSkip))
+func aBoundConnectionStringIsRedactedWhenReadBack() throws {
+    let con = try secretEngine()
     let secret = "AccountKey=SUPERSECRETVALUE=="
     let spec = azureSpec(.connectionString)
     let (sql, params) = try #require(createSecretSQL(spec, secretValue: secret))

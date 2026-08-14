@@ -22,11 +22,20 @@ default install makes are the one-time checksum-verified download of the pinned 
 (`scripts/fetch-duckdb.sh`, which you run explicitly) and the one-time `INSTALL` of the DuckDB
 `delta` and `excel` extensions from DuckDB's own repository.
 
+Two things used to make that paragraph untrue and no longer do, both fixed in the Phase 1 review:
+saving your first connection installed the `azure` or `httpfs` extension over the network
+immediately, on the session that had just promised not to; and the SELECT-only gate's parser
+connection, which is handed the SQL you type, kept DuckDB's default "install an extension if a query
+needs one", so `SELECT * FROM read_csv('https://…')` fetched `httpfs` from DuckDB's repository
+before refusing the read. Both now wait for the relaunch you asked for.
+
 **Adding a connection is what turns that off, and it is a decision you make.** Saving the first
-connection in **Data → Connections…** sets `allowRemote: true`; from the next launch that session's
-DuckDB is opened without the filesystem deny list and with `httpfs` (and `azure`, if a saved
-connection needs it) loaded. From that point Sift can read `https://`, `s3://`, `az://` and
-`abfss://` URLs — and so can any `SELECT` you run. See **The trade you are making**, below, which
+connection in **Data → Connections…** sets `allowRemote: true` in the config and writes your
+credential to the Keychain, and does nothing else — this session installs no extension and
+registers no credential with DuckDB, because it was opened strict and cannot use either. From the
+next launch that session's DuckDB is opened without the filesystem deny list and with `httpfs` (and
+`azure`, if a saved connection needs it) loaded. From that point Sift can read `https://`, `s3://`,
+`az://` and `abfss://` URLs — and so can any `SELECT` you run. See **The trade you are making**, below, which
 is the part worth reading twice.
 
 The switch is revocable: turning it off rewrites the config and drops every issued credential

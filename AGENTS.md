@@ -13,8 +13,14 @@ No Python, no server, no web view: the 2026 rewrite deleted all three. DuckDB re
 
 Sift reaches **nothing until a user asks it to**: with no `connections.json` the posture is
 `allowRemote: false`, DuckDB's network filesystems are disabled by name, and `httpfs`/`azure`
-are never loaded. Saving a connection turns that on **from the next launch** — the posture is
-frozen when the `Database` opens and cannot be widened or narrowed inside it. Credentials live
+are never loaded — nor installed, which is a separate promise, because `harden()`'s deny list
+gates DuckDB's VFS and **not** its extension installer. Saving a connection turns that on **from
+the next launch** — the posture is frozen when the `Database` opens and cannot be widened or
+narrowed inside it, so `addConnection` on a strict session writes the file and the Keychain and
+stops there: it installs nothing (that would be the outbound request this paragraph forbids) and
+registers no secret (RE-MEASURED: `CREATE SECRET (TYPE s3|azure)` is refused outright without the
+extension — an earlier "it needs no extension" measurement was taken on a `Database` that had not
+been `harden()`ed, so DuckDB autoloaded one behind it). Credentials live
 in the Keychain; a SAS query string is memory-only for one open. The only listener anywhere is
 `LoopbackHTTPServer` — the oracle every remote test and five `--verify` checks read their
 verdict from — which binds 127.0.0.1 on an ephemeral port, is started only by tests or
@@ -22,10 +28,28 @@ verdict from — which binds 127.0.0.1 on an ephemeral port, is started only by 
 
 ## The one rule: tests are the spec
 
-`Tests/**` is the source of truth for behavior — **910** declared across `DuckDBKitTests`,
-`SiftCoreTests`, `SiftEngineTests`, `SiftUITests`. **37** of them carry the `remoteFact` prefix and
-are gated behind `SIFT_REMOTE_FACTS=1`, so the default run is offline: those are the ones allowed to
-`INSTALL` an extension over the network, and CI runs them as a separate step.
+`Tests/**` is the source of truth for behavior — **936** declared across `DuckDBKitTests`,
+`SiftCoreTests`, `SiftEngineTests`, `SiftUITests`. **39** of them carry the `remoteFact` prefix and
+are gated behind `SIFT_REMOTE_FACTS=1`: those are the ones allowed to `INSTALL` an extension over
+the network, and CI runs them as a separate step.
+
+🔴 **"Offline" means the default run makes no REQUEST, not that it passes without one**, and the
+distinction is load-bearing: for the whole of Phase 1 the suite was offline-tolerant (its assertions
+were written `!= nil` rather than `== .loaded`) while a dozen ungated tests fetched `httpfs` and
+`azure` from `extensions.duckdb.org` on any machine that did not already have them. Two rules keep
+it true now. A test that builds a **permissive** `Session`, or that needs `CREATE SECRET` to bind,
+is gated on `extensionIsInstalled(_:)` — a bare `LOAD` against a `harden()`ed scratch database,
+which answers from disk in microseconds and can never install. And `Database.networkInstalls`
+records every name an `INSTALL` was issued for, so a test can assert what the process DID rather
+than what is on disk afterwards; "the extension is present" has two provenances and a warm cache
+makes them indistinguishable, which is exactly how a strict session's install survived the phase.
+
+**The one thing the default run can still install is `delta`/`excel`.** `Session.init` loads
+`sessionExtensions` in every posture, LOAD→INSTALL→LOAD, so a machine that has never had them
+fetches them the first time any test opens a `Session` — and so does the app, at launch, and so does
+`--verify`. That is pre-existing, it is what makes the gated xlsx/delta tests runnable on a cold CI
+runner, and closing it means installing lazily at the point a `.xlsx` or a `_delta_log/` is opened
+rather than at launch. Worth doing; it is a product change, not a test fix.
 **Never weaken a test to make a change pass.** If a test pins a symbol or an output string, that
 is a contract, not an accident. The suite runs fully **in parallel** and nothing is
 `.serialized`; a test that only passes serialized is a bug in the test.
@@ -39,16 +63,18 @@ optional. Temp paths go through `Tests/TestSupport`'s `TestTemp` — a bare
 
 ```bash
 ./scripts/fetch-duckdb.sh          # once, needs network — the pinned prebuilt libduckdb
-swift build && swift test          # 910 declared, 37 gated off, ~30 s; warning-free is the bar
+swift build && swift test          # 936 declared, 39 gated off, ~30 s; warning-free is the bar
 swift run sift --verify            # the engine end to end: 26 checks, every format
-SIFT_REMOTE_FACTS=1 swift test     # + the 37 that may INSTALL httpfs/azure over the network
+SIFT_REMOTE_FACTS=1 swift test     # + the 39 that may INSTALL an extension over the network
 ./build-app.sh                     # -> ./Sift.app; verify by MOVING it away from the repo
 ```
 
-`--verify` reaches nothing off the machine: its five remote checks run against
+`--verify`'s five remote checks reach nothing off the machine: they run against
 `LoopbackHTTPServer`, each caps its own `http_timeout`/`http_retries`, and each skips with a
 sentence when `httpfs` is not already installed rather than reaching for it. A check that cannot
-run is not a check that passed.
+run is not a check that passed. The command as a whole is not airtight — every workspace `Session`
+it builds can `INSTALL delta`/`excel`, per the note above — and unlike `swift test` that is
+defensible: `--verify` is what a user runs to check their own install.
 
 After any engine or UI change, exercise it end to end against a **multi-million-row file** —
 several real bugs here were invisible on small files. The window cannot be screenshotted on this
@@ -66,8 +92,9 @@ CI rather than trusting a local green build.
   staging policy, snippets. Logic goes here, where it costs milliseconds to test.
 - `Sources/SiftEngine/Session.swift` is the **only** stateful module: an actor owning the
   catalog, background jobs, staging, profiling. Read its header before touching concurrency —
-  the `pagingConnection` invariant (six users, no suspension between acquire and last use) is
-  measured, load-bearing, and documented there.
+  the `pagingConnection` invariant (**eight** users, no suspension between acquire and last use)
+  is measured, load-bearing, and documented there — and the count is part of the contract, because
+  it said six through the two commits that made it eight.
 - `Sources/DuckDBKit/` wraps the C API: `Database`, `Connection`, chunk decoding, `harden()`.
 - `Sources/SiftUI/` is every view and view-model; `Sources/SiftApp/` is `@main` + menus +
   LaunchServices **and is untestable by construction** (a test target cannot import an

@@ -243,12 +243,19 @@ extension Session {
     /// `Database` was opened with (frozen — §2), and the switch as it stands now.
     private var remoteUsableNow: Bool { allowRemoteAtLaunch && remoteConfig.allowRemote }
 
-    /// Save a connection: Keychain first, then the file, then the extension, then the live secret.
+    /// Save a connection: Keychain first, then the file — and then, **only on a session that
+    /// started permissive**, the extension and the live secret.
     ///
     /// **The order is a failure-mode argument.** A Keychain item with no config entry is an orphan
     /// nobody ever reads; a config entry with no credential is a connection that looks saved and
     /// does not work. So the credential goes down first, and a failure to persist the config takes
     /// it back out again.
+    ///
+    /// The two halves after the file are gated on `remoteUsableNow` and the long comment at that
+    /// line says why for both. In one sentence: a strict session can neither install an extension
+    /// (that is an outbound request the posture forbids) nor register a secret without one
+    /// (RE-MEASURED — the "`CREATE SECRET` needs no extension" fact this method used to cite was
+    /// taken from an un-`harden()`ed `Database` that autoloaded behind the measurement).
     ///
     /// The FIRST connection turns the master switch on in the file — saving one is the user asking
     /// for remote — but see `ConnectionOutcome`: it cannot turn it on in this engine.
@@ -297,10 +304,43 @@ extension Session {
         }
         remoteConfig = next
 
-        // Only when the switch is on: `installExtension` falls through to `INSTALL`, which is
-        // outbound network, and a session the user has told to stay local must not make one.
-        var extensionIssue: String?
-        if next.allowRemote {
+        // 🔴 **`remoteUsableNow`, NOT `next.allowRemote`, and the difference is the whole bug this
+        // line was.** `installExtension` falls through to `INSTALL`, which is an outbound request to
+        // `extensions.duckdb.org`. The old gate was the CONFIG — which this method had set to `true`
+        // fifteen lines earlier — so the very first connection a user ever saved, on the
+        // fresh-install session that is strict by construction, made that request on behalf of a
+        // posture that forbids exactly it. MEASURED: `disabled_filesystems` gates DuckDB's VFS and
+        // not its extension installer, so the call also SUCCEEDED, and on a machine that cannot
+        // reach the repository it is a synchronous DuckDB call on the actor — `addConnection`
+        // freezes the whole `Session` for DuckDB's HTTP timeout × retries.
+        //
+        // Nothing is lost by waiting: this save is `.activeAfterRelaunch`, and the relaunch's
+        // `remoteExtensions(for:)` does the install in the permissive posture where it belongs.
+        //
+        // 🔴 **The SECRET is inside this gate too, and that is a correction to a measured fact this
+        // file used to state.** The old comment here read "MEASURED (Task 4, on a bare 1.5.5 with
+        // nothing loaded and no network): `CREATE SECRET` needs no extension to PARSE, bind and
+        // register — only to be USED." **That is false, and it was measured on a `Database` that
+        // had not been `harden()`ed** — DuckDB's own `autoload_known_extensions` defaults to `true`,
+        // so the engine silently autoloaded (and on a cold machine autoINSTALLED) the extension the
+        // statement needed. Sift's `harden()` sets it to `false` in EVERY posture, so the product
+        // never gets that rescue. RE-MEASURED against the vendored 1.5.5, hardened, nothing loaded:
+        //
+        //     TYPE s3    -> Invalid Input Error: Secret type 's3' does not exist, but it exists in
+        //                   the httpfs extension.
+        //     TYPE azure -> Invalid Input Error: Secret type 'azure' does not exist, but it exists
+        //                   in the azure extension.
+        //     TYPE azure, PROVIDER credential_chain -> …provider 'credential_chain' … does not
+        //                   exist, but it exists in the azure extension.
+        //
+        // So on a strict session there is no shape of connection whose secret can register, and the
+        // only thing issuing one could produce is a DuckDB sentence about a missing extension —
+        // which is a worse way of saying `.activeAfterRelaunch`, and which `connectionRowState`
+        // ranks ABOVE the relaunch sentence, so it would paint the row red for a save that went
+        // perfectly. The credential is in the Keychain and the config is on disk; the next launch's
+        // `issueSecrets` puts it on an engine that can hold it.
+        if remoteUsableNow {
+            var extensionIssue: String?
             switch installExtension(extensionName(for: spec.kind)) {
             case .loaded:
                 extensionIssue = nil
@@ -311,14 +351,12 @@ extension Session {
                 extensionIssue = "Sift asked DuckDB for an extension name it cannot use "
                     + "(\(extensionName(for: spec.kind))) \u{2014} this is a bug in Sift."
             }
+            // The extension is loaded by the line above, so the secret can actually register — and
+            // the secret's own failure is the more actionable of the two when both went wrong.
+            let con = try engineConnection()
+            secretIssues[spec.id] =
+                Self.issueSecret(con, spec, service: keychainService) ?? extensionIssue
         }
-
-        // MEASURED (Task 4, on a bare 1.5.5 with nothing loaded and no network): `CREATE SECRET`
-        // needs no extension to PARSE, bind and register — only to be USED. So the credential goes
-        // live here whatever the extension did, and the secret's own failure is the more actionable
-        // of the two when both went wrong.
-        let con = try engineConnection()
-        secretIssues[spec.id] = Self.issueSecret(con, spec, service: keychainService) ?? extensionIssue
         return remoteUsableNow ? .active : .activeAfterRelaunch
     }
 
@@ -391,6 +429,16 @@ extension Session {
     /// different sentences for the user. `.rejectedName` is a Sift bug, never a user-fixable state.
     ///
     /// Idempotent and cheap when the extension is already loaded, which is the common call.
+    ///
+    /// 🔴 **Every caller is responsible for the posture, because this method cannot see it.** An
+    /// `INSTALL` is the one outbound request Sift makes, and `harden()` does not stop it — the
+    /// disabled-filesystem set gates DuckDB's VFS, not its extension installer. There are exactly
+    /// three call sites and all three are gated on a session that started PERMISSIVE:
+    /// `addConnection` above (`remoteUsableNow`), `Session.checkRemoteExtension` (unreachable on a
+    /// strict session — `buildRemoteOpen` throws "not allowed to reach the network" first), and the
+    /// Connections sheet's Install button (only rendered for `.extensionMissing`, which
+    /// `connectionRowState` produces only when `usableNow`). A fourth call site has to earn its own
+    /// gate; there is no guard here to fall back on.
     ///
     /// ⚠️ This is the only post-`init` writer of `Database.loadedExtensions`, whose header notes the
     /// dictionary is unsynchronized because it is written at configure time and read afterwards.

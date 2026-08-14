@@ -719,3 +719,4 @@ final class LoopbackServer: @unchecked Sendable {
         return reply(200, "OK", acceptRanges, body)
     }
 }
+

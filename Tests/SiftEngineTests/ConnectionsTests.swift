@@ -18,10 +18,35 @@ import TestSupport
 // `Session.keychainService` exists for — the same split `KeychainTests` makes one layer down, so no
 // test run can add, overwrite or delete a credential a user actually saved.
 //
-// Nothing here needs the network. `CREATE SECRET` parses, binds and registers on a bare 1.5.5 with
-// no extension loaded (MEASURED, Task 4), so the whole secret lifecycle is checkable offline; the
-// one thing that is not — a remote read actually working — is `--verify`'s `remote connection`
-// check and `RemotePostureTests`, both gated behind `SIFT_REMOTE_FACTS=1`.
+// 🔴 **Nothing here makes a request, and the gate below is what makes that true rather than
+// merely likely.** The secret lifecycle itself is offline — `CREATE SECRET` parses, binds and
+// registers on a bare 1.5.5 with no extension loaded (MEASURED, Task 4) — and a remote read
+// actually working is `--verify`'s `remote connection` check and `RemotePostureTests`, both gated
+// behind `SIFT_REMOTE_FACTS=1`.
+//
+// But a PERMISSIVE `Session` is not offline by itself: `Session.init` asks for `httpfs` (and
+// `azure` when a saved connection needs it), `Database.loadExtensions` does LOAD → INSTALL → LOAD,
+// and the header this replaced said "nothing here needs the network" while a dozen tests below
+// fetched two binaries from `extensions.duckdb.org` on any machine that did not already have them.
+// That the assertions were all written `!= nil` rather than `== .loaded` meant the suite PASSED
+// offline; AGENTS.md's contract is that it makes no REQUEST, which is a different and stronger
+// claim. Every test that plants `allowRemote: true` now carries `permissivePostureIsOffline`.
+
+/// Is this machine already carrying what a permissive `Session` will ask DuckDB for?
+///
+/// `extensionIsInstalled` is a bare `LOAD` against a `harden()`ed scratch database — no `INSTALL`
+/// behind it — so the answer costs microseconds and no packets. Both names, together and once: the
+/// two are installed as a pair (CI's remote-facts canary is the one step that fetches them), and one
+/// condition that reads "this machine is prepared for the permissive posture" beats two that make a
+/// reader work out which test needed which binary.
+private let permissivePostureIsOffline =
+    extensionIsInstalled("httpfs") && extensionIsInstalled("azure")
+private let permissiveSkip: Comment = "duckdb httpfs/azure extensions not installed"
+
+/// The env gate every other file in this target declares for itself — `SIFT_REMOTE_FACTS=1`, CI's
+/// separate canary step. One test below needs it; SwiftPM test targets share a module, so this is
+/// the same `private let` five other files already carry rather than a new mechanism.
+private let remoteFacts = ProcessInfo.processInfo.environment["SIFT_REMOTE_FACTS"] == "1"
 
 private let testService = Keychain.service + ".connections-test"
 
@@ -163,7 +188,8 @@ private let keychainUsable: Bool = {
 /// extensions are asked for. `.loaded` is deliberately not asserted — that needs a network INSTALL
 /// on an unprepared machine, and it is what the gated `--verify` check is for. What IS asserted is
 /// that Sift ASKED, which is the decision this file makes.
-@Test func aSavedAllowRemoteDecidesThePostureAndTheExtensionsAtLaunch() async throws {
+@Test(.enabled(if: permissivePostureIsOffline, permissiveSkip))
+func aSavedAllowRemoteDecidesThePostureAndTheExtensionsAtLaunch() async throws {
     let home = newHome()
     _ = try plantConfig(home, RemoteConfig(allowRemote: true, connections: [chainSpec()]))
     let session = try newSession(home)
@@ -181,7 +207,8 @@ private let keychainUsable: Bool = {
 }
 
 /// `azure` costs a second binary to fetch, so it is asked for only when something needs it.
-@Test func azureIsNotLoadedForAnS3OnlyConfig() throws {
+@Test(.enabled(if: permissivePostureIsOffline, permissiveSkip))
+func azureIsNotLoadedForAnS3OnlyConfig() throws {
     let home = newHome()
     _ = try plantConfig(home, RemoteConfig(allowRemote: true, connections: [s3Spec()]))
     let session = try newSession(home)
@@ -196,7 +223,8 @@ private let keychainUsable: Bool = {
 /// gone — deleted by hand in Keychain Access, or restored from a backup without the keychain — has
 /// nothing to bind, so `createSecretSQL` produces nothing. That is a broken connection and the user
 /// has to be told, but it is not a reason for a window full of local CSVs to refuse to open.
-@Test func aMissingCredentialIsRecordedAgainstItsConnectionAndTheSessionStillStarts() async throws {
+@Test(.enabled(if: permissivePostureIsOffline, permissiveSkip))
+func aMissingCredentialIsRecordedAgainstItsConnectionAndTheSessionStillStarts() async throws {
     let home = newHome()
     let spec = s3Spec(name: "no-key-here")
     _ = try plantConfig(home, RemoteConfig(allowRemote: true, connections: [spec]))
@@ -215,7 +243,8 @@ private let keychainUsable: Bool = {
 
 /// The healthy half of the same path: `credentialChain` stores nothing on purpose, so an absent
 /// Keychain item is the CORRECT state for it and must not be reported as a problem.
-@Test func aCredentialChainConnectionIssuesWithNoKeychainItemAtAll() async throws {
+@Test(.enabled(if: permissivePostureIsOffline, permissiveSkip))
+func aCredentialChainConnectionIssuesWithNoKeychainItemAtAll() async throws {
     let home = newHome()
     let spec = chainSpec()
     _ = try plantConfig(home, RemoteConfig(allowRemote: true, connections: [spec]))
@@ -238,11 +267,26 @@ private let keychainUsable: Bool = {
 
 // MARK: - the operations
 
-/// 🔴 **The measured outcome.** Saving the first connection on a strict session writes the file,
-/// flips the master switch in it, and registers the credential — and the engine still refuses the
-/// read, because MEASURED (§2) `disabled_filesystems` cannot be narrowed inside a live `Database`.
-/// `.activeAfterRelaunch` is that fact as a return value rather than a comment: the UI's move is
-/// "reopen Sift", never "try again".
+/// 🔴 **The measured outcome.** Saving the first connection on a strict session writes the file and
+/// flips the master switch in it — and the engine still refuses the read, because MEASURED (§2)
+/// `disabled_filesystems` cannot be narrowed inside a live `Database`. `.activeAfterRelaunch` is that
+/// fact as a return value rather than a comment: the UI's move is "reopen Sift", never "try again".
+///
+/// 🔴 **`secretCount == 0` is a CORRECTION, and it is a stronger claim than the `== 1` it replaces.**
+/// That `1` was real, and it was produced by the defect: `addConnection` installed the `azure`
+/// extension over the network first — on the one session whose whole point is not making a request —
+/// and the secret then registered because the extension was there. RE-MEASURED on a `harden()`ed
+/// 1.5.5 with nothing loaded, every shape Sift issues is refused:
+/// `Invalid Input Error: Secret type 'azure' does not exist, but it exists in the azure extension.`
+/// (and the same for `s3`/httpfs, and for `PROVIDER credential_chain`). The old header of this file
+/// and three other comments cited the opposite as MEASURED; that measurement was taken on a
+/// `Database.inMemory()` with no `harden()`, whose `autoload_known_extensions` is DuckDB's default
+/// `true`, so DuckDB loaded the extension behind the measurement.
+///
+/// So the honest state of a strict save is: the file has it, the Keychain has it, the ENGINE has
+/// nothing, and the outcome says so. `connectionIssues()` stays empty rather than carrying DuckDB's
+/// missing-extension sentence, because `connectionRowState` ranks an issue above
+/// `.readyAfterRelaunch` and would paint a perfectly good save red.
 @Test func theFirstConnectionTurnsRemoteOnInTheFileAndNotInThisEngine() async throws {
     let home = newHome()
     let session = try newSession(home)
@@ -256,8 +300,9 @@ private let keychainUsable: Bool = {
     #expect(saved.allowRemote == true)
     #expect(saved.connections == [spec])
     #expect(await session.connections() == saved, "the in-memory config drifted from the file")
-    // …the credential is live on the engine…
-    #expect(try secretCount(session) == 1)
+    // …the engine holds nothing, and does not complain about holding nothing…
+    #expect(try secretCount(session) == 0,
+            "a strict engine registered a secret only a forbidden extension fetch could create")
     #expect(await session.connectionIssues().isEmpty)
     // …and the posture did not move.
     #expect(session.allowRemoteAtLaunch == false)
@@ -281,8 +326,57 @@ private let keychainUsable: Bool = {
             "expected the strict engine to refuse the read; got: \(message)")
 }
 
+/// 🔴 **The half the test above could not see: a strict save must not touch `extensions.duckdb.org`.**
+///
+/// `addConnection` used to gate its `installExtension` on `next.allowRemote` — the CONFIG, which it
+/// had set to `true` fifteen lines earlier — instead of on the POSTURE. So the very first connection
+/// a user ever saved, on the fresh-install session that is strict by construction, ran
+/// LOAD → INSTALL → an outbound request, on behalf of a session whose whole point is not making one.
+/// `disabled_filesystems` does not stop it: it gates DuckDB's VFS, not its extension installer.
+///
+/// Two assertions, because "the extension is present" has two provenances and only one of them is a
+/// network call:
+///
+///  * `loadedExtensions["azure"] == nil` is the fourth `ExtensionState` — **never asked** — and it
+///    is the one that fails on a warm machine, where `LOAD azure` succeeds from
+///    `~/.duckdb/extensions` and the `INSTALL` branch is never reached. Every machine this suite has
+///    ever run on is warm, which is exactly why nothing caught this.
+///  * `networkInstalls` unchanged across the call is the same claim on a COLD machine, where the
+///    request actually leaves. Compared against a snapshot rather than against `[]` because
+///    `Session.init` legitimately installs `delta`/`excel` on a machine that has never run Sift, and
+///    this test is about what `addConnection` decided, not about what the process arrived carrying.
+@Test func savingTheFirstConnectionOnAStrictSessionInstallsNothing() async throws {
+    let session = try newSession(newHome())
+    let before = session.database.networkInstalls
+
+    #expect(try await session.addConnection(chainSpec(name: "first"), secret: nil)
+        == .activeAfterRelaunch)
+
+    #expect(session.database.loadedExtensions["azure"] == nil,
+            "a session that started strict asked DuckDB for the azure extension")
+    #expect(session.database.networkInstalls == before,
+            "a session that started strict installed \(session.database.networkInstalls) over the network")
+}
+
+/// The other side of it: a session that STARTED permissive is allowed to fetch what it just saved,
+/// and the row it produces has to be able to say the extension is missing. Asserted as "Sift asked",
+/// never as `.loaded` — `.loaded` needs a binary this machine may not have, which is the gated
+/// `--verify` check's job.
+@Test(.enabled(if: permissivePostureIsOffline, permissiveSkip))
+func savingAConnectionOnAPermissiveSessionAsksForItsExtension() async throws {
+    let home = newHome()
+    _ = try plantConfig(home, RemoteConfig(allowRemote: true))
+    let session = try newSession(home)
+
+    _ = try await session.addConnection(chainSpec(name: "first"), secret: nil)
+
+    #expect(session.database.loadedExtensions["azure"] != nil,
+            "a permissive session did not ask for the extension the connection reads through")
+}
+
 /// The same operation on a session that STARTED permissive is `.active` — the connection works now.
-@Test func aConnectionAddedToAPermissiveSessionIsActiveImmediately() async throws {
+@Test(.enabled(if: permissivePostureIsOffline, permissiveSkip))
+func aConnectionAddedToAPermissiveSessionIsActiveImmediately() async throws {
     let home = newHome()
     _ = try plantConfig(home, RemoteConfig(allowRemote: true))
     let session = try newSession(home)
@@ -292,14 +386,22 @@ private let keychainUsable: Bool = {
 }
 
 /// Add → remove, through the Keychain and through `duckdb_secrets()`, on a real engine.
-@Test(.enabled(if: keychainUsable))
+///
+/// 🔴 **On a PERMISSIVE session, which is a correction and a strengthening.** This used to run on a
+/// strict one and assert `secretCount == 1`, and it passed only because `addConnection` installed
+/// `httpfs` over the network first — a strict engine cannot register a `TYPE s3` secret at all
+/// (RE-MEASURED; see `theFirstConnectionTurnsRemoteOnInTheFileAndNotInThisEngine`). So the
+/// add-and-drop of a live secret was never exercised on a posture that could hold one, and now it
+/// is: `.active` rather than `.activeAfterRelaunch` is asserted as part of the round trip.
+@Test(.enabled(if: keychainUsable && permissivePostureIsOffline, permissiveSkip))
 func addingAndRemovingAConnectionRoundTripsTheFileTheKeychainAndTheSecret() async throws {
     let home = newHome()
+    _ = try plantConfig(home, RemoteConfig(allowRemote: true))
     let session = try newSession(home)
     let spec = s3Spec(name: "round trip")
     defer { try? Keychain.delete(account: spec.id.uuidString, in: testService) }
 
-    _ = try await session.addConnection(spec, secret: "SUPERSECRETKEY123")
+    #expect(try await session.addConnection(spec, secret: "SUPERSECRETKEY123") == .active)
 
     #expect(try readConfig(home).connections == [spec])
     #expect(try Keychain.get(account: spec.id.uuidString, in: testService)
@@ -337,7 +439,8 @@ func addingAndRemovingAConnectionRoundTripsTheFileTheKeychainAndTheSecret() asyn
 
 /// Revoking: the file changes, the credentials go away NOW, and the engine stays permissive until
 /// the next launch. Three separate claims, and only the middle one is immediate.
-@Test func revokingDropsTheSecretsButLeavesTheEnginePermissiveUntilRelaunch() async throws {
+@Test(.enabled(if: permissivePostureIsOffline, permissiveSkip))
+func revokingDropsTheSecretsButLeavesTheEnginePermissiveUntilRelaunch() async throws {
     let home = newHome()
     _ = try plantConfig(home, RemoteConfig(allowRemote: true, connections: [chainSpec()]))
     let session = try newSession(home)
@@ -467,18 +570,43 @@ func aConfigThatCannotBeSavedTakesTheCredentialBackOut() async throws {
 
 // MARK: - installExtension
 
-@Test func installExtensionReportsTheThreeStates() async throws {
+/// The two states that cost nothing to reach. `.unavailable` is the third and it is below, gated —
+/// see that test for why it cannot live here.
+@Test func installExtensionReportsTheLoadedAndRejectedStates() async throws {
     let session = try newSession(newHome())
+    let before = session.database.networkInstalls
 
     // Already loaded at launch, so this is the cheap path and must not re-LOAD anything.
     #expect(await session.installExtension("delta") == .loaded)
-    // A name that cannot be a DuckDB extension is a Sift bug, not a user-fixable state.
+    // A name that cannot be a DuckDB extension is a Sift bug, not a user-fixable state. Rejected by
+    // the name guard, so it never reaches DuckDB at all — the assertion below says so rather than
+    // trusting it.
     #expect(await session.installExtension("httpfs; ATTACH 'evil.db'") == .rejectedName)
-    // A legal name with no binary anywhere. `.unavailable` carries DuckDB's own first line.
+
+    #expect(session.database.networkInstalls == before,
+            "neither of these two states may cost an INSTALL; got \(session.database.networkInstalls)")
+}
+
+/// 🔴 **The third state, and the one that cannot be reached offline.** `.unavailable` means LOAD and
+/// INSTALL both failed, so producing it needs an `INSTALL` — and `INSTALL no_such_extension_zzz` is a
+/// request to `extensions.duckdb.org` that comes back 404. That is a network call, which puts this
+/// test in the gated set by AGENTS.md's own rule ("those are the ones allowed to `INSTALL` an
+/// extension over the network") rather than in the default run, where it had been quietly living.
+///
+/// The `remoteFact` prefix is the `--filter` CI's canary step selects on, so this is a rename with a
+/// job, not a label.
+@Test(.enabled(if: remoteFacts))
+func remoteFactInstall_aLegalNameWithNoBinaryAnywhereIsUnavailableWithAReason() async throws {
+    let session = try newSession(newHome())
+
     let missing = await session.installExtension("no_such_extension_zzz")
     if case .unavailable(let why) = missing {
         #expect(!why.isEmpty, "an unavailable extension reported no reason")
     } else {
         Issue.record("expected .unavailable, got \(missing)")
     }
+    // The state and the act, separately: `.unavailable` is what Sift reports, and the INSTALL is
+    // what it did to find out. Nothing else in this file may append to that array.
+    #expect(session.database.networkInstalls.last == "no_such_extension_zzz",
+            "the INSTALL was not recorded; got \(session.database.networkInstalls)")
 }
