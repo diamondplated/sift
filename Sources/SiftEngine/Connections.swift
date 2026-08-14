@@ -185,17 +185,34 @@ extension Session {
     /// outlives the connection that created it and every sibling and every later connection can
     /// resolve it.
     static func issueSecrets(
-        _ con: Connection, config: RemoteConfig, service: String
+        _ con: Connection, config: RemoteConfig, service: String, register: Bool = true
     ) -> [UUID: String] {
         var issues: [UUID: String] = [:]
         for spec in config.connections {
-            issues[spec.id] = issueSecret(con, spec, service: service)
+            issues[spec.id] = issueSecret(con, spec, service: service, register: register)
         }
         return issues
     }
 
     /// `nil` when the secret is live on this engine; otherwise the first line of why not.
-    static func issueSecret(_ con: Connection, _ spec: ConnectionSpec, service: String) -> String? {
+    ///
+    /// 🔴 **`register: false` runs every check and skips only the `CREATE SECRET`,** and the split
+    /// is exactly where the two kinds of failure separate. Everything above the statement is
+    /// credential resolution — no Keychain item, an unreadable one, a `credentialChain` connection
+    /// with no account name — and those sentences are TRUE whatever the posture is: they name a
+    /// field to fill in or a credential to re-enter. The statement itself is the only line that can
+    /// fail *because of* the posture: `harden()` turns `autoload_known_extensions` off in every
+    /// posture, so on a strict session DuckDB answers `Secret type 'azure' does not exist, but it
+    /// exists in the azure extension` — a message about an extension, filed against a connection
+    /// that is fine, and `connectionRowState` ranks an issue ABOVE the relaunch sentence, so it
+    /// paints the row red for a save that went perfectly.
+    ///
+    /// Suppressing the whole call was the first fix and it was too much: it also threw away the
+    /// honest half, on the one posture EVERY user's first connection is saved under — so a typo'd
+    /// account name was accepted in silence and only surfaced after a relaunch.
+    static func issueSecret(
+        _ con: Connection, _ spec: ConnectionSpec, service: String, register: Bool = true
+    ) -> String? {
         let secret: String?
         do {
             secret = try Keychain.get(account: spec.id.uuidString, in: service)
@@ -218,6 +235,7 @@ extension Session {
             return "no credential is saved for \(spec.name) \u{2014} open Connections and enter it "
                 + "again."
         }
+        guard register else { return nil }
         do {
             _ = try con.query(sql, params.map(toDBValue))
         } catch let error as DuckDBError {
@@ -339,8 +357,8 @@ extension Session {
         // ranks ABOVE the relaunch sentence, so it would paint the row red for a save that went
         // perfectly. The credential is in the Keychain and the config is on disk; the next launch's
         // `issueSecrets` puts it on an engine that can hold it.
+        var extensionIssue: String?
         if remoteUsableNow {
-            var extensionIssue: String?
             switch installExtension(extensionName(for: spec.kind)) {
             case .loaded:
                 extensionIssue = nil
@@ -351,12 +369,22 @@ extension Session {
                 extensionIssue = "Sift asked DuckDB for an extension name it cannot use "
                     + "(\(extensionName(for: spec.kind))) \u{2014} this is a bug in Sift."
             }
-            // The extension is loaded by the line above, so the secret can actually register — and
-            // the secret's own failure is the more actionable of the two when both went wrong.
-            let con = try engineConnection()
-            secretIssues[spec.id] =
-                Self.issueSecret(con, spec, service: keychainService) ?? extensionIssue
         }
+        // 🔴 **Outside the posture gate, with `register:` inside it.** What the INSTALL above is
+        // gated on is the outbound request; what the checks below find — no credential saved, a
+        // `credentialChain` connection with no account name — is a mistake the user just made, in
+        // the form they just filled in. Every user's FIRST connection is saved on a strict session,
+        // so keeping these behind the gate meant the one save most likely to contain a typo was the
+        // one that accepted it in silence and reported it a relaunch later. `register` skips only
+        // the `CREATE SECRET`, which is the single line that can fail for the posture rather than
+        // for the connection — see `issueSecret`.
+        //
+        // On a permissive session the extension is loaded by the branch above, so the secret can
+        // really register, and its failure is the more actionable of the two when both went wrong.
+        let con = try engineConnection()
+        secretIssues[spec.id] =
+            Self.issueSecret(con, spec, service: keychainService, register: remoteUsableNow)
+            ?? extensionIssue
         return remoteUsableNow ? .active : .activeAfterRelaunch
     }
 
@@ -413,7 +441,15 @@ extension Session {
 
         let con = try engineConnection()
         if on {
-            secretIssues = Self.issueSecrets(con, config: next, service: keychainService)
+            // `register: remoteUsableNow` — the credential checks always run, the `CREATE SECRET`
+            // only on a session that can hold one. Turning this switch on from a strict session
+            // used to file DuckDB's "Secret type 'azure' does not exist" against every saved
+            // connection, and `connectionRowState` ranks an issue ABOVE the relaunch sentence, so
+            // the screen answered a perfect save with a message about extensions instead of
+            // "reopen Sift" — which is what `.activeAfterRelaunch` below already says. What the
+            // user actually broke still reaches them; see `issueSecret`.
+            secretIssues = Self.issueSecrets(
+                con, config: next, service: keychainService, register: remoteUsableNow)
         } else {
             // Same best-effort reasoning as `removeConnection`, one per saved connection.
             for spec in next.connections { try? con.execute(dropSecretSQL(spec)) }

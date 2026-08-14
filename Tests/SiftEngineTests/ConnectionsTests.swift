@@ -459,6 +459,54 @@ func revokingDropsTheSecretsButLeavesTheEnginePermissiveUntilRelaunch() async th
     #expect(try readConfig(home).allowRemote == true)
 }
 
+/// Turning the switch ON from a strict session reports the relaunch and says **nothing else**.
+///
+/// 🔴 The bug this pins painted every saved row red for an operation that went perfectly.
+/// `issueSecrets` ran unconditionally, and on a strict session no secret can register at all —
+/// `harden()` turns `autoload_known_extensions` off in every posture, so `CREATE SECRET` answers
+/// `Secret type 'azure' does not exist, but it exists in the azure extension`. That sentence landed
+/// in `connectionIssues()`, which `connectionRowState` ranks ABOVE the relaunch sentence, so the
+/// screen replaced "reopen Sift" with a DuckDB message about extensions.
+///
+/// The assertion is on the DECISION — issues empty, secrets zero, outcome `.activeAfterRelaunch` —
+/// rather than on the text, because the failure was a real message about a real missing extension:
+/// asserting it is absent is the only thing that separates "nothing was attempted" from "something
+/// was attempted and happened to succeed".
+@Test func turningRemoteOnFromAStrictSessionReportsTheRelaunchAndNothingElse() async throws {
+    let home = newHome()
+    _ = try plantConfig(home, RemoteConfig(allowRemote: false, connections: [chainSpec()]))
+    let session = try newSession(home)
+    #expect(try secretCount(session) == 0, "a strict session started with a live secret")
+
+    #expect(try await session.setAllowRemote(true) == .activeAfterRelaunch)
+    #expect(try readConfig(home).allowRemote == true, "the switch has to survive the relaunch")
+    #expect(
+        await session.connectionIssues().isEmpty,
+        "the row was blamed for a failure that is just the posture it was saved under")
+    #expect(try secretCount(session) == 0, "a secret registered on a session that cannot use it")
+}
+
+/// …and the other half, which is why the fix is `register:` and not "issue nothing when strict".
+///
+/// 🔴 A connection the USER got wrong still says so on a strict session. Every user's first
+/// connection is saved under exactly this posture, so the save most likely to contain a typo is the
+/// one that must not accept it in silence. `credentialChain` with no account name is the shape that
+/// fails before DuckDB is asked anything, which is precisely the half `register: false` keeps.
+@Test func aConnectionTheUserGotWrongStillSaysSoOnAStrictSession() async throws {
+    let session = try newSession(newHome())
+    let broken = ConnectionSpec(
+        kind: .azure, name: "no-account", accountName: nil, azureAuth: .credentialChain)
+
+    #expect(try await session.addConnection(broken, secret: nil) == .activeAfterRelaunch)
+    let sentence = try #require(
+        await session.connectionIssues()[broken.id],
+        "a connection with no account name was accepted in silence")
+    #expect(sentence.contains("no-account"), "\(sentence)")
+    #expect(
+        !sentence.lowercased().contains("extension"),
+        "the user's mistake was reported as a missing extension: \(sentence)")
+}
+
 /// Asking for the posture the engine already has is `.active` — there is nothing to relaunch for.
 @Test func settingTheSwitchToThePostureTheEngineAlreadyHasIsActive() async throws {
     let session = try newSession(newHome())
