@@ -6,90 +6,102 @@ how to prove you didn't.
 
 ## What Sift is
 
-A local Mac tool: drop a file in, explore it instantly. A **Swift + WKWebView shell** (native
-window, vibrant sidebar, toolbar) over a **FastAPI + DuckDB engine** it runs as a sidecar, with the
-UI as one hand-written `web/index.html`. DuckDB reads files **in place**, so size is not the
-constraint. Sift touches **no live system** — local files only, no credentials, no network egress,
-bound to `127.0.0.1`.
+A native Mac tool: drop a file in, explore it instantly. **One SwiftPM package, one binary** —
+SwiftUI/AppKit window over a Swift engine (`Session`, an actor) over a vendored `libduckdb`.
+No Python, no server, no web view: the 2026 rewrite deleted all three. DuckDB reads files
+**in place**, so size is not the constraint. Sift touches **no live system** — local files only,
+no credentials, no network egress. There is no port to bind because there is no server.
 
 ## The one rule: tests are the spec
 
-Nearly all of that ~28 s is two DuckDB-bound tests (timezone data load ~18 s, Delta fixture ~9 s);
-216 of the 218 are under 10 ms. `-k "not delta and not timestamptz"` is the `core/` loop at ~10 s —
-the floor is the session fixture's extension load, not the tests.
+`Tests/**` is the source of truth for behavior — ~730 tests across `DuckDBKitTests`,
+`SiftCoreTests`, `SiftEngineTests`, `SiftUITests`. **Never weaken a test to make a change
+pass.** If a test pins a symbol or an output string, that is a contract, not an accident. The
+suite runs fully **in parallel** and nothing is `.serialized`; a test that only passes
+serialized is a bug in the test.
 
-`engine/tests/**` is the source of truth for engine behavior. It is **read-only** — never weaken a
-test to make a change pass. If a test pins a symbol or output string, that is a contract, not an
-accident (several tests import internals like `core.sqlgen._safe_type`). Behavior parity is the
-bar for any refactor.
+The house bar is **mutation**: when you add a guard, delete it on purpose and confirm its test
+goes red. This branch caught 15+ tests that passed while guarding nothing; the discipline is not
+optional. Temp paths go through `Tests/TestSupport`'s `TestTemp` — a bare
+`FileManager.default.temporaryDirectory` write is how this suite once leaked 24 GB.
 
 ## How to build, test, verify — run these, don't assume
 
 ```bash
-cd sift
-.venv/bin/python -m pytest engine/tests -q                 # 218 tests, ~28s. Must stay green.
-.venv/bin/python -c "import sys;sys.path.insert(0,'engine');import app;print(len(app.app.routes))"
-sed -n '/^<script>/,/^<\/script>/p' web/index.html | sed '1d;$d' | node --check /dev/stdin
-( cd shell && swift build -c release )                     # native shell; no Xcode needed
-./scripts/fetch-duckdb.sh && ./build-app.sh                # -> ./Sift.app, then relaunch it
+./scripts/fetch-duckdb.sh          # once, needs network — the pinned prebuilt libduckdb
+swift build && swift test          # ~730 tests, ~30 s, warning-free is the bar
+swift run sift --verify            # the engine end to end: 20 checks, every format
+./build-app.sh                     # -> ./Sift.app; verify by MOVING it away from the repo
 ```
-The web layer is identical in browser mode (`dev.sh`, `NATIVE=false`) and the native shell, so
-verify UI logic in the browser preview; the native window can't be screenshotted here. After any
-engine or web change, exercise it end to end — don't trust a green unit run alone.
+
+After any engine or UI change, exercise it end to end against a **multi-million-row file** —
+several real bugs here were invisible on small files. The window cannot be screenshotted on this
+machine (no Screen Recording); the working capture is `cacheDisplay(in:to:)` on a live `NSView`,
+control-render-first. `ImageRenderer` is measurably unstable for pixel comparison — don't.
+
+**CI on macos-15 is the only SDK oracle.** This Mac carries a newer SDK and has accepted code
+the runner rejects (Sendable inference, system-color resolution) multiple times. Push and read
+CI rather than trusting a local green build.
 
 ## Architecture, and where the state lives
 
-- `engine/core/**` is **pure**: importable with no connection, no server, no module-level mutable
-  state. Identifier quoting, SQL generation, the SELECT-only gate, format detection, profiling,
-  staging policy, snippets. This is where logic goes and where it's cheap to test.
-- `engine/session.py` is the **only** stateful module: the one DuckDB connection, the catalog of
-  open tables, background jobs, SSE fan-out. Every request handler takes `con.cursor()` (the
-  connection is not thread-safe).
-- `engine/app.py` is thin: request → core/session call → JSON. Also the CLI + `--sidecar` mode.
-- `web/index.html` is the whole UI, no build step. `shell/` is the native window (Swift, zero deps).
+- `Sources/SiftCore/` is **pure, Foundation-only** (enforced by the package graph): identifier
+  quoting, SQL generation, the SELECT-only gate's pure half, format detection, profiling policy,
+  staging policy, snippets. Logic goes here, where it costs milliseconds to test.
+- `Sources/SiftEngine/Session.swift` is the **only** stateful module: an actor owning the
+  catalog, background jobs, staging, profiling. Read its header before touching concurrency —
+  the `pagingConnection` invariant (six users, no suspension between acquire and last use) is
+  measured, load-bearing, and documented there.
+- `Sources/DuckDBKit/` wraps the C API: `Database`, `Connection`, chunk decoding, `harden()`.
+- `Sources/SiftUI/` is every view and view-model; `Sources/SiftApp/` is `@main` + menus +
+  LaunchServices **and is untestable by construction** (a test target cannot import an
+  executable target) — nothing with a decision in it goes there. Same for `Sources/sift/`
+  (the CLI): logic lives in `SiftEngine/Verification.swift`.
 
 ## Frozen contracts — changing these breaks the app silently
 
-- Every HTTP path + JSON shape in `app.py`; the `__SIFT_TOKEN__` / `__SIFT_MAX_UPLOAD_MB__` /
-  `__SIFT_NATIVE__` page placeholders; the `window.sift*` JS bridge functions; the sidecar stdout
-  handshake `{port, token}`; the `WKScriptMessageHandler` `"sift"` message shapes.
-- Security/safety: the SELECT-only guard **plus** the newline subquery-wrap (that wrap is the real
-  enforcement — a keyword blocklist is not); disabled network filesystems; per-launch token + Host
-  pinning; `127.0.0.1`-only bind; `~/.sift` at `0700`; spill sweep; the parent-death watcher;
-  the atomic view→table swap; staged-data age-out/budget.
-- Data truth: NULL vs `''` vs `'N/A'` stay distinct (`allow_quoted_nulls=false`); `ignore_errors`
-  + `TRY_CAST` bad-row accounting; exact counts via the all-varchar relation, never a bare
-  `count(*)` on the typed view; wide ints / decimals cross the wire as **strings**; approx-distinct
-  is clamped; a `_delta_log/` dir is read via `delta_scan`, never a raw parquet glob.
+- Security/safety: the SELECT-only guard **plus** the newline subquery-wrap (the wrap is the
+  real enforcement — a keyword blocklist is not); `harden()`'s four settings incl. disabled
+  network filesystems; `~/.sift` at `0700`; the atomic view→table swap; staged-data
+  age-out/budget; one `Session` per home (`OpenHomes` — two on one home are two databases
+  overwriting each other).
+- Data truth: NULL vs `''` vs `'N/A'` stay distinct end to end (`allow_quoted_nulls=false`,
+  `glyph(for:kind:)` — the UI never calls `Cell.display`); `ignore_errors` + `TRY_CAST`
+  bad-row accounting; exact counts via the all-varchar relation, never a bare `count(*)` on
+  the typed view; approx-distinct is clamped; a `_delta_log/` dir is read via `delta_scan`,
+  never a raw parquet glob; cell rendering lives in the engine so the app and the CLI cannot
+  disagree; no `NumberFormatter`/`DateFormatter`/`ISO8601DateFormatter` anywhere user-visible
+  (four locale bugs shipped that way, one deleted user data).
+- Every engine error is **one clean sentence** (`SiftError.description`) — never a parser dump,
+  never swallowed with `try?`. That contract was broken and repaired four times; don't be five.
 
 ## DuckDB 1.5.5 facts this code depends on (re-verify before bumping the pin)
 
-- `sniff_csv` reports an absent quote/escape/comment as the literal string `'(empty)'` — normalize
-  it to `''` before feeding it back to `read_csv`.
-- `reject_scans()` / `reject_errors()` **do not exist**; bad rows are found with `TRY_CAST` against
-  an all-varchar read instead.
-- `count(*)` on a CSV view uses projection pushdown and ignores uncastable rows, so it disagrees
-  with `SELECT *`. Count the all-varchar relation.
-- `read_xlsx` takes `sheet =>` (not `sheet_name`) and can't list sheets — hence openpyxl.
-- `pytz` is **required**: without it, fetching a `TIMESTAMP WITH TIME ZONE` value raises.
-- Delta time travel is `version => n`; `AT (VERSION => n)` does not parse.
-- The `delta` and `excel` extensions need one online `INSTALL`; autoloading is deliberately off.
-- `approx_count_distinct` overshoots: HyperLogLog reports **340** for 300 distinct values, hence
-  the clamp in `core/profile.py`.
-- `duckdb_tables().estimated_size` is a **row count, not bytes** — it read "3,000,048 B" for a
-  3M-row table, which is why staged bytes are measured as growth of `stage.duckdb` instead.
+Pinned executable in `Tests/DuckDBKitTests/DuckDB155FactsTests.swift` and re-verified against
+the vendored dylib — not folklore:
 
-**Re-verified 2026-08-09 against `libduckdb` 1.5.5 (the C API), not the Python wheel** — seven of
-the nine directly, in `Tests/DuckDBKitTests/DuckDB155FactsTests.swift`. All seven still hold,
-including `approx_count_distinct` = 340 for 300 distinct values, measured through the C API. The
-two needing fixtures (`read_xlsx`'s `sheet =>`, Delta time travel) are re-probed in the plan that
-builds those fixtures; a test pointed at a nonexistent path passes for the missing file, not for
-the behavior. One fact **changes** under the rewrite: `pytz` is a Python-wheel requirement only, so
-it disappears with the sidecar.
+- `sniff_csv` reports an absent quote/escape/comment as the literal string `'(empty)'` —
+  normalize before feeding it back to `read_csv`.
+- `reject_scans()` / `reject_errors()` **do not exist**; bad rows are found with `TRY_CAST`
+  against an all-varchar read.
+- `count(*)` on a CSV view uses projection pushdown and ignores uncastable rows, so it
+  disagrees with `SELECT *`. Count the all-varchar relation.
+- `read_xlsx` takes `sheet =>` (not `sheet_name`) and can't list sheets — hence
+  `XLSXSheets.swift` parsing the OOXML directly.
+- Delta time travel is `version => n`; `AT (VERSION => n)` does not parse.
+- The `delta` and `excel` extensions need one online `INSTALL` (`loadExtensions` does
+  LOAD→INSTALL→LOAD); autoloading is deliberately off.
+- `approx_count_distinct` overshoots (340 for 300 distinct) — clamped in the profile.
+- `duckdb_tables().estimated_size` is a **row count, not bytes** — staged bytes are measured
+  from storage blocks instead.
+- `duckdb_interrupt` before execution starts is **swallowed**; cancelling means hammering it
+  in a loop until the job reports stopped (`StageJob`).
+- `sortedRelation`'s TEMP TABLE is visible only to the connection that created it — the reason
+  `pagingConnection` exists at all.
 
 ## Style
 
-Ponytail is on: prefer the shortest change that keeps behavior, delete over add, reuse what's here.
-But never simplify away validation, security, error handling, or accessibility, and never delete a
-comment that records a **measured fact** (the probe results above) — compress it if you must, keep
-the fact. Cuts, not churn: don't reformat code you're keeping, don't rename public symbols.
+Ponytail is on: prefer the shortest change that keeps behavior, delete over add, reuse what's
+here. But never simplify away validation, security, error handling, or accessibility, and never
+delete a comment that records a **measured fact** — compress it if you must, keep the fact.
+Cuts, not churn: don't reformat code you're keeping, don't rename public symbols.

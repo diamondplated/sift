@@ -3,13 +3,13 @@
 <p align="center"><strong>Drop a file in. Explore it instantly.</strong></p>
 
 <p align="center">
-  A local Mac explorer for data files — schema, profile, grid, and distinct values,<br>
+  A native Mac explorer for data files — schema, profile, grid, and distinct values,<br>
   on files far too big to open any other way.
 </p>
 
 <p align="center">
-  <a href="https://github.com/diamondplated/sift/actions/workflows/ci.yml"><img src="https://github.com/diamondplated/sift/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
-  <img src="https://img.shields.io/badge/platform-macOS-lightgrey.svg" alt="macOS">
+  <a href="https://github.com/diamondplated/sift/actions/workflows/ci-native.yml"><img src="https://github.com/diamondplated/sift/actions/workflows/ci-native.yml/badge.svg" alt="CI"></a>
+  <img src="https://img.shields.io/badge/platform-macOS%2014%2B-lightgrey.svg" alt="macOS 14+">
   <img src="https://img.shields.io/badge/DuckDB-1.5.5-yellow.svg" alt="DuckDB 1.5.5">
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-blue.svg" alt="License: MIT"></a>
 </p>
@@ -38,13 +38,14 @@ it will show you a single row.
 Sift skips all of that. DuckDB reads the file **in place**, so nothing is loaded, copied, or
 imported — a 20 GB CSV opens as fast as a 2 MB one, and never has to fit in memory.
 
-- ⚡ **Instant at any size.** Opening is a view over the file, not a read of it.
-- 🔍 **Answers, not rows.** Schema, per-column profile, and top values with counts and share — in
-  one pass, in milliseconds. The screenshot above is 2.5 million rows profiled in 49 ms.
-- 🔒 **Nothing leaves your machine.** No database, no cloud, no credentials, no telemetry, no
-  network egress. Bound to `127.0.0.1` and staying there.
+- ⚡ **Instant at any size.** Opening is a view over the file, not a read of it. A 6-million-row
+  parquet opens with its exact count in under a second — the count comes free from the footer.
+- 🔍 **Answers, not rows.** Schema, per-column profile, and top values with counts and share.
+- 🔒 **Nothing leaves your machine.** No server, no cloud, no credentials, no telemetry, no
+  network egress. One process, one binary; there is no port because there is nothing listening.
 - 🧠 **Honest about your data.** `NULL`, `''`, and `'N/A'` stay three different things. Rows the
-  parser dropped get counted and shown, not silently discarded.
+  parser dropped get counted and shown, not silently discarded. A file whose column structure
+  collapsed says so in a sentence, with a one-click way to recover it.
 
 ---
 
@@ -55,16 +56,18 @@ imported — a 20 GB CSV opens as fast as a 2 MB one, and never has to fit in me
 ./build-app.sh /Applications        # builds Sift.app and installs it
 ```
 
-Drag a file onto the Dock icon, or right-click a `.parquet` → **Open With → Sift**.
+Drag a file onto the Dock icon, double-click a `.parquet`, or right-click → **Open With → Sift**.
 
 The app is self-contained: libduckdb is copied inside the bundle, so it keeps working with this
-checkout deleted.
+checkout deleted. There is also a CLI:
 
-Prefer a browser? `./dev.sh` serves the same UI on <http://127.0.0.1:8642> — that one still needs
-the Python setup in [CONTRIBUTING.md](CONTRIBUTING.md).
+```bash
+swift run sift ~/Desktop/orders.csv    # schema + first rows at your terminal
+swift run sift --verify                # the engine proving itself: 20 checks, every format
+```
 
 **Requirements:** macOS 14+. No Xcode needed — everything builds with SwiftPM and the Command Line
-Tools.
+Tools. No Python, no Node, no third-party Swift dependencies. None.
 
 ---
 
@@ -75,34 +78,36 @@ Tools.
 | **CSV / TSV** | dialect, header and types sniffed; whole-file sniff under 50 MB |
 | **`.csv.gz`, `.zst`** | works, but no row estimate — compressed bytes say nothing about row count |
 | **Parquet** | exact row count and per-column stats free from the footer |
-| **Folder of parquet** | one globbed table, hive partitions detected, `filename` provenance kept |
+| **Folder of parquet/CSV** | one globbed table, hive partitions detected, `filename` provenance kept |
 | **Delta table** | read through the transaction log, so tombstoned rows stay deleted |
 | **JSON / NDJSON** | `read_json_auto` handles both |
-| **`.xlsx`** | sheet picker with per-sheet dimensions. `.xls` is refused with a "re-save" message |
+| **`.xlsx` / `.xlsm`** | sheet picker with per-sheet dimensions. `.xls` is refused with a "re-save" message |
 
 ---
 
 ## What you get
 
-**The distinct-values panel.** Top values with counts and share-of-rows in a single pass. Click to
-filter, ⌘-click to multi-select, right-click to exclude. It ignores its own column's filter, so
-every value stays visible with the selected ones highlighted.
+**The distinct-values panel.** Top values with counts and share-of-rows. Click to filter, ⌘-click
+to multi-select, right-click to exclude. It ignores its own column's filter, so every value stays
+visible with the selected ones highlighted.
 
 **Three kinds of missing.** `NULL`, empty string, and `'N/A'` render differently in the grid and are
 counted separately in the profile — because in real data feeds they mean three different problems,
 and every tool that flattens them into one costs you an afternoon later.
 
 **The rows your file lost.** If a value won't cast to its column's type, DuckDB drops the row. Sift
-counts those independently and shows you the offending cells. Nothing disappears quietly.
+counts those independently and shows you the offending cells. Nothing disappears quietly — and a
+ragged CSV that would silently collapse into one column tells you, with a re-open button that
+recovers the real columns.
 
-**Numbers that survive the trip.** `BIGINT` and `DECIMAL` cross the wire as strings, because JS
-`Number` silently rounds past 2^53 — and an order id is exactly the sort of thing that would corrupt.
+**Real numbers.** `BIGINT` and `DECIMAL` render exactly — there is no JavaScript in the building to
+round them. `10.50` stays `10.50`.
 
 **A SQL box that cannot write.** Run any `SELECT` against what's open. The enforcement isn't a
 keyword blocklist (see [below](#things-that-are-the-way-they-are-for-a-reason)).
 
-**Merge, export, and staged-data management** — including one screen that answers "what is this tool
-holding on to", with sizes, last-used times, and a purge button.
+**Merge, export, and staged-data management** — including one screen that answers "what is this
+tool holding on to", with sizes, last-used times, and a purge button.
 
 ---
 
@@ -110,32 +115,24 @@ holding on to", with sizes, last-used times, and a purge button.
 
 ```
 sift/
-  dev.sh              browser mode on 127.0.0.1:8642
-  build-app.sh        builds Sift.app (icon drawn with the Cocoa that ships in macOS)
-  bin/sift-open       CLI; starts the engine or hands off to a running one
-  engine/
-    app.py            FastAPI routes, CLI, sidecar mode
-    session.py        the only stateful module: connection, catalog, jobs, SSE
-    core/             pure — importable with no connection, no server, no global state
-  shell/              SwiftPM package: the native window (no Xcode needed)
-  web/index.html      the whole UI, no build step
+  build-app.sh          builds Sift.app (icon drawn with the Cocoa that ships in macOS)
+  scripts/fetch-duckdb.sh   downloads + checksum-verifies the pinned libduckdb
+  Sources/
+    CDuckDB/            the module map over duckdb.h
+    DuckDBKit/          Swift over the C API: Database, Connection, chunk decoding
+    SiftCore/           pure, Foundation-only: SQL generation, gates, policy
+    SiftEngine/         Session — the one actor holding all state
+    SiftUI/             every view and view model
+    SiftApp/            @main, menus, LaunchServices — nothing with a decision in it
+    sift/               the CLI
+  Tests/                ~730 tests; the spec
 ```
 
-`core/` is pure on purpose: identifier sanitation, SQL generation, the SELECT-only gate, staging
-policy and panel selection are all testable in milliseconds without fixtures.
+`SiftCore` is pure on purpose — importable with no connection and no state, which is why most of
+the suite runs in milliseconds:
 
 ```bash
-.venv/bin/python -m pytest engine/tests -q      # 218 tests
-```
-
-216 of those 218 finish in under 10 ms each, which is the point of keeping `core/` pure. The ~28 s
-wall clock is almost entirely two tests that have to go through DuckDB itself: loading timezone data
-for the `TIMESTAMP WITH TIME ZONE` round-trip (~18 s) and building the Delta fixture (~9 s).
-Skipping both gets you to ~10 s — the floor is the one-time extension load in the session fixture,
-not the tests:
-
-```bash
-.venv/bin/python -m pytest engine/tests -q -k "not delta and not timestamptz"   # 207 passed, ~10s
+swift test          # ~730 tests, ~30 s, fully parallel
 ```
 
 ---
@@ -143,34 +140,14 @@ not the tests:
 ## Things that are the way they are for a reason
 
 <details>
-<summary><strong>The <code>.app</code> is not cosmetic</strong></summary><br>
+<summary><strong>Native, with no web view in the building</strong></summary><br>
 
-An HTML5 file drop yields a `File` object with no filesystem path — WebKit withholds it
-deliberately. DuckDB needs a real path to read in place, so a browser-only tool would have to copy
-multi-GB files before showing anything. LaunchServices hands over the real path. That is what makes
-"20 GB opens as fast as 2 MB" true.
-
-In the browser, drops under 512 MB are copied to a spill file and badged as such; above that Sift
-refuses and points at the app or the paste-a-path box (⌥⌘C in Finder copies a POSIX path).
-</details>
-
-<details>
-<summary><strong>The engine is Python, and the window is Swift</strong></summary><br>
-
-DuckDB's Swift binding publishes no stable release tags — every tag is a `-dev` prerelease, which
-SwiftPM's resolver ignores — and vendors a 400-file C++ amalgamation. Keeping DuckDB in Python means
-the data layer stays editable without a C++ toolchain in the loop. The shell is ~700 lines of AppKit
-with zero dependencies.
-</details>
-
-<details>
-<summary><strong>The grid caps its own scroll height</strong></summary><br>
-
-Browsers clamp element height (~33.5M px Chrome, ~17.8M Safari). At 27 px/row a naive spacer breaks
-silently past ~800k rows: the thumb stops tracking and rows repeat. Above the cap, scroll position
-maps as a *fraction* and the wheel is handled separately.
-
-Develop against a multi-million-row file, never a 10k-row CSV — the bug is invisible on small files.
+Sift 1.x was a Python engine behind a local web UI. The rewrite deleted the server, the browser,
+and the Python — not for fashion: an HTML5 file drop withholds the file's real path, browsers clamp
+scroll height (~17.8M px in Safari, silently broken past ~800k rows at 27 px/row), and JS `Number`
+rounds integers past 2^53. `NSTableView` asks only for visible rows, LaunchServices hands over real
+paths, and `Int64` is `Int64`. Porting also surfaced seven real bugs in the shipping engine —
+including sorted paging that threw on page 2 — all fixed in the Swift.
 </details>
 
 <details>
@@ -185,8 +162,9 @@ header peek should not pay for a 20 s copy. Parquet, globs and Delta are never s
 <summary><strong>Staged data is still your data</strong></summary><br>
 
 It lives in `~/.sift/stage.duckdb` (mode 0700), is listed with sizes and last-used times under
-**Staged**, ages out after 14 days, and is capped at 20 GB. One screen answers "what is this tool
-holding on to", which is the question you want answerable when the files you opened were sensitive.
+**Staged**, ages out after 14 days, and is capped at 20 GB. A staged copy is fingerprinted against
+its source — including a folder's individual members, and a timestamp a rewrite can't fake — so a
+stale copy is collected, never served. One screen answers "what is this tool holding on to."
 </details>
 
 <details>
@@ -204,7 +182,8 @@ only copy of anything: sources are read-only and staged tables are rebuildable.
 <details>
 <summary><strong>DuckDB 1.5.5 specifics this code depends on</strong></summary><br>
 
-Verified by probe; re-run `engine/tests` before bumping the pin.
+Verified by probe, pinned executable in `Tests/DuckDBKitTests/DuckDB155FactsTests.swift`; re-run
+before bumping the pin.
 
 - `sniff_csv` reports an absent quote/escape/comment as the literal string `'(empty)'`. Passing that
   back into `read_csv` fails with "cannot exceed a size of 1 byte".
@@ -217,10 +196,12 @@ Verified by probe; re-run `engine/tests` before bumping the pin.
 - `allow_quoted_nulls` defaults to true, which reads a quoted `""` as NULL and makes it
   indistinguishable from a missing value. Sift sets it false.
 - `delta_scan` honors tombstones. Time travel is `version => n`; `AT (VERSION => n)` does not parse.
-- `read_xlsx` takes `sheet =>` (not `sheet_name`), and cannot list sheets — hence openpyxl.
-- `pytz` is required, not optional: without it, fetching any `TIMESTAMP WITH TIME ZONE` raises.
+- `read_xlsx` takes `sheet =>` (not `sheet_name`), and cannot list sheets — Sift parses the OOXML
+  itself.
 - `approx_count_distinct` can exceed the row count (340 for 300 distinct), so it is clamped.
 - `duckdb_tables.estimated_size` is estimated **rows**, not bytes.
+- `duckdb_interrupt` issued before execution starts is silently swallowed — cancelling a running
+  query means re-asserting it in a loop.
 </details>
 
 ---
@@ -229,12 +210,9 @@ Verified by probe; re-run `engine/tests` before bumping the pin.
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `SIFT_PORT` | `8642` | browser mode only; the native shell uses a kernel-assigned port |
-| `SIFT_HOME` | `~/.sift` | staged data, spill, auth token (created 0700) |
+| `SIFT_HOME` | `~/.sift` | staged data (created 0700) |
 | `SIFT_STAGE_BUDGET_GB` | `20` | staged-data ceiling |
 | `SIFT_STAGE_MAX_AGE_DAYS` | `14` | age-out for staged tables |
-| `SIFT_MAX_UPLOAD_MB` | `512` | ceiling on the pathless browser-drop copy |
-| `SIFT_ROOT` | — | engine location override, for running the shell from source |
 
 ---
 
@@ -243,11 +221,12 @@ Verified by probe; re-run `engine/tests` before bumping the pin.
 Sift is a file explorer, not a warehouse client:
 
 - It reads local files only. There is no connector for a live database, by design.
-- It never writes to your source files. Sources are opened read-only.
+- It never writes to your source files. Sources are opened read-only; export refuses to overwrite.
 - Compressed CSV gives no row estimate until it is read — compressed bytes say nothing about rows.
 - `.xls` (the pre-2007 format) is refused rather than half-supported; re-save as `.xlsx`.
-- One machine, one user. There is no server mode and no auth model beyond loopback + a per-launch
-  token, because adding one would change what this is.
+- A sorted view reaches its first 5,000,000 rows and says so — a named limit, not a silent one.
+- One machine, one user, one window. No server mode, no auth model, because adding one would
+  change what this is.
 
 ---
 
@@ -255,11 +234,11 @@ Sift is a file explorer, not a warehouse client:
 
 [MIT](LICENSE).
 
-Sift bundles no third-party data or models. It depends on DuckDB (MIT), FastAPI (MIT), Uvicorn
-(BSD-3-Clause), openpyxl (MIT) and pytz (MIT); the `delta` and `excel` DuckDB extensions are
-downloaded from DuckDB's own extension repository on first run.
+Sift bundles no third-party code at all: the only runtime dependency is DuckDB (MIT), vendored as
+the prebuilt `libduckdb` with a pinned checksum. The `delta` and `excel` DuckDB extensions are
+downloaded from DuckDB's own extension repository on first use.
 
 ## Contributing
 
-See [CONTRIBUTING.md](CONTRIBUTING.md). The short version: `engine/tests/**` is the spec, and it is
+See [CONTRIBUTING.md](CONTRIBUTING.md). The short version: `Tests/**` is the spec, and it is
 read-only — never weaken a test to make a change pass.

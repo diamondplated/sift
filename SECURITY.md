@@ -5,39 +5,44 @@
 Use GitHub's **Security → Report a vulnerability** form on this repository (private vulnerability
 reporting is enabled). Please don't open a public issue for an unpatched problem.
 
-Include the DuckDB version, the file format, and roughly how big the file was — most behaviour here
-is size- and format-dependent, and it narrows the search immediately.
+Include the file format and roughly how big the file was — most behaviour here is size- and
+format-dependent, and it narrows the search immediately.
 
 ## What Sift is, from a security standpoint
 
 Sift is a single-user local tool. It opens files on your own machine and shows you what's in them.
-There is no server deployment, no multi-tenancy, no account system, and no remote data.
+There is no server, no port, no multi-tenancy, no account system, and no remote data — one native
+process, one binary.
 
 **It reaches no live system.** No database connector, no cloud client, no credentials, no telemetry,
-no analytics, no update check. The only outbound network request Sift's dependencies make is the
-one-time `INSTALL` of the DuckDB `delta` and `excel` extensions, which you run explicitly during
-setup. DuckDB's network filesystems are disabled at runtime.
+no analytics, no update check. The only outbound network requests are the one-time checksum-verified
+download of the pinned `libduckdb` (`scripts/fetch-duckdb.sh`, which you run explicitly) and the
+one-time `INSTALL` of the DuckDB `delta` and `excel` extensions from DuckDB's own repository.
+DuckDB's network filesystems are disabled at runtime.
 
 ## The properties that are meant to hold
 
 If you find a way to break one of these, that's a vulnerability and worth reporting:
 
-- **Loopback only.** The engine binds `127.0.0.1` and nothing else. `/api/open` reads any path the
-  caller names, so a `--host` flag is deliberately absent and must never be added.
-- **Per-launch token plus Host pinning.** Every request carries a token minted at launch
-  (`x-sift-token` header or `?t=`), and the `Host` header is checked. The token lives in
-  `~/.sift/token`.
-- **`~/.sift` is `0700`.** Staged data, the browser-drop spill, and the token all live there.
+- **No listener.** Sift 1.x ran a loopback HTTP server; the native rewrite deleted it. There is no
+  socket, no token, and no request surface — the UI calls the engine as a library. A patch that
+  reintroduces a network listener changes what this program is.
+- **`~/.sift` is `0700`.** Staged data lives there.
 - **The SQL box cannot write.** The enforcement is *not* the keyword guard — it is that user SQL is
   wrapped as `SELECT * FROM (\n …\n) AS _q`. `DROP`, `COPY`, `ATTACH`, `PRAGMA` and `SET` cannot
   occupy a subquery position, so they die in DuckDB's parser before anything runs. The keyword guard
   exists to produce a better error message, not to be the gate. **A patch that replaces the wrap
   with a blocklist is a security regression**, however much simpler it looks.
+- **Export is the one place Sift writes, and it is engine-built.** No user-supplied string reaches a
+  `COPY` statement, path, or format; stored SQL is re-validated before wrapping; an existing file is
+  never overwritten unless explicitly asked.
 - **Sources are read-only.** Sift never writes to a file you opened.
-- **Staged data ages out.** Staged tables are purged after 14 days and capped at 20 GB, and the
-  **Staged** screen lists everything currently held with sizes and last-used times.
-- **The engine dies with its parent.** A watcher terminates the sidecar if the shell goes away, so a
-  token-bearing process is not left listening.
+- **Staged data ages out.** Staged tables are purged after 14 days and capped at 20 GB; a staged
+  copy is fingerprinted against its source (per-member for folders, with a timestamp that cannot be
+  forged from userspace) so a stale copy is collected, never served; and the **Staged** screen lists
+  everything currently held with sizes and last-used times.
+- **One `Session` per data home.** A second engine on the same `~/.sift` is refused outright — two
+  would be two databases silently overwriting each other's writes.
 
 ## Known and accepted
 
@@ -48,11 +53,6 @@ owns the only copy of anything, sources are read-only, and staged tables are reb
 filesystems are disabled, so such a read cannot be exfiltrated by the query itself.
 
 If you are running Sift somewhere that reasoning doesn't hold, don't.
-
-**Browser mode copies dropped files.** An HTML5 drop gives no filesystem path, so drops under
-`SIFT_MAX_UPLOAD_MB` (default 512) are copied to a spill file in `~/.sift` and badged in the UI as
-copied. The native `.app` never does this — LaunchServices supplies the real path and DuckDB reads
-in place.
 
 **Staged data is a real copy of your data on disk.** It is exactly as sensitive as the file you
 opened. That's the reason for the 0700 mode, the age-out, and the one screen that answers "what is
@@ -68,7 +68,8 @@ this tool holding on to".
 
 ## Supported versions
 
-Sift is pre-1.0 and only the current `main` is supported. `requirements.txt` is fully pinned on
-purpose — an unpinned floor means a surprise upstream release can change CSV sniffing with nothing
-in the repository to explain it. Dependabot alerts are enabled, and the pins are re-verified against
-`engine/tests` before any bump.
+Sift is pre-2.0-final and only the current `main` is supported. The DuckDB dependency is a single
+prebuilt `libduckdb` pinned by version **and** SHA-256 in `scripts/fetch-duckdb.sh` — an unpinned
+floor would mean a surprise upstream release could change CSV sniffing with nothing in the
+repository to explain it. The behaviors that pin depends on are executable facts in
+`Tests/DuckDBKitTests/DuckDB155FactsTests.swift`, re-verified before any bump.
