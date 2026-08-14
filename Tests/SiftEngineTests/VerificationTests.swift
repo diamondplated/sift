@@ -160,7 +160,9 @@ private func newHome() -> String { TestTemp.path("verification-tests") }
         "open folder", "malformed file", "profile", "distinct panel", "histogram panel",
         "sample and length panels", "dropped rows", "ragged csv", "skipped preamble",
         "snippet and rendered SQL",
-        "SELECT-only gate", "staging and unstaging", "merge", "export",
+        "SELECT-only gate", "remote posture", "remote connection", "remote csv download",
+        "remote parquet ranges", "remote credential", "remote cache sweep",
+        "staging and unstaging", "merge", "export",
     ] {
         #expect(names.contains(required), "the \u{201C}\(required)\u{201D} check has gone missing")
     }
@@ -652,6 +654,55 @@ func deltaOpensAndHonoursTombstones() async throws { try await withWorkspace(che
 }
 @Test func theSelectOnlyGateRefusesEverythingItShould() async throws {
     try await withWorkspace(checkSelectOnlyGate)
+}
+
+// The six remote checks. Two of them run everywhere — a strict session refuses before it reaches
+// for anything, and the cache sweep is files plus one local catalog — and four need `httpfs`.
+//
+// 🔴 The enablement condition is `httpfsIsInstalled()`, the LOAD-with-no-INSTALL probe, and NOT the
+// `extensionIsAvailable` helper the delta/excel tests use: that one calls `loadExtensions`, which
+// falls through to `INSTALL`, so using it here would put `extensions.duckdb.org` on the critical
+// path of `swift test` — the exact thing `SIFT_REMOTE_FACTS` gates the `remoteFact` tests for.
+// Everything below is loopback-only, so with the extension already present it needs no network at
+// all and no env var either.
+
+@Test func aStrictSessionRefusesAUrlAndReachesNothing() async throws {
+    try await withWorkspace(checkRemotePosture)
+}
+@Test(.enabled(if: httpfsIsInstalled(), "duckdb httpfs extension not installed"))
+func aPermissiveSessionReadsARemoteParquetThroughTheSqlBox() async throws {
+    try await withWorkspace(checkRemoteConnection)
+}
+@Test(.enabled(if: httpfsIsInstalled(), "duckdb httpfs extension not installed"))
+func aServedCsvIsDownloadedOnceAndEverythingAfterThatReadsTheCopy() async throws {
+    try await withWorkspace(checkRemoteCSVDownload)
+}
+@Test(.enabled(if: httpfsIsInstalled(), "duckdb httpfs extension not installed"))
+func aServedParquetRangeReadsInPlaceAndLeavesNoCacheFile() async throws {
+    try await withWorkspace(checkRemoteParquetRanges)
+}
+@Test(.enabled(if: httpfsIsInstalled(), "duckdb httpfs extension not installed"))
+func aSignedUrlsQueryStringReachesNothingPersistedOrRendered() async throws {
+    try await withWorkspace(checkRemoteCredential)
+}
+@Test func theCacheSweepCollectsOrphansAndAgedCopiesAndNothingOutsideItsDirectory() async throws {
+    try await withWorkspace(checkRemoteCacheSweep)
+}
+
+/// 🔴 The probe those four stand on, pinned as a probe rather than as a boolean. The claim is not
+/// "httpfs is present" — it is that ASKING costs no network: `scratchDatabase()` has
+/// `autoinstall_known_extensions=false`, so this can only ever answer from what is already on disk.
+/// Swap it for `loadExtensions` and the answer is identical on this machine while `swift test`
+/// silently gains an outbound install on an unprepared one.
+@Test func theHttpfsProbeAgreesWithABareLoadAndNeverInstalls() throws {
+    let db = try scratchDatabase()
+    #expect(httpfsIsInstalled() == ((try? db.connect().execute("LOAD httpfs")) != nil))
+    // The two settings that make the probe offline, asserted rather than assumed: without them a
+    // bare LOAD autoinstalls, and the probe becomes the network call it exists to avoid.
+    #expect(db.hardened["autoinstall_known_extensions"] == true)
+    #expect(db.hardened["autoload_known_extensions"] == true)
+    // ...and it must not have registered anything, the way `loadExtensions` does.
+    #expect(db.loadedExtensions["httpfs"] == nil)
 }
 @Test func stagingAndUnstagingRoundTripsWithoutChangingTheRows() async throws {
     try await withWorkspace(checkStagingRoundTrip)

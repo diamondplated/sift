@@ -248,7 +248,12 @@ let verificationChecks: [VerificationCheck] = [
     VerificationCheck(name: "skipped preamble", run: checkPreambleAteTheFile),
     VerificationCheck(name: "snippet and rendered SQL", run: checkSnippetAndRenderedSQL),
     VerificationCheck(name: "SELECT-only gate", run: checkSelectOnlyGate),
+    VerificationCheck(name: "remote posture", run: checkRemotePosture),
     VerificationCheck(name: "remote connection", run: checkRemoteConnection),
+    VerificationCheck(name: "remote csv download", run: checkRemoteCSVDownload),
+    VerificationCheck(name: "remote parquet ranges", run: checkRemoteParquetRanges),
+    VerificationCheck(name: "remote credential", run: checkRemoteCredential),
+    VerificationCheck(name: "remote cache sweep", run: checkRemoteCacheSweep),
     VerificationCheck(name: "staging and unstaging", run: checkStagingRoundTrip),
     VerificationCheck(name: "merge", run: checkMerge),
     VerificationCheck(name: "export", run: checkExport),
@@ -879,42 +884,55 @@ let verificationChecks: [VerificationCheck] = [
     try requireEqual(back.rows.count, 500, "rows after leaving SQL mode")
 }
 
-// MARK: the connections config decides the posture
+// MARK: remote data, proved without a network
+//
+// Six checks, and none of them reaches anything off this machine: the oracle is
+// `LoopbackHTTPServer`, which binds `INADDR_LOOPBACK` on an ephemeral port and lives in `SiftEngine`
+// rather than in the test target for exactly this reason. Every one of them pairs the server with
+// `defer { server.stop() }` on the line after it is constructed, so a thrown check still releases
+// the port; every one gets its own `~/.sift` from `withWorkspace` and leaves the user's alone; and
+// every permissive one caps its own HTTP clock (see `permissiveSession`).
 
-/// 🔴 The other half of the hardening claim, and the half nothing else in `--verify` can make.
-/// Every check above this one runs on a default home, where there is no `connections.json` and the
-/// engine is airtight — that is the strict half, and `checkSelectOnlyGate` plus the posture tests in
-/// the suite already pin it. This one plants `allowRemote: true` in a workspace's own home and
-/// proves the whole chain end to end: the file is read BEFORE the `Database` opens, `harden()` skips
-/// the deny list because of what it said, `httpfs` is loaded because of what it said, and a real
-/// `read_parquet` over a real socket comes back with rows through the shipped SQL path.
+/// Can DuckDB load `httpfs` out of what is already installed on this machine?
 ///
-/// GATED behind `SIFT_REMOTE_FACTS=1`, matching `RemoteFactsTests`/`RemotePostureTests`: `httpfs`
-/// has to be present, and `loadExtensions` does LOAD→INSTALL→LOAD, so an unprepared machine would
-/// reach for the network in the middle of a command a user runs to check their own install. A skip
-/// is not a pass (rule 3 in this file's header) — it says which switch to flip.
-@Sendable func checkRemoteConnection(_ ws: Workspace) async throws {
-    guard ProcessInfo.processInfo.environment["SIFT_REMOTE_FACTS"] == "1" else {
+/// 🔴 **A bare `LOAD` with no `INSTALL` behind it, and that is the whole gate.**
+/// `Database.loadExtensions` does LOAD→INSTALL→LOAD, so building a permissive `Session` on an
+/// unprepared machine puts `extensions.duckdb.org` on the critical path of a command the user ran to
+/// check their own install — and a remote path that cannot reach what it needs is not fast about
+/// saying so (MEASURED on the first remote CI canary: 244 s to report nothing). `scratchDatabase()`
+/// has already set `autoinstall_known_extensions=false`, so a `LOAD` that fails here means the
+/// extension is absent and nothing else, decided offline in microseconds.
+///
+/// This replaced a `SIFT_REMOTE_FACTS=1` gate. That env var was a proxy for "this machine is
+/// prepared" and it was wrong in both directions: it skipped the check on every prepared machine,
+/// and in those runs it told the reader the extension "may have to be installed over the network"
+/// when it demonstrably did not. `RemoteFactsTests` and friends keep the env gate, because they are
+/// the ones allowed to INSTALL and CI's canary step is where that is exercised.
+func httpfsIsInstalled() -> Bool {
+    guard let con = try? scratchDatabase().connect() else { return false }
+    return (try? con.execute("LOAD httpfs")) != nil
+}
+
+/// THE permissive `Session` for a workspace — the only way to reach the posture at all — with its
+/// HTTP clock capped, or a skip when this machine has no `httpfs`.
+///
+/// The config is written **before** the `Session` exists, and that ordering is the feature:
+/// `Session.init` reads it before it opens the store, and MEASURED (remote facts §2)
+/// `disabled_filesystems` can only ever GROW inside a live `Database` — narrowing it, clearing it
+/// and `RESET`ing it all fail. So a posture is chosen once, at open, and there is no later switch.
+func permissiveSession(_ ws: Workspace) throws -> Session {
+    guard httpfsIsInstalled() else {
         throw VerifySkipped(
-            message: "set SIFT_REMOTE_FACTS=1 to check a remote read — it needs the httpfs "
-                + "extension, which may have to be installed over the network"
+            message: "the DuckDB httpfs extension is not installed here, so no remote read can be "
+                + "checked \u{2014} Sift installs it the first time you save a connection"
         )
     }
-
-    // Written before the Session exists, which is the point: `Session.init` reads it before it
-    // opens the store, and the posture is frozen from that moment.
     try Session.ensureHomeDirectory(ws.home)
     try Session.writeRemoteConfig(
         RemoteConfig(allowRemote: true), to: Session.connectionsPath(in: ws.home)
     )
-
-    let server = try LoopbackHTTPServer()
-    defer { server.stop() }
-    let parquet = try writeParquet(ws.path("remote.parquet"), rows: 1000)
-    server.register(path: "/remote.parquet", body: try Data(contentsOf: URL(fileURLWithPath: parquet)))
-
     let session = try ws.session()
-    try requireEqual(await session.connections().allowRemote, true, "the config the session read back")
+
     try requireEqual(session.allowRemoteAtLaunch, true, "the posture the Database opened with")
     // MEASURED (remote facts §2): the permissive posture never issues the SET at all, so the key is
     // ABSENT rather than false — absent is "Sift deliberately never asked", false is "DuckDB
@@ -923,18 +941,162 @@ let verificationChecks: [VerificationCheck] = [
         session.database.hardened["disabled_filesystems"] == nil,
         "a permissive session still disabled the network filesystems"
     )
-    guard session.engineInfo().extensions["httpfs"] == .loaded else {
-        throw VerifySkipped(
-            message: "the DuckDB httpfs extension is not installed, so no remote read can be checked"
+    // A FAILURE and not a skip, which is the whole reason the guard above it exists separately: the
+    // probe already loaded `httpfs` from disk a moment ago, so a session that cannot is a bug in
+    // Sift (a posture that never asked, a renamed extension) rather than an unprepared machine.
+    // Reporting it as "not installed here" would hide it behind a plausible sentence.
+    try require(
+        session.engineInfo().extensions["httpfs"] == .loaded,
+        "httpfs loads on a bare Database but not on a Session that asked for the permissive posture"
+    )
+
+    // 🔴 EVERY CHECK CAPS ITS OWN CLOCK. `SET GLOBAL`, never a bare `SET` — MEASURED (spike §8), a
+    // bare one configures the connection it ran on and no queries at all, and Sift hands work to
+    // throwaway connections. 5 s with one retry rather than the shipped 30 s with three, whose
+    // worst case is ~32 s of hang per statement: loopback needs nothing like it, and a machine that
+    // cannot reach its own socket has to say so in seconds rather than in CI minutes.
+    let con = try session.database.connect()
+    try con.execute("SET GLOBAL http_timeout=5")
+    try con.execute("SET GLOBAL http_retries=1")
+
+    // 🔴 **AND DUCKDB'S OWN CACHE COMES OFF, or the request log below proves nothing.** MEASURED
+    // (remote facts §11): `enable_external_file_cache` defaults to `true` with
+    // `validate_external_file_cache=VALIDATE_ALL`, so a repeat remote read of an ETagged URL inside
+    // ONE `Database` is revalidated with a HEAD and served out of the buffer manager — 1 GET, then
+    // 0. Leave it on and "Sift downloaded once" and "Sift downloaded three times and DuckDB
+    // absorbed two" produce the IDENTICAL log. Found here as a surviving mutant: a second
+    // `downloadRemoteObject` call, inserted on purpose, cost zero extra GETs and left every check
+    // green. This is the same failure the phase's timeout saga was — a correct-looking value with
+    // two possible provenances is not evidence.
+    try con.execute("SET GLOBAL enable_external_file_cache=false")
+    return session
+}
+
+/// What `openPath` said when it refused, as a sentence. "no error at all" when it did not refuse,
+/// so a caller asserting on the words fails rather than passing on an empty string.
+func remoteRefusal(_ session: Session, _ url: String) async -> String {
+    do {
+        _ = try await session.openPath(url)
+        return "no error at all"
+    } catch let error as SessionError {
+        return error.message
+    } catch {
+        return "\(error)"
+    }
+}
+
+/// The names in a workspace home's `remote-cache/`, sorted. `[]` when the directory was never
+/// created, which is itself an assertion `checkRemoteParquetRanges` makes.
+func cacheFileNames(inHome home: String) -> [String] {
+    let dir = (home as NSString).appendingPathComponent(remoteCacheDirName)
+    return ((try? FileManager.default.contentsOfDirectory(atPath: dir)) ?? []).sorted()
+}
+
+/// Assert a path's POSIX mode, reporting both sides in octal — `expected 384, got 420` is a mode
+/// check nobody can read.
+func requireMode(_ path: String, _ expected: Int, _ what: String) throws {
+    let attributes = (try? FileManager.default.attributesOfItem(atPath: path)) ?? [:]
+    guard let mode = (attributes[.posixPermissions] as? NSNumber)?.intValue else {
+        throw VerifyFailure(message: "\(what): no POSIX mode could be read for \(path)")
+    }
+    guard mode == expected else {
+        throw VerifyFailure(
+            message: "\(what): expected 0\(String(expected, radix: 8)), got 0\(String(mode, radix: 8))"
         )
     }
+}
 
-    // Loopback needs nothing like the default 30 s, and a machine that cannot reach its own socket
-    // should say so in seconds — MEASURED on the first CI canary: 244 s to report nothing.
-    try session.database.connect().execute("SET GLOBAL http_timeout=5")
+/// Every GET the oracle answered, which is the measurement half of every check below.
+func getsLogged(_ server: LoopbackHTTPServer)
+    -> [(method: String, path: String, range: String?, status: Int, bytesSent: Int)] {
+    server.requestLog.filter { $0.method == "GET" }
+}
 
-    // Through the shipped path — the SELECT-only gate and `wrapUserSQL` — not a hand-built
-    // connection. The claim is about what a user's query does, not about a DuckDB feature.
+// MARK: the default posture, and what it does NOT do
+
+/// 🔴 **Remote data is off until someone turns it on, and this is the only check in the file whose
+/// subject is what did not happen.** Two different failures hide behind a refusal that merely
+/// throws. A gate placed after `openPath`'s `fileExists` answers `No such file or folder:
+/// http://…` — Sift, in its own voice, telling a user their URL is a missing file. And a gate that
+/// HEADs the URL "just to see" makes exactly the request the posture forbids. The EMPTY request log
+/// is the assertion; the sentence is the other half of it.
+///
+/// The local open at the end is not decoration: without it every assertion above is equally
+/// satisfied by an engine that cannot open anything at all.
+@Sendable func checkRemotePosture(_ ws: Workspace) async throws {
+    let server = try LoopbackHTTPServer()
+    defer { server.stop() }
+    let local = try writeSalesCSV(ws.path("sales.csv"), rows: 20)
+    server.register(path: "/sales.csv", body: try Data(contentsOf: URL(fileURLWithPath: local)))
+    let url = "\(server.baseURL)/sales.csv"
+
+    // No `connections.json` at all — the shipped default, and the posture every other check in this
+    // file runs under without ever saying so out loud.
+    let session = try ws.session()
+    try requireEqual(session.allowRemoteAtLaunch, false, "the posture the Database opened with")
+    try requireEqual(await session.connections().allowRemote, false, "the default config")
+    try require(
+        session.database.hardened["disabled_filesystems"] == true,
+        "the default session did not disable the network filesystems"
+    )
+
+    let refusal = await remoteRefusal(session, url)
+    for fragment in ["not allowed to reach the network", "Connections", "sales.csv"] {
+        try require(
+            refusal.contains(fragment),
+            "the refusal is missing \u{201C}\(fragment)\u{201D}: \(refusal)"
+        )
+    }
+    try require(
+        !refusal.contains("No such file"),
+        "the URL fell through to the local-file flow instead of the posture gate: \(refusal)"
+    )
+    try require(
+        server.requestLog.isEmpty,
+        "a session that forbids the network reached the server anyway: \(server.requestLog)"
+    )
+    try requireEqual(await session.state().tables.count, 0, "tables opened by a refused URL")
+
+    // 🔴 Turning the switch on does NOT open this session, and the return value is the only honest
+    // report of that. MEASURED (remote facts §2): the posture is frozen when the `Database` opens,
+    // so the switch lands in the file and the engine stays exactly as it started. Sending the user
+    // back to a screen that already reads "on" is how a correct setting gets toggled twice by
+    // someone hunting for what they missed — so the second refusal is a DIFFERENT sentence.
+    try requireEqual(
+        try await session.setAllowRemote(true), ConnectionOutcome.activeAfterRelaunch,
+        "the outcome of turning remote on inside a strict session"
+    )
+    let afterSwitch = await remoteRefusal(session, url)
+    try require(
+        afterSwitch.contains("relaunch"),
+        "the refusal after the switch does not name the way out: \(afterSwitch)"
+    )
+    try require(
+        server.requestLog.isEmpty,
+        "the URL was fetched after a switch that cannot take effect: \(server.requestLog)"
+    )
+
+    try requireEqual(try await session.openPath(local).rowCount, 20, "rows from a local file")
+}
+
+// MARK: the connections config decides the posture
+
+/// 🔴 The other half of the hardening claim, and the half nothing else in `--verify` can make.
+/// `checkRemotePosture` above proves the strict default; this one plants `allowRemote: true` in a
+/// workspace's own home and proves the whole chain end to end: the file is read BEFORE the
+/// `Database` opens, `harden()` skips the deny list because of what it said, `httpfs` is loaded
+/// because of what it said, and a real `read_parquet` over a real socket comes back with rows
+/// through the shipped SQL path — the SELECT-only gate and `wrapUserSQL`, not a hand-built
+/// connection. The claim is about what a user's query does, not about a DuckDB feature.
+@Sendable func checkRemoteConnection(_ ws: Workspace) async throws {
+    let server = try LoopbackHTTPServer()
+    defer { server.stop() }
+    let parquet = try writeParquet(ws.path("remote.parquet"), rows: 1000)
+    server.register(path: "/remote.parquet", body: try Data(contentsOf: URL(fileURLWithPath: parquet)))
+
+    let session = try permissiveSession(ws)
+    try requireEqual(await session.connections().allowRemote, true, "the config the session read back")
+
     let local = try await session.openPath(try writeSalesCSV(ws.path("sales.csv"), rows: 20))
     let page = try await session.runSQL(
         local.name,
@@ -944,6 +1106,260 @@ let verificationChecks: [VerificationCheck] = [
     try requireEqual(page.rows.count, 1, "rows from the remote count")
     try requireEqual(page.rows[0][0].display, "1000", "rows read over http through a permissive Session")
     try require(!server.requestLog.isEmpty, "the read returned an answer without reaching the server")
+}
+
+// MARK: a remote text source is downloaded once
+
+/// 🔴 **One download, and everything after it is the LOCAL pipeline.** MEASURED (spike §7): reading
+/// a remote CSV in place costs 100 % of the object to sniff and 200 % to scan, so a five-row preview
+/// pays for the file twice and every statement after it pays again. The design answer is to download
+/// once and let the local flow sniff, count and bad-row-scan the copy — and only the request log can
+/// tell that design from a plausible-looking one that refetches per statement, because both put the
+/// same rows on screen.
+///
+/// The fixture is GZIPPED for `checkDroppedRows`' reason plus one that only matters here: compressed
+/// bytes carry no row count, so `buildSource` leaves `rowCount` nil and the 25,000 can only have come
+/// from the background exact count reading the cache file. The one bad row is a second, independent
+/// proof — an all-varchar `TRY_CAST` pass over that same local relation.
+@Sendable func checkRemoteCSVDownload(_ ws: Workspace) async throws {
+    let server = try LoopbackHTTPServer()
+    defer { server.stop() }
+    let fixture = try writeDirtyGzipCSV(ws.path("dirty.csv.gz"), rows: 25_000, badRow: 21_000)
+    let body = try Data(contentsOf: URL(fileURLWithPath: fixture))
+    server.register(path: "/sales.csv.gz", body: body, headers: ["ETag": "\"v1\""])
+
+    let session = try permissiveSession(ws)
+    let url = "\(server.baseURL)/sales.csv.gz"
+    let opened = try await session.openPath(url)
+    guard let t = await waitForOpenScan(session, opened.name) else {
+        throw VerifyFailure(
+            message: "the background scan of the downloaded copy did not finish within 30s"
+        )
+    }
+
+    try requireEqual(t.spec.fmt, Fmt.csv, "detected format")
+    try require(t.spec.compressed, "the cache file lost its compression")
+    try requireEqual(t.spec.key.path, url, "identity is the URL, never the cache file")
+    try requireEqual(t.spec.remote?.etag, "\"v1\"", "the ETag the HEAD reported")
+    try requireEqual(t.rowCount, 25_000, "the exact count did not come from the cache file")
+    try requireEqual(t.badRows, 1, "the bad-row scan did not run on the cache file")
+
+    // The bytes are read from `<home>/remote-cache/<hash>.csv.gz`, 0600 inside a 0700 directory —
+    // this file is a copy of someone's real data sitting on a laptop. BOTH suffixes survive, because
+    // DuckDB decides to decompress from the outer one and reads the format from the inner one: a
+    // `<hash>.gz` would open every `.json.gz` in the world as a CSV.
+    let dir = (ws.home as NSString).appendingPathComponent(remoteCacheDirName)
+    let names = cacheFileNames(inHome: ws.home)
+    try requireEqual(names.count, 1, "files in the download cache: \(names)")
+    let cached = names[0]
+    try requireEqual(
+        t.spec.target, (dir as NSString).appendingPathComponent(cached), "what the view reads"
+    )
+    try require(
+        cached.hasSuffix(".csv.gz"), "the cache file lost a suffix that decides its format: \(cached)"
+    )
+    try requireMode(t.spec.target, 0o600, "the downloaded copy")
+    try requireMode(dir, 0o700, "the directory holding downloaded copies")
+
+    // 🔴 THE assertion, and the only one that can see the mutation this check exists for. Sniffing,
+    // counting or scanning over the URL instead of the copy is not a crash and not a wrong number —
+    // it is the SAME answer, bought by re-downloading the object per statement.
+    let log = server.requestLog
+    let gets = getsLogged(server)
+    try requireEqual(gets.count, 1, "GETs for one object: \(log)")
+    try requireEqual(
+        log.reduce(0) { $0 + $1.bytesSent }, body.count,
+        "bytes across the wire for a \(body.count) B object: \(log)"
+    )
+}
+
+// MARK: a remote parquet is read where it lies
+
+/// The other half of the split, and the reason there is a split at all: parquet reads IN PLACE.
+/// MEASURED (spike §7), `count(*)` over a 28.6 MB remote parquet moves 64 KB and a filtered scan
+/// 0.7 %, so downloading it would be strictly worse. The proof is ranged 206s and an EMPTY cache
+/// directory — a whole-object GET that happened to return the right rows looks identical from the
+/// grid, and costs the whole file on every open.
+@Sendable func checkRemoteParquetRanges(_ ws: Workspace) async throws {
+    let server = try LoopbackHTTPServer()
+    defer { server.stop() }
+    let fixture = try writeParquet(ws.path("a.parquet"), rows: 100_000)
+    let body = try Data(contentsOf: URL(fileURLWithPath: fixture))
+    server.register(path: "/a.parquet", body: body)
+
+    let session = try permissiveSession(ws)
+    let url = "\(server.baseURL)/a.parquet"
+    let opened = try await session.openPath(url)
+    guard let t = await waitForOpenScan(session, opened.name) else {
+        throw VerifyFailure(message: "the background pipeline for a remote parquet did not settle")
+    }
+
+    try requireEqual(t.spec.fmt, Fmt.parquet, "detected format")
+    try requireEqual(t.rowCount, 100_000, "the exact count from the parquet footer")
+    try requireEqual(t.spec.target, url, "an in-place parquet must read from the URL")
+    try require(t.spec.remote?.cachePath == nil, "an in-place parquet was given a cache path")
+    try requireEqual(cacheFileNames(inHome: ws.home), [], "a parquet was downloaded")
+    try requireEqual(t.stageDecision?.stage, false, "remote parquet must stay neverStage")
+
+    let gets = getsLogged(server)
+    try require(!gets.isEmpty, "the open never reached the server at all")
+    try require(
+        gets.allSatisfy { $0.status == 206 && $0.range != nil },
+        "a whole-object GET slipped into the parquet path: \(gets)"
+    )
+    let moved = server.requestLog.reduce(0) { $0 + $1.bytesSent }
+    try require(
+        moved < body.count / 4, "moved \(moved) of \(body.count) B to open a parquet in place"
+    )
+}
+
+// MARK: the credential in the URL reaches nothing
+
+/// 🔴 **A `?sv=…&sig=…` query is a bearer credential, and this is the check that says where it may
+/// not go.** An in-place read would persist it twice over: `spec.target` is rendered into the
+/// `CREATE VIEW` text DuckDB writes into the on-disk store, and `key.path` is written into
+/// `_sift_sources`. So a SAS'd parquet is DOWNLOADED instead — the credential invariant is not
+/// negotiable, and refusing outright would mean the shape most people are handed a private blob in
+/// simply does not open. The note is what makes the lost range reads visible rather than mysterious.
+///
+/// The greps are the assertion, and the last two lines are what stop them being a tautology: a list
+/// of surfaces that does not contain the source at all passes every "does not contain the signature"
+/// test there is.
+@Sendable func checkRemoteCredential(_ ws: Workspace) async throws {
+    let server = try LoopbackHTTPServer()
+    defer { server.stop() }
+    let fixture = try writeParquet(ws.path("private.parquet"), rows: 500)
+    server.register(path: "/private.parquet", body: try Data(contentsOf: URL(fileURLWithPath: fixture)))
+
+    let session = try permissiveSession(ws)
+    let signature = "SUPERSECRETSIGNATURE"
+    let opened = try await session.openPath(
+        "\(server.baseURL)/private.parquet?sv=2024&sig=\(signature)"
+    )
+    guard let t = await waitForOpenScan(session, opened.name) else {
+        throw VerifyFailure(message: "the background pipeline for a signed URL did not settle")
+    }
+
+    try require(t.notes.contains(sasParquetNote), "the download went unexplained; notes were \(t.notes)")
+    try requireEqual(t.rowCount, 500, "rows read back through the signed URL")
+    try require(
+        t.spec.remote?.cachePath != nil,
+        "a SAS-signed parquet was read in place, which persists the token"
+    )
+    try requireEqual(getsLogged(server).count, 1, "the object was downloaded more than once")
+
+    // A row in `_sift_sources` to grep. Parquet never stages on its own, so this is the explicit
+    // "download a local copy" path — the affordance that pays the note's cost back.
+    _ = try await session.stageNow(t.name, force: true)
+    let staged = try await waitForStaging(session, t.name)
+    try require(staged.staged, "the staged copy was not built: \(staged.stagingError ?? "none")")
+
+    let con = try session.database.connect()
+    var surfaces = [t.spec.target, t.spec.key.path, staged.spec.target, staged.spec.key.path]
+    surfaces += cacheFileNames(inHome: ws.home)
+    surfaces += try con.query("SELECT sql FROM duckdb_views()").allRows().map { cellText($0[0]) }
+    surfaces += try con.query("SELECT source_token, path FROM _sift_sources").allRows()
+        .flatMap { $0.map(cellText) }
+    for dialect in ["sql", "duckdb", "pandas", "polars"] {
+        surfaces.append(try await session.snippet(staged.name, dialect: dialect))
+    }
+    surfaces.append(try await session.renderedSQL(staged.name))
+    // The config file too: a Keychain payload and a signature are both things that may never land
+    // in `connections.json`, and this is the run where one could have.
+    surfaces.append(
+        (try? String(contentsOfFile: Session.connectionsPath(in: ws.home), encoding: .utf8)) ?? ""
+    )
+
+    for text in surfaces {
+        try require(!text.contains(signature), "the SAS signature was persisted or rendered: \(text)")
+        try require(!text.contains("sig="), "a query string was persisted or rendered: \(text)")
+    }
+    try require(
+        surfaces.contains { $0.contains("private.parquet") },
+        "not one surface named the source, so the greps above proved nothing"
+    )
+    try require(
+        surfaces.contains { $0.contains("read_parquet") || $0.contains("SELECT") },
+        "not one surface carried SQL, so the greps above proved nothing"
+    )
+}
+
+// MARK: the downloaded copies are collected
+
+/// 🔴 **The collector, and the only check here whose subject DELETES.** A downloaded object is a
+/// copy of the user's own data on a laptop, so it ages out on the same clock the staged store does
+/// (`stageMaxAgeDays()`, one number, one place) and a copy nothing points at is collected at the next
+/// launch. The orphan rule works off a name RECOMPUTED from what a catalog row persists, never from
+/// what happens to be on disk.
+///
+/// The last assertion is worth more than the three before it: the sweep enumerates ONE directory
+/// non-recursively, acts only on names `contentsOfDirectory` handed it, and `removeItem` unlinks a
+/// symlink rather than following it — so a file outside the cache cannot be reached however it got
+/// named in there.
+@Sendable func checkRemoteCacheSweep(_ ws: Workspace) async throws {
+    let session = try ws.session()
+    let con = try session.database.connect()
+    let manager = FileManager.default
+    let dir = (ws.home as NSString).appendingPathComponent(remoteCacheDirName)
+
+    /// The name the sweep will recompute for a URL, from the same two pure functions it uses.
+    func cacheName(_ text: String) throws -> String {
+        guard let url = classifyRemote(text) else {
+            throw VerifyFailure(message: "\(text) did not classify as a remote URL")
+        }
+        return (try remoteCachePath(home: ws.home, url: url) as NSString).lastPathComponent
+    }
+
+    func plant(_ name: String, ageDays: Double = 0) throws {
+        try Session.ensureHomeDirectory(dir)
+        let path = (dir as NSString).appendingPathComponent(name)
+        guard manager.createFile(
+            atPath: path, contents: Data("cached bytes".utf8),
+            attributes: [.posixPermissions: 0o600]
+        ) else { throw VerifyFailure(message: "could not plant a cache file at \(path)") }
+        guard ageDays > 0 else { return }
+        try manager.setAttributes(
+            [.modificationDate: Date().addingTimeInterval(-ageDays * 86400)], ofItemAtPath: path
+        )
+    }
+
+    func catalogue(_ table: String, _ url: String) throws {
+        _ = try con.query(
+            "INSERT INTO _sift_sources (source_token, path, mtime_ns, size, table_name, fmt, "
+                + "staged_at, last_used, row_count, bytes) VALUES (?,?,?,?,?,?,now(),now(),?,?)",
+            [
+                .text("\(remoteTokenPrefix)\(url)|etag=\"v1\""), .text(url), .int(0), .int(0),
+                .text(table), .text("csv"), .int(1), .int(1),
+            ]
+        )
+    }
+
+    let keptName = try cacheName("https://h/kept.csv")
+    try catalogue("kept", "https://h/kept.csv")
+    try plant(keptName)
+    try catalogue("aged", "https://h/aged.csv")
+    try plant(try cacheName("https://h/aged.csv"), ageDays: Double(stageMaxAgeDays()) + 1)
+    try plant(try cacheName("https://h/orphan.csv"))
+
+    // A file OUTSIDE the cache, reachable only by following a link the sweep must not follow.
+    let precious = ws.path("precious.csv")
+    try "real data".write(toFile: precious, atomically: true, encoding: .utf8)
+    try manager.createSymbolicLink(
+        atPath: (dir as NSString).appendingPathComponent("escape.csv"), withDestinationPath: precious
+    )
+    try requireEqual(cacheFileNames(inHome: ws.home).count, 4, "planted cache entries")
+
+    Session.sweepRemoteCache(in: ws.home, con: con)
+
+    try requireEqual(cacheFileNames(inHome: ws.home), [keptName], "what survived the sweep")
+    try require(
+        manager.fileExists(atPath: precious),
+        "the sweep followed a symlink out of its own directory and deleted \(precious)"
+    )
+    try requireEqual(
+        try String(contentsOfFile: precious, encoding: .utf8), "real data",
+        "the contents of the file the planted symlink pointed at"
+    )
 }
 
 // MARK: staging
