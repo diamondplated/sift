@@ -25,12 +25,26 @@ import SiftCore
 //      it, because a hung endpoint is a real and ordinary thing and it must suspend the open
 //      rather than freeze the actor for the OS's idea of a timeout (MEASURED, RemoteProbe.swift:
 //      31 s on the macos-15 runner for a HEAD asked to give up after 1). It touches NO actor state
-//      and in particular never `pagingConnection` — the six users below are still six.
-//   3. SIX methods share ONE long-lived `Connection` (`pagingConnection`), for as long as the
+//      and in particular never `pagingConnection` — it adds no user to the list below.
+//   3. EIGHT methods share ONE long-lived `Connection` (`pagingConnection`), for as long as the
 //      `Session` exists, instead of opening a fresh one per call. In this file: `page`,
-//      `sortedRelation`, `closeTable`. In Staging.swift: `applyStaged` (drops a stale
-//      materialized-sort TEMP TABLE), `finishStage` (drops the VIEW of a table closed mid-job),
-//      and `unstage` (drops a materialized-sort TEMP TABLE).
+//      `sortedRelation`, `closeTable`, `finishOpen`, `tempTableExistsForTest`. In Staging.swift:
+//      `applyStaged` (drops a stale materialized-sort TEMP TABLE), `finishStage` (drops the VIEW of
+//      a table closed mid-job), and `unstage` (drops a materialized-sort TEMP TABLE).
+//
+//      🔴 **It said SIX for the whole of Phase 1, and Phase 1 is what made it eight** — one of the
+//      lines that phase ADDED re-asserted "still six" while sitting in the file that had just
+//      gained the seventh. Both new users are T10's and both are safe, for the same reason and not
+//      by luck:
+//
+//        * `finishOpen` — the refresh mode's `DROP TABLE IF EXISTS` of the materialized sort the
+//          replaced bytes orphaned. `private func … throws -> Table`: not `async`, so it cannot
+//          suspend at all. Its one `await` is inside a `Task.detached` closure, which is a new task
+//          rather than a suspension of the enclosing call.
+//        * `tempTableExistsForTest` — reads `duckdb_tables()` through the connection that owns the
+//          TEMP TABLE, because nothing else can see one. Also non-`async`, and the query is its
+//          whole body. Test support, but a user by this list's own definition, which is why it is
+//          on the list.
 //
 //      Sharing is not a stylistic choice — MEASURED (see `sortedRelation`'s doc comment): a
 //      `CREATE TEMP TABLE` created on one `duckdb_connect()` connection is invisible to a `SELECT`
@@ -39,17 +53,21 @@ import SiftCore
 //      a DROP of one must go through that connection too — which is why the three in Staging.swift
 //      are on this list at all.
 //
-//      🔴 **THE INVARIANT IS PER-USE, NOT PER-METHOD, AND ONE OF THE SIX IS `async`.** `Connection`
-//      is not `Sendable`; what makes sharing safe is that no user ever SUSPENDS between acquiring
-//      the connection and finishing with it, so the actor's serial executor guarantees exactly one
-//      caller is inside at a time. All six were re-checked line by line and all six hold. But
-//      `unstage` IS `async` and DOES `await` — `computeProfile`, immediately after it is done with
-//      the connection — so "none of these methods awaits anything" (what an earlier version of
-//      this fact said, about three methods it thought were all of them) is simply false, and a
-//      reader who believed it would not know what they were preserving. **The rule to preserve:
-//      you may `await` in one of these methods, but never between `pagingConnection.…` and the
-//      last statement that depends on it.** A new user of `pagingConnection` must be added to this
-//      list and checked against that rule.
+//      🔴 **THE INVARIANT IS PER-USE, NOT PER-METHOD, AND TWO OF THE EIGHT ARE `async`.**
+//      `Connection` is not `Sendable`; what makes sharing safe is that no user ever SUSPENDS
+//      between acquiring the connection and finishing with it, so the actor's serial executor
+//      guarantees exactly one caller is inside at a time. All eight were re-checked line by line
+//      and all eight hold. Three are `async` (`page`, `closeTable`, `unstage`) and exactly one of
+//      them AWAITS: `unstage` calls `computeProfile`, immediately after it is done with the
+//      connection. So "none of these methods awaits anything" (what an earlier version of this fact
+//      said, about three methods it thought were all of them) is simply false, and a reader who
+//      believed it would not know what they were preserving. **The rule to preserve: you may
+//      `await` in one of these methods, but never between `pagingConnection.…` and the last
+//      statement that depends on it.**
+//
+//      A new user of `pagingConnection` must be added to this list and checked against that rule —
+//      and the count in the first line of fact 3 must move with it. It did not, twice, in the phase
+//      that wrote the rule down.
 //
 //      `openPath`'s initial half and `_after_open`'s background pipeline still open a fresh
 //      `Connection` each time (fact 2) — they never touch a materialized sort, so they have no
@@ -147,8 +165,10 @@ public actor Session {
     /// the detached background pipeline in `runAfterOpen` reach it without an actor hop — the
     /// whole point of that path being detached in the first place.
     nonisolated let database: Database
-    /// The one `Connection` shared by `page`, `sortedRelation` and `closeTable` — see this file's
-    /// header (fact 3) for why it must be a single long-lived connection rather than one per call,
+    /// The one `Connection` shared by eight methods — `page`, `sortedRelation`, `closeTable`,
+    /// `finishOpen` and `tempTableExistsForTest` here, three more in Staging.swift. See this file's
+    /// header (fact 3) for the full list, for why it must be a single long-lived connection rather
+    /// than one per call,
     /// and why sharing it is safe despite `Connection` not being `Sendable`. Actor-isolated, not
     /// `nonisolated`: unlike `database`, `Connection` isn't `Sendable`, so it must never be reached
     /// from outside the actor (in particular, never from `runAfterOpen`'s detached pipeline).
@@ -335,7 +355,13 @@ public actor Session {
             // And the downloaded copies, which nothing collected until T10 — same clock, same
             // "a copy of someone's real data on a laptop" reasoning, one directory nobody could
             // see. AFTER the purge, so a copy it just dropped takes its cache file with it.
-            Self.sweepRemoteCache(in: resolvedHome, con: con)
+            //
+            // 🔴 `shared`, not `true`. The cache directory is scoped to the HOME and the keep-set is
+            // scoped to the STORE, and in the lock-fallback branch above those are different
+            // scopes: this session's catalog was created empty three lines ago while the directory
+            // belongs to the instance that still holds the lock — and is still reading files out of
+            // it. See `sweepRemoteCache`'s own comment.
+            Self.sweepRemoteCache(in: resolvedHome, con: con, sharedStore: shared)
 
             // Credentials last, and only in the permissive posture. A secret on a strict engine is
             // inert — every network filesystem is denied, so nothing could resolve it — and issuing
@@ -1322,7 +1348,7 @@ public actor Session {
     /// Not fixed here because fact 3 (this file's header) forecloses the obvious fix: detaching
     /// this work would mean using `pagingConnection` from a detached `Task`, and `pagingConnection`
     /// is safe to hold as a single, long-lived, non-`Sendable` `Connection` ONLY because every
-    /// caller — `page`, `sortedRelation`, `closeTable` — is guaranteed by the actor's serial
+    /// caller — all eight of them, listed in fact 3 — is guaranteed by the actor's serial
     /// executor to run to completion before the next one starts. A detached caller would break
     /// that guarantee, which is the one thing standing between "shared Connection" and a data race.
     /// Given the choice between reintroducing that risk and leaving this cliff documented, this

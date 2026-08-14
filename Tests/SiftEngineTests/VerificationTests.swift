@@ -659,29 +659,29 @@ func deltaOpensAndHonoursTombstones() async throws { try await withWorkspace(che
 // The six remote checks. Two of them run everywhere — a strict session refuses before it reaches
 // for anything, and the cache sweep is files plus one local catalog — and four need `httpfs`.
 //
-// 🔴 The enablement condition is `httpfsIsInstalled()`, the LOAD-with-no-INSTALL probe, and NOT the
-// `extensionIsAvailable` helper the delta/excel tests use: that one calls `loadExtensions`, which
-// falls through to `INSTALL`, so using it here would put `extensions.duckdb.org` on the critical
-// path of `swift test` — the exact thing `SIFT_REMOTE_FACTS` gates the `remoteFact` tests for.
-// Everything below is loopback-only, so with the extension already present it needs no network at
-// all and no env var either.
+// 🔴 The enablement condition is `extensionIsInstalled("httpfs")`, the LOAD-with-no-INSTALL probe,
+// and NOT the `extensionIsAvailable` helper the delta/excel tests use: that one calls
+// `loadExtensions`, which falls through to `INSTALL`, so using it here would put
+// `extensions.duckdb.org` on the critical path of `swift test` — the exact thing
+// `SIFT_REMOTE_FACTS` gates the `remoteFact` tests for. Everything below is loopback-only, so with
+// the extension already present it needs no network at all and no env var either.
 
 @Test func aStrictSessionRefusesAUrlAndReachesNothing() async throws {
     try await withWorkspace(checkRemotePosture)
 }
-@Test(.enabled(if: httpfsIsInstalled(), "duckdb httpfs extension not installed"))
+@Test(.enabled(if: extensionIsInstalled("httpfs"), "duckdb httpfs extension not installed"))
 func aPermissiveSessionReadsARemoteParquetThroughTheSqlBox() async throws {
     try await withWorkspace(checkRemoteConnection)
 }
-@Test(.enabled(if: httpfsIsInstalled(), "duckdb httpfs extension not installed"))
+@Test(.enabled(if: extensionIsInstalled("httpfs"), "duckdb httpfs extension not installed"))
 func aServedCsvIsDownloadedOnceAndEverythingAfterThatReadsTheCopy() async throws {
     try await withWorkspace(checkRemoteCSVDownload)
 }
-@Test(.enabled(if: httpfsIsInstalled(), "duckdb httpfs extension not installed"))
+@Test(.enabled(if: extensionIsInstalled("httpfs"), "duckdb httpfs extension not installed"))
 func aServedParquetRangeReadsInPlaceAndLeavesNoCacheFile() async throws {
     try await withWorkspace(checkRemoteParquetRanges)
 }
-@Test(.enabled(if: httpfsIsInstalled(), "duckdb httpfs extension not installed"))
+@Test(.enabled(if: extensionIsInstalled("httpfs"), "duckdb httpfs extension not installed"))
 func aSignedUrlsQueryStringReachesNothingPersistedOrRendered() async throws {
     try await withWorkspace(checkRemoteCredential)
 }
@@ -696,13 +696,17 @@ func aSignedUrlsQueryStringReachesNothingPersistedOrRendered() async throws {
 /// silently gains an outbound install on an unprepared one.
 @Test func theHttpfsProbeAgreesWithABareLoadAndNeverInstalls() throws {
     let db = try scratchDatabase()
-    #expect(httpfsIsInstalled() == ((try? db.connect().execute("LOAD httpfs")) != nil))
+    #expect(extensionIsInstalled("httpfs") == ((try? db.connect().execute("LOAD httpfs")) != nil))
     // The two settings that make the probe offline, asserted rather than assumed: without them a
     // bare LOAD autoinstalls, and the probe becomes the network call it exists to avoid.
     #expect(db.hardened["autoinstall_known_extensions"] == true)
     #expect(db.hardened["autoload_known_extensions"] == true)
     // ...and it must not have registered anything, the way `loadExtensions` does.
     #expect(db.loadedExtensions["httpfs"] == nil)
+    // The decision rather than the delivery, and the half that is not warm-cache-blind: on this Mac
+    // and on the runner `LOAD httpfs` succeeds from `~/.duckdb/extensions` either way, so
+    // `loadedExtensions` above cannot tell a probe that installs from one that does not. This can.
+    #expect(db.networkInstalls.isEmpty)
 }
 @Test func stagingAndUnstagingRoundTripsWithoutChangingTheRows() async throws {
     try await withWorkspace(checkStagingRoundTrip)

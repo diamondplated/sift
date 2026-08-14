@@ -893,7 +893,7 @@ let verificationChecks: [VerificationCheck] = [
 // the port; every one gets its own `~/.sift` from `withWorkspace` and leaves the user's alone; and
 // every permissive one caps its own HTTP clock (see `permissiveSession`).
 
-/// Can DuckDB load `httpfs` out of what is already installed on this machine?
+/// Can DuckDB load `name` out of what is already installed on this machine?
 ///
 /// 🔴 **A bare `LOAD` with no `INSTALL` behind it, and that is the whole gate.**
 /// `Database.loadExtensions` does LOAD→INSTALL→LOAD, so building a permissive `Session` on an
@@ -908,9 +908,18 @@ let verificationChecks: [VerificationCheck] = [
 /// and in those runs it told the reader the extension "may have to be installed over the network"
 /// when it demonstrably did not. `RemoteFactsTests` and friends keep the env gate, because they are
 /// the ones allowed to INSTALL and CI's canary step is where that is exercised.
-func httpfsIsInstalled() -> Bool {
-    guard let con = try? scratchDatabase().connect() else { return false }
-    return (try? con.execute("LOAD httpfs")) != nil
+///
+/// Also the default suite's offline gate: an ungated test that builds a PERMISSIVE `Session`
+/// (`Session.init` asks for `httpfs`, and `azure` when a saved connection needs it) reaches
+/// `extensions.duckdb.org` on a machine that does not have them. Gating those tests on this probe
+/// makes the run offline in both directions — the extension is already on disk, or the test does not
+/// run — rather than merely offline-tolerant, which is what "the assertions are all `!= nil`" bought
+/// and is not the same contract.
+func extensionIsInstalled(_ name: String) -> Bool {
+    guard Database.isExtensionName(name), let con = try? scratchDatabase().connect() else {
+        return false
+    }
+    return (try? con.execute("LOAD \(name)")) != nil
 }
 
 /// THE permissive `Session` for a workspace — the only way to reach the posture at all — with its
@@ -921,7 +930,7 @@ func httpfsIsInstalled() -> Bool {
 /// `disabled_filesystems` can only ever GROW inside a live `Database` — narrowing it, clearing it
 /// and `RESET`ing it all fail. So a posture is chosen once, at open, and there is no later switch.
 func permissiveSession(_ ws: Workspace) throws -> Session {
-    guard httpfsIsInstalled() else {
+    guard extensionIsInstalled("httpfs") else {
         throw VerifySkipped(
             message: "the DuckDB httpfs extension is not installed here, so no remote read can be "
                 + "checked \u{2014} Sift installs it the first time you save a connection"
@@ -1349,7 +1358,7 @@ func getsLogged(_ server: LoopbackHTTPServer)
     )
     try requireEqual(cacheFileNames(inHome: ws.home).count, 4, "planted cache entries")
 
-    Session.sweepRemoteCache(in: ws.home, con: con)
+    Session.sweepRemoteCache(in: ws.home, con: con, sharedStore: true)
 
     try requireEqual(cacheFileNames(inHome: ws.home), [keptName], "what survived the sweep")
     try require(

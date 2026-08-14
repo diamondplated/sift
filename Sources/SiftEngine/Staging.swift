@@ -19,8 +19,9 @@ import SiftCore
 // acquiring it and finishing with it (Session.swift's header, fact 3), and a multi-second CTAS on
 // it would both break that proof and freeze every page request behind it.
 //
-// THREE places in this file DO touch `pagingConnection` — half of its six users, which is why
-// fact 3 names them:
+// THREE places in this file DO touch `pagingConnection` — three of its eight users, which is why
+// fact 3 names them (it said six until the phase-1 review counted; the other five are in
+// Session.swift):
 //
 //   * `applyStaged` — drops the stale materialized-sort TEMP TABLE the swap orphaned;
 //   * `unstage` — drops the same thing, going the other way;
@@ -628,7 +629,23 @@ extension Session {
     /// `removeItem` unlinks the link, never the target, and `attributesOfItem` does not follow it
     /// either, so the file it points at is untouched. `remoteCacheSurvivesOutsideItsOwnDirectory`
     /// is the test that says so, and it is worth more than three that prove files inside it die.
-    static func sweepRemoteCache(in home: String, con: Connection) {
+    ///
+    /// 🔴 **`sharedStore` is the second load-bearing part, and it is a PARAMETER rather than an
+    /// assumption because the assumption was wrong.** The keep-set comes from `_sift_sources` on the
+    /// connection it is handed; the directory comes from the home. Those are the same scope only
+    /// when this session owns the home's store. A session that lost the lock and fell back to
+    /// `stage-<pid>.duckdb` (see `Session.init`) has a FRESH, EMPTY catalog and the SHARED home — so
+    /// `expected` is `∅` and every file in `<home>/remote-cache/` is an orphan, including the ones
+    /// the instance still holding the lock downloaded and is reading through a live view. That
+    /// instance is by definition still running: the lock failing is what proves it. Its next page
+    /// fails with a DuckDB IO error on a file it downloaded itself.
+    ///
+    /// `sweepPrivateStores` directly above gets the same question right (it PID-scopes and
+    /// `kill(pid, 0)`-checks) and is the model. No default value on purpose: this is the one
+    /// destructive operation in the engine, and a caller has to say which scope it is in rather than
+    /// inherit an answer.
+    static func sweepRemoteCache(in home: String, con: Connection, sharedStore: Bool) {
+        guard sharedStore else { return }
         let dir = (home as NSString).appendingPathComponent(remoteCacheDirName)
         guard let names = try? FileManager.default.contentsOfDirectory(atPath: dir) else { return }
 
