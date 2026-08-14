@@ -248,6 +248,7 @@ let verificationChecks: [VerificationCheck] = [
     VerificationCheck(name: "skipped preamble", run: checkPreambleAteTheFile),
     VerificationCheck(name: "snippet and rendered SQL", run: checkSnippetAndRenderedSQL),
     VerificationCheck(name: "SELECT-only gate", run: checkSelectOnlyGate),
+    VerificationCheck(name: "remote connection", run: checkRemoteConnection),
     VerificationCheck(name: "staging and unstaging", run: checkStagingRoundTrip),
     VerificationCheck(name: "merge", run: checkMerge),
     VerificationCheck(name: "export", run: checkExport),
@@ -876,6 +877,73 @@ let verificationChecks: [VerificationCheck] = [
     _ = try await session.exitSQLMode(t.name)
     let back = try await session.page(t.name, offset: 0, limit: 500)
     try requireEqual(back.rows.count, 500, "rows after leaving SQL mode")
+}
+
+// MARK: the connections config decides the posture
+
+/// 🔴 The other half of the hardening claim, and the half nothing else in `--verify` can make.
+/// Every check above this one runs on a default home, where there is no `connections.json` and the
+/// engine is airtight — that is the strict half, and `checkSelectOnlyGate` plus the posture tests in
+/// the suite already pin it. This one plants `allowRemote: true` in a workspace's own home and
+/// proves the whole chain end to end: the file is read BEFORE the `Database` opens, `harden()` skips
+/// the deny list because of what it said, `httpfs` is loaded because of what it said, and a real
+/// `read_parquet` over a real socket comes back with rows through the shipped SQL path.
+///
+/// GATED behind `SIFT_REMOTE_FACTS=1`, matching `RemoteFactsTests`/`RemotePostureTests`: `httpfs`
+/// has to be present, and `loadExtensions` does LOAD→INSTALL→LOAD, so an unprepared machine would
+/// reach for the network in the middle of a command a user runs to check their own install. A skip
+/// is not a pass (rule 3 in this file's header) — it says which switch to flip.
+@Sendable func checkRemoteConnection(_ ws: Workspace) async throws {
+    guard ProcessInfo.processInfo.environment["SIFT_REMOTE_FACTS"] == "1" else {
+        throw VerifySkipped(
+            message: "set SIFT_REMOTE_FACTS=1 to check a remote read — it needs the httpfs "
+                + "extension, which may have to be installed over the network"
+        )
+    }
+
+    // Written before the Session exists, which is the point: `Session.init` reads it before it
+    // opens the store, and the posture is frozen from that moment.
+    try Session.ensureHomeDirectory(ws.home)
+    try Session.writeRemoteConfig(
+        RemoteConfig(allowRemote: true), to: Session.connectionsPath(in: ws.home)
+    )
+
+    let server = try LoopbackHTTPServer()
+    defer { server.stop() }
+    let parquet = try writeParquet(ws.path("remote.parquet"), rows: 1000)
+    server.register(path: "/remote.parquet", body: try Data(contentsOf: URL(fileURLWithPath: parquet)))
+
+    let session = try ws.session()
+    try requireEqual(await session.connections().allowRemote, true, "the config the session read back")
+    try requireEqual(session.allowRemoteAtLaunch, true, "the posture the Database opened with")
+    // MEASURED (remote facts §2): the permissive posture never issues the SET at all, so the key is
+    // ABSENT rather than false — absent is "Sift deliberately never asked", false is "DuckDB
+    // refused", and collapsing them would hide a renamed setting.
+    try require(
+        session.database.hardened["disabled_filesystems"] == nil,
+        "a permissive session still disabled the network filesystems"
+    )
+    guard session.engineInfo().extensions["httpfs"] == .loaded else {
+        throw VerifySkipped(
+            message: "the DuckDB httpfs extension is not installed, so no remote read can be checked"
+        )
+    }
+
+    // Loopback needs nothing like the default 30 s, and a machine that cannot reach its own socket
+    // should say so in seconds — MEASURED on the first CI canary: 244 s to report nothing.
+    try session.database.connect().execute("SET GLOBAL http_timeout=5")
+
+    // Through the shipped path — the SELECT-only gate and `wrapUserSQL` — not a hand-built
+    // connection. The claim is about what a user's query does, not about a DuckDB feature.
+    let local = try await session.openPath(try writeSalesCSV(ws.path("sales.csv"), rows: 20))
+    let page = try await session.runSQL(
+        local.name,
+        sql: "SELECT count(*) AS n FROM read_parquet('\(server.baseURL)/remote.parquet')",
+        offset: 0, limit: 10
+    )
+    try requireEqual(page.rows.count, 1, "rows from the remote count")
+    try requireEqual(page.rows[0][0].display, "1000", "rows read over http through a permissive Session")
+    try require(!server.requestLog.isEmpty, "the read returned an answer without reaching the server")
 }
 
 // MARK: staging

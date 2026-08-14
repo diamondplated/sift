@@ -117,6 +117,25 @@ public actor Session {
     public nonisolated let dbPath: String
     /// `false` once a second engine has been found holding the shared store's lock — see `init`.
     public nonisolated let sharedStore: Bool
+    /// `<siftHome>/connections.json` — the remote-connections config this session read at launch
+    /// and rewrites on every change. Public because a Connections screen that refuses to start has
+    /// to be able to say which file to fix.
+    public nonisolated let connectionsPath: String
+    /// The posture the `Database` was actually opened with, frozen for the life of this session.
+    ///
+    /// 🔴 Not the same thing as `connections().allowRemote`, and conflating them is the bug this
+    /// property exists to prevent. MEASURED (remote facts §2): `disabled_filesystems` only ever
+    /// grows inside one `duckdb_database`, so the switch in the config can be flipped at any time
+    /// and the ENGINE keeps whatever it started with. Everything in Connections.swift that reports
+    /// `ConnectionOutcome` compares the two.
+    public nonisolated let allowRemoteAtLaunch: Bool
+    /// The Keychain service this session files credentials under.
+    ///
+    /// Production is always `Keychain.service`. The seam exists so ConnectionsTests can point a
+    /// real `Session` at `dev.sift.connections.<something>` and do genuine add/read/delete round
+    /// trips without ever touching an item a user actually saved — the same namespace split
+    /// `KeychainTests` makes, applied one layer up. There is no public way to set it.
+    nonisolated let keychainService: String
     /// `@unchecked Sendable` (Database.swift) and immutable after `init`, so `nonisolated` lets
     /// the detached background pipeline in `runAfterOpen` reach it without an actor hop — the
     /// whole point of that path being detached in the first place.
@@ -193,7 +212,24 @@ public actor Session {
     /// seconds of `sleep` in a parallel suite is a flake generator, not a test.
     var stageDwellSeconds: Double = 3.0
 
+    // Remote connections (Connections.swift owns every method that touches these; they live here
+    // because Swift extensions cannot add stored properties).
+    //
+    /// The config as it stands on disk, read before the `Database` opened and rewritten by every
+    /// `addConnection`/`removeConnection`/`setAllowRemote`.
+    var remoteConfig: RemoteConfig
+    /// Why a saved connection's credential is not live on this engine, by connection id. Filled in
+    /// at launch by `issueSecrets` and per-connection by `addConnection`. **Recorded, never
+    /// thrown**: one bad credential must not stop the app opening local files.
+    var secretIssues: [UUID: String] = [:]
+
+    /// The shipping entry point. Delegates so the Keychain namespace stays out of the public API —
+    /// see `keychainService`.
     public init(home: String? = nil) throws {
+        try self.init(home: home, keychainService: Keychain.service)
+    }
+
+    init(home: String?, keychainService: String) throws {
         let resolvedHome = Self.resolveHome(home)
         // Read once into a local: the failure path below needs it while `self` is still only
         // partly initialized, and it must be the SAME value `deinit` will release with.
@@ -214,6 +250,18 @@ public actor Session {
         // throws — so every failure path past the claim has to hand the home back explicitly.
         do {
             try Self.ensureHomeDirectory(resolvedHome)
+
+            // 🔴 BEFORE the `Database` opens, and that ordering is the whole security posture.
+            // `harden(allowRemote:)` is applied once, to a `Database` that is already open, and
+            // MEASURED (remote facts §2) the disabled-filesystem set only ever grows afterwards —
+            // there is no second chance. Reading the config later would mean either opening the
+            // engine in the wrong posture or opening it twice. It also means a config Sift refuses
+            // costs no store file: nothing on disk is touched before this line. See
+            // `Connections.swift` for why a corrupt or future-version file refuses the session
+            // rather than defaulting.
+            let connectionsPath = Self.connectionsPath(in: resolvedHome)
+            let config = try Self.loadRemoteConfig(connectionsPath)
+
             Self.sweepPrivateStores(in: resolvedHome)
 
             // DuckDB takes an exclusive lock on the database file, so only one engine can own the
@@ -253,9 +301,13 @@ public actor Session {
             self.dbPath = path
             self.sharedStore = shared
             self.database = db
+            self.connectionsPath = connectionsPath
+            self.remoteConfig = config
+            self.allowRemoteAtLaunch = config.allowRemote
+            self.keychainService = keychainService
 
-            db.harden()
-            db.loadExtensions(sessionExtensions)
+            db.harden(allowRemote: config.allowRemote)
+            db.loadExtensions(sessionExtensions + remoteExtensions(for: config))
 
             let con: Connection
             do {
@@ -273,6 +325,16 @@ public actor Session {
             // a copy that aged out, blew the budget, or no longer matches its source gets
             // collected. `try?`: a store that cannot be purged must not stop the engine starting.
             _ = try? Self.purgeStagedTables(con, open: [], tables: nil, all: false)
+
+            // Credentials last, and only in the permissive posture. A secret on a strict engine is
+            // inert — every network filesystem is denied, so nothing could resolve it — and issuing
+            // one would mean reading the Keychain (a prompt, on a locked one) on behalf of a session
+            // the user has told to stay local. Best effort per connection: `issueSecrets` RECORDS
+            // failures rather than throwing, so a deleted Keychain item costs one row in the
+            // Connections screen and not the whole app.
+            if config.allowRemote {
+                self.secretIssues = Self.issueSecrets(con, config: config, service: keychainService)
+            }
             self.pagingConnection = con
         } catch {
             Self.openHomes.release(resolvedHome, token: token)
