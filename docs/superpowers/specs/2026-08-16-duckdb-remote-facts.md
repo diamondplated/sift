@@ -10,8 +10,9 @@ Measured 2026-08-13 on macOS 26 (Darwin 25.3), Swift 6.3, arm64, against `b59d77
 Where a fact deserves a permanent executable pin it lives in
 `Tests/DuckDBKitTests/RemoteFactsTests.swift`, gated behind **`SIFT_REMOTE_FACTS=1`** — those
 tests need `httpfs`/`azure`/`delta`, and `loadExtensions` does LOAD→INSTALL→LOAD, so leaving them
-in the default suite would put the network on the critical path of `swift test`. The default suite
-is 729 tests before this change and 729 tests after it, with 13 skipped.
+in the default suite would put the network on the critical path of `swift test`. Measured both
+ways: `swift test` runs **729** tests before this change and **729** after it (742 declared, 13
+skipped); `SIFT_REMOTE_FACTS=1 swift test --filter remoteFact` runs the 13 in 1.3 s.
 
 **The test oracle.** Probes that need a server use a ~120-line HTTP/1.1 origin server on
 `127.0.0.1` with `Range`/206 support, a request log, and a switch for how it treats `Range`
@@ -543,15 +544,39 @@ only SDK oracle this project has, and it is also the only place where a cold `IN
 `SIFT_REMOTE_FACTS` is set only in that step, so the `swift test` step above it is untouched and
 the main suite stays offline.
 
-**Measured.** See the run linked from the draft PR. The canary is the check that `INSTALL` reaches
-the network from a GitHub runner, that the signed `httpfs`/`azure` binaries exist for
-macos-15/arm64 at DuckDB 1.5.5, and that the loopback oracle can bind a socket inside the runner
-sandbox — the last of which cannot be assumed after the `NWListener` result on this Mac.
+**Measured — run 1 (`31758872022`, red, and worth every minute).** The canary answered its
+question and caught a bug that would otherwise have shipped as an intermittent test.
 
-**Consequence.** If the canary is green, the gated tests can stay gated and be run on demand plus
-on this one CI step. If `INSTALL` is unavailable on the runner, the extensions must be vendored
-alongside `libduckdb` by `fetch-duckdb.sh` — which is the better answer anyway, since the shipped
-app cannot depend on a user having network access at first open.
+- **`INSTALL httpfs` and `INSTALL azure` work on macos-15.** Every test that only needs an
+  extension passed on the runner: facts 1, 2, 6a, 6b, 6c, 8 and 9. Signed binaries for DuckDB
+  1.5.5 exist for the runner's platform (`arm64e-apple-macos14.0`) and the runner has the network.
+  All the Azure and secret findings above are therefore reproduced on a second machine, not just
+  this Mac.
+- **Every server-backed test failed, all with an empty request log**:
+  `IO Error: Timeout was reached error for HTTP HEAD to 'http://127.0.0.1:PORT/…'`. Nothing was
+  ever accepted. The whole step took **244 s**, all thirteen tests reporting at the same instant —
+  every one of them sitting on the default 30 s `http_timeout` through its retries.
+
+That is a defect in the oracle, not in DuckDB, and there were two of them. The accept loop ran on
+`DispatchQueue.global()` with a blocking `accept()` — the textbook thread-starvation antipattern,
+and thirteen parallel tests each blocked a pool thread — and `accept` returning `-1` with `EINTR`
+was treated as fatal, killing the listener permanently. Both fixed: a real `Thread` per listener
+and per connection, and only a genuinely dead socket ends the loop. `recv`/`send` retry on `EINTR`
+too. The server-backed tests now also set `SET GLOBAL http_timeout=5` (loopback needs nothing
+like 30 s), so a future environment that cannot reach the oracle fails in seconds instead of four
+minutes.
+
+**Measured — run 2, on the fixed oracle: green.** All 13 pass on macos-15.
+
+**Consequence.** Keep the canary step on the branch and keep the tests gated: the default suite
+stays offline and CI stays a real check on `INSTALL`. Two lessons beyond the verdict: this project's
+"CI is the only SDK oracle" rule extends to **concurrency and sockets**, not just the SDK — a
+3-core runner surfaced a threading bug thirteen parallel tests could not surface on this Mac; and
+any test that reaches the network must cap its own timeout, or one broken assumption costs four
+minutes of CI per run. `INSTALL` being available on the runner does **not** settle the shipping
+question: the app still cannot assume a user has network access at first open, so vendoring
+`httpfs`/`azure` alongside `libduckdb` in `fetch-duckdb.sh` remains the right call for the app
+bundle.
 
 ---
 
