@@ -19,6 +19,13 @@ import SiftCore
 //      pipeline, and `runProfile` each take their own throwaway `Connection` — the direct analogue
 //      of Python's `con.cursor()` for one-shot work. `Connection` is deliberately not `Sendable`
 //      and never crosses a task boundary: profiling's is created *inside* its detached task.
+//
+//      `openPath`'s REMOTE half is the exception that proves the "initial work runs on the actor"
+//      half of this: `buildRemoteOpen` is a detached `Task` whose `Connection` is created inside
+//      it, because a hung endpoint is a real and ordinary thing and it must suspend the open
+//      rather than freeze the actor for the OS's idea of a timeout (MEASURED, RemoteProbe.swift:
+//      31 s on the macos-15 runner for a HEAD asked to give up after 1). It touches NO actor state
+//      and in particular never `pagingConnection` — the six users below are still six.
 //   3. SIX methods share ONE long-lived `Connection` (`pagingConnection`), for as long as the
 //      `Session` exists, instead of opening a fresh one per call. In this file: `page`,
 //      `sortedRelation`, `closeTable`. In Staging.swift: `applyStaged` (drops a stale
@@ -454,6 +461,35 @@ public actor Session {
         fileSize(dbPath) + fileSize(dbPath + ".wal")
     }
 
+    /// The byte count a staging decision is about — `SourceKey.size` for a local source, the CACHE
+    /// FILE's real size for a downloaded remote one.
+    ///
+    /// 🔴 The substitution is not cosmetic. For a remote source `key.size` is the server's
+    /// `Content-Length`, and that is the wrong number twice over: it is **0** when the server sent
+    /// no length at all (`buildRemoteSource`'s documented fallback), which reads as "only 0 B —
+    /// re-reading it is faster than copying it" and silently disables staging for the whole source;
+    /// and for a `.csv.gz` it is the COMPRESSED length, so a 30 MB download that expands to 900 MB
+    /// of text is judged as 30. What `shouldStage` is actually asking is "how much text does DuckDB
+    /// have to re-parse on every page", and once the object is on disk the file itself answers that
+    /// exactly.
+    ///
+    /// An in-place remote parquet has no cache file and keeps `key.size` — `neverStage` refuses it
+    /// whatever the number says, so there is nothing here for it to get wrong.
+    ///
+    /// Not `private`: `stageNow` re-runs the same decision at the moment the copy would start
+    /// (Python's ordering too), and it has to ask the same question with the same number or the two
+    /// disagree about a source the banner has already offered to stage.
+    nonisolated func stagingSizeBytes(_ spec: SourceSpec) -> Int {
+        guard let cache = spec.remote?.cachePath else { return spec.key.size }
+        return fileSize(cache)
+    }
+
+    /// Where this source's bytes came from, for `shouldStage`'s wording. Shared by `runAfterOpen`
+    /// and `stageNow` for the reason above: one question, one answer.
+    nonisolated func transport(of spec: SourceSpec) -> Transport {
+        spec.remote == nil ? .local : .remote
+    }
+
     // MARK: - relations
 
     public func table(_ name: String) throws -> Table {
@@ -633,7 +669,20 @@ public actor Session {
                     + "what defeats null padding. Pick one."
             )
         }
-        let expanded = (path.trimmingCharacters(in: .whitespacesAndNewlines) as NSString).expandingTildeInPath
+        let trimmed = path.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        // 🔴 BEFORE the `fileExists` guard, and the order is the whole branch. A URL is not a path:
+        // `realPath` leaves it alone, `stat` fails, and every remote source in the product would
+        // come back as `No such file or folder: https://…` — Sift refusing, in its own voice, to
+        // open something it can open. `classifyRemote` returning `nil` means "not a URL Sift
+        // reaches", which is the local flow below, untouched.
+        if let remote = classifyRemote(trimmed) {
+            return try await openRemote(
+                remote, name: name, sheet: sheet, nullPadding: nullPadding, skipPreamble: skipPreamble
+            )
+        }
+
+        let expanded = (trimmed as NSString).expandingTildeInPath
         let resolved = realPath(expanded)
         guard FileManager.default.fileExists(atPath: resolved) else {
             throw SessionError("No such file or folder: \(resolved)")
@@ -675,14 +724,36 @@ public actor Session {
             throw SessionError(error.firstLine)
         }
 
+        return try finishOpen(
+            spec: spec, requestedName: name,
+            displayName: (resolved as NSString).lastPathComponent
+        )
+    }
+
+    /// The half of an open both branches share: derive a free table name, put the source into the
+    /// catalog under a fresh generation, reuse a staged copy if one matches, and kick the
+    /// background pipeline.
+    ///
+    /// Factored out when the remote branch arrived rather than copied into it, and that is not
+    /// tidiness: every line below is a rule with a measurement or a review behind it — the sorted
+    /// `state()` order that `openedAt` carries, `adoptStagedCopy`'s `CREATE OR REPLACE VIEW`-over-a-
+    /// TABLE catalog error, the `openedAt` snapshot the whole background pipeline is checked
+    /// against. A second copy is a second place for one of them to be dropped, and the copy that
+    /// drops one still looks right.
+    ///
+    /// `displayName` is the source's own name — the last path component locally,
+    /// `RemoteURL.displayName` for a URL. `extraNotes` is what the branch learned on the way in
+    /// that the spec cannot say for itself; today that is exactly one thing, the SAS'd parquet that
+    /// had to be downloaded.
+    private func finishOpen(
+        spec: SourceSpec, requestedName: String?, displayName: String, extraNotes: [String] = []
+    ) throws -> Table {
         let taken = Set(tables.keys)
         let base: String
-        if let name, !name.isEmpty {
-            base = name
+        if let requestedName, !requestedName.isEmpty {
+            base = requestedName
         } else {
-            let raw = spec.fmt == .xlsx
-                ? (spec.sheet ?? (resolved as NSString).lastPathComponent)
-                : (resolved as NSString).lastPathComponent
+            let raw = spec.fmt == .xlsx ? (spec.sheet ?? displayName) : displayName
             base = try sanitizeTableName(raw)
         }
         let tname = taken.contains(base) ? try sanitizeTableName(base, taken: taken) : base
@@ -690,6 +761,7 @@ public actor Session {
         nextOpenGeneration += 1
         var t = Table(name: tname, spec: spec, qspec: QuerySpec(relation: tname), openedAt: nextOpenGeneration)
         if let rowCount = spec.rowCount { t.rowCount = rowCount }
+        t.notes.append(contentsOf: extraNotes)
 
         if spec.fmt == .xlsx, !spec.sheets.isEmpty {
             t.notes.append(
@@ -737,6 +809,172 @@ public actor Session {
         return t
     }
 
+    // MARK: - open: the remote branch
+
+    /// Open a URL. Four gates that never touch the network, then one detached build that does.
+    ///
+    /// The gates are in this order because each one's sentence is only correct once the ones above
+    /// it have passed: there is no point naming an extension to a session that may not reach the
+    /// network at all, and no point naming a missing Azure connection to a session whose azure
+    /// extension is not installed. Each of them is a local decision from state this actor already
+    /// holds, so the whole prefix costs nothing and refuses in microseconds — the same
+    /// "refuse before the wire" rule `remoteFormat`'s glob and Delta refusals follow one layer down.
+    func openRemote(
+        _ url: RemoteURL, name: String?, sheet: String?, nullPadding: Bool, skipPreamble: Bool
+    ) async throws -> Table {
+        try checkRemotePosture(url)
+        try checkRemoteExtension(url)
+        try checkRemoteConnection(url)
+
+        let opened = try await remoteOpen(
+            url, sheet: sheet, nullPadding: nullPadding, skipPreamble: skipPreamble
+        )
+        return try finishOpen(
+            spec: opened.spec, requestedName: name, displayName: url.displayName,
+            extraNotes: opened.notes
+        )
+    }
+
+    /// May this session reach the network at all? MEASURED (remote facts §2, and `Connections.swift`
+    /// is built on it): the posture is frozen when the `Database` opens and can never be narrowed or
+    /// widened inside it, so this is `allowRemoteAtLaunch` and never `connections().allowRemote`.
+    ///
+    /// The two sentences are different because the FIXES are different, which is the whole reason
+    /// `ConnectionOutcome` exists as a return value in T6: a user who has already flipped the switch
+    /// has nothing left to do in Connections and must be told to relaunch, not sent back to a screen
+    /// that already says yes. Telling them to "turn it on" there is how a correct setting gets
+    /// toggled twice by someone hunting for the thing they missed.
+    private func checkRemotePosture(_ url: RemoteURL) throws {
+        guard !allowRemoteAtLaunch else { return }
+        guard !remoteConfig.allowRemote else {
+            throw SessionError(
+                "Remote sources are switched on in Data \u{2192} Connections…, but this Sift "
+                    + "session started with them off \u{2014} relaunch Sift to open "
+                    + "\(url.displayName)."
+            )
+        }
+        throw SessionError(
+            "Sift is not allowed to reach the network in this session, so it cannot open "
+                + "\(url.displayName) \u{2014} switch remote sources on in Data \u{2192} "
+                + "Connections…, then relaunch Sift."
+        )
+    }
+
+    /// Is the DuckDB extension this scheme reads through actually here?
+    ///
+    /// Asked through `installExtension`, which is idempotent and free when the extension is already
+    /// loaded (the common call — a permissive session asks for `httpfs` at launch). Going through it
+    /// rather than reading `loadedExtensions` directly is what makes the tri-state exhaustive: an
+    /// `az://` URL on a permissive session with no saved Azure connection has no `azure` entry at
+    /// all, because `remoteExtensions(for:)` only asks for it when a connection needs it, and
+    /// "absent" is not a state with a sentence — `installExtension` turns it into `.loaded` (this is
+    /// a session the user has authorised to reach the network, so a first INSTALL here is exactly
+    /// what they asked for) or into one of the two below.
+    ///
+    /// `.unavailable` carries DuckDB's own first line, which is what separates "there is no such
+    /// extension" from "this machine has no network" — two different problems and two different
+    /// fixes, which is why T1 made the state carry the reason at all.
+    private func checkRemoteExtension(_ url: RemoteURL) throws {
+        let name = remoteExtensionName(url.scheme)
+        switch installExtension(name) {
+        case .loaded:
+            return
+        case .unavailable(let why):
+            throw SessionError(
+                "Sift reads \(url.scheme.rawValue):// sources through the DuckDB \(name) extension, "
+                    + "and it is not available here: \(why). Install it from Data \u{2192} "
+                    + "Connections…, once, on a machine with network access."
+            )
+        case .rejectedName:
+            throw SessionError(
+                "Sift asked DuckDB for an extension name it cannot use (\(name)) \u{2014} this is a "
+                    + "bug in Sift, not something you can fix."
+            )
+        }
+    }
+
+    /// Does a saved Azure connection cover this URL? Azure only.
+    ///
+    /// **Nothing is looked up FROM the match** — the secret was issued at launch and DuckDB resolves
+    /// it by scope, so this changes no SQL and passes nothing on. It exists purely so an Azure URL
+    /// with no credential behind it gets Sift's sentence instead of DuckDB's
+    /// `Invalid Input Error: No valid Azure credentials found!` (MEASURED — spike §1, the error every
+    /// unauthenticated `az://` read produces), which names nothing the user can act on.
+    ///
+    /// The account is the host's first label, and it is only really there for `abfss://`:
+    /// `abfss://c@acct.dfs.core.windows.net/f` carries the account (the `c@` is already stripped by
+    /// `classifyRemote`), while `az://container/blob` names only the container and leaves the account
+    /// to the secret. That asymmetry is why a lone saved azure connection is accepted whatever the
+    /// host says — with one connection there is nothing to choose between, and refusing would make
+    /// `az://` unopenable for the ordinary single-account user.
+    ///
+    /// s3 needs nothing: an anonymous read of a public bucket is a real and supported thing
+    /// (`createSecretSQL` returns `nil` for a half-empty s3 spec for the same reason). http(s) needs
+    /// nothing either — a pasted URL is the most common remote source there is.
+    ///
+    /// Internal rather than `private` so its sentences can be tested without an Azure account or an
+    /// installed `azure` extension: reaching this through `openRemote` means passing
+    /// `checkRemoteExtension` first, which for an `az://` URL is an INSTALL, and a sentence about a
+    /// missing connection should not need a network to prove.
+    func checkRemoteConnection(_ url: RemoteURL) throws {
+        guard url.scheme == .az || url.scheme == .abfss else { return }
+        let azure = remoteConfig.connections.filter { $0.kind == .azure }
+        let account = String(url.host.prefix { $0 != "." })
+        if azure.contains(where: {
+            $0.accountName?.caseInsensitiveCompare(account) == .orderedSame
+        }) { return }
+        if azure.count == 1 { return }
+
+        guard !azure.isEmpty else {
+            throw SessionError(
+                "\(url.displayName) is an Azure source and no Azure connection is saved, so Sift "
+                    + "has no credential to read it with \u{2014} add one in Data \u{2192} "
+                    + "Connections…."
+            )
+        }
+        throw SessionError(
+            "\(url.displayName) is an Azure source and none of the \(azure.count) saved "
+                + "connections is for \(url.host) \u{2014} add the right one in Data \u{2192} "
+                + "Connections…, or use the abfss:// form, which names the storage account."
+        )
+    }
+
+    /// The detached half: HEAD, format, download, spec. Off the actor, with its own `Connection`.
+    ///
+    /// 🔴 **Detached because a hung endpoint must suspend the OPEN, never the actor.** Everything
+    /// inside is a network round trip in the bad case, and two of the three are synchronous DuckDB
+    /// calls that no `Task.cancel` can reach. Run on the actor, one unreachable host would block
+    /// paging on every other open table, `state()`, and every `apply*` callback from every other
+    /// table's background pipeline — the `page` cliff this file's header documents, except caused by
+    /// somebody else's server rather than by a big sort.
+    ///
+    /// The errors are unwrapped here rather than inside, so the three refusal types RemoteProbe
+    /// raises (`UnsupportedSource` for a glob, a remote Delta table, an over-cap object;
+    /// `LegacyXls`; `DuckDBError` for anything the engine said) reach the user as the one clean
+    /// sentence they already are — the identical wrap `openPath`'s local half puts around
+    /// `buildSource`.
+    private func remoteOpen(
+        _ url: RemoteURL, sheet: String?, nullPadding: Bool, skipPreamble: Bool
+    ) async throws -> RemoteOpen {
+        let database = self.database
+        let home = self.siftHome
+        let fetchedAtNs = fetchClockNs()
+        do {
+            return try await Task.detached {
+                try await buildRemoteOpen(
+                    database: database, home: home, url: url, fetchedAtNs: fetchedAtNs,
+                    sheet: sheet, nullPadding: nullPadding, skipPreamble: skipPreamble
+                )
+            }.value
+        } catch let error as UnsupportedSource {
+            throw SessionError(error.message)
+        } catch let error as LegacyXls {
+            throw SessionError(error.message)
+        } catch let error as DuckDBError {
+            throw SessionError(error.firstLine)
+        }
+    }
+
     // MARK: - post-open background work
 
     /// Background work: exact count, bad-row detection, staging decision — in that order. Runs
@@ -777,6 +1015,16 @@ public actor Session {
     ) async {
         guard let connection = try? database.connect() else { return }
 
+        // 🔴 **The remote adaptation is that there is none, and that is the design working rather
+        // than a gap.** A remote text source has already been downloaded once (`buildRemoteOpen`),
+        // so `spec.target` is a local cache file and both steps below are the ordinary LOCAL
+        // pipeline reading an ordinary local file: the exact count is a `count(*)` over the cache,
+        // the bad-row scan is the same all-varchar pass, and neither touches the network. An
+        // in-place remote parquet skips both for the same reasons a local parquet does — its
+        // `rowCount` came free from the footer, so the count never runs, and `rawRelationExpr` is
+        // `nil` for a format that carries real types, so the scan never runs either. The whole point
+        // of downloading once (MEASURED — spike §7: a bare `read_csv(url)` fetches 200 % of the
+        // object) is that nothing after the download has to know it was ever remote.
         var rowCount = initialRowCount
         if rowCount == nil {
             await applyCounting(name, true, openedAt: openedAt)
@@ -789,7 +1037,10 @@ public actor Session {
         }
 
         let free = freeDiskBytes(at: siftHome)
-        let decision = shouldStage(fmt: spec.fmt, sizeBytes: spec.key.size, freeBytes: free)
+        let decision = shouldStage(
+            fmt: spec.fmt, sizeBytes: stagingSizeBytes(spec), freeBytes: free,
+            transport: transport(of: spec)
+        )
         await applyStageDecision(name, decision, openedAt: openedAt)
 
         // `needsConfirm` (a source over 20 GB) is the user's call, not a background job's.
@@ -1060,6 +1311,151 @@ public struct TablePage: Sendable {
     public let limit: Int
     public let milliseconds: Double
     public let total: Total
+}
+
+// MARK: - free helpers: the remote open (no actor state; runs in a detached task)
+
+/// What a remote open produced: the spec, plus anything the branch learned that the spec has no
+/// field for. `Sendable` because it crosses back out of the detached task.
+struct RemoteOpen: Sendable {
+    let spec: SourceSpec
+    let notes: [String]
+}
+
+/// Where downloaded remote objects live, under `SIFT_HOME`.
+let remoteCacheDirName = "remote-cache"
+
+/// The note a SAS-signed parquet gets, and the shape of the ruling behind it.
+///
+/// 🔴 A `?sv=…&sig=…` query is a **bearer credential**. `RemoteRef` deliberately carries none
+/// (Types.swift states it as a rule), because a `SourceSpec` is rendered into the `CREATE VIEW`
+/// text DuckDB writes into the on-disk store and its `key.path` is written into `_sift_sources` —
+/// an in-place read would put the signature in both. So a SAS'd parquet is DOWNLOADED, like a text
+/// format, and that is the ruling rather than a refusal: refusing would mean the shape most people
+/// are handed a private blob in simply does not open, to protect an optimisation. The cost is real
+/// and is what this note is for — range reads are the whole reason parquet is normally read in
+/// place (MEASURED, spike §7: `count(*)` over 28.6 MB costs 64 KB), and a downloaded copy pays for
+/// the object once instead. Plain `https://` parquet and `az://`-through-a-connection parquet still
+/// read in place: their credential is a Database-scoped secret, not a string in the URL.
+let sasParquetNote =
+    "SAS-signed parquet cannot be read in place without persisting the token, so Sift downloaded "
+    + "a local copy instead"
+
+/// The connection-needing half of a remote open. Called only from `Session.remoteOpen`'s detached
+/// task, and touches no actor state — `database` is `@unchecked Sendable` and immutable, `home` is
+/// a string.
+///
+/// The order is the cheap-and-local-first order every remote path in this codebase uses:
+///
+///  1. **The format**, from the URL's own extension — which is also where the glob and Delta
+///     refusals live, and why this goes FIRST rather than after the HEAD it reads more naturally
+///     after. Both refusals are decided from the URL text alone (MEASURED, spike §3 and §4: DuckDB
+///     refuses a remote glob at plan time, and `delta_scan` over http dies inside delta-kernel-rs
+///     without one request leaving the machine), so putting a HEAD in front of them would send a
+///     request on behalf of a source Sift has already decided it will not open — and for the Delta
+///     case that refusal is the only thing standing between a URL and tombstoned rows served as
+///     live data.
+///  2. **The HEAD**, for identity. `nil` for `az`/`s3` by design (no `URLSession` can sign one) and
+///     `nil` for every failure — the read below produces the error a user can act on, and a second
+///     one from here would only race it.
+///  3. **The download decision.** Everything that is not parquet is a text format, and MEASURED
+///     (spike §7) reading one in place re-downloads the whole object per statement — so it is
+///     downloaded once and the LOCAL pipeline takes it from there. Parquet reads in place, except
+///     when a SAS is in the URL (see `sasParquetNote`).
+///  4. **The spec**, `buildRemoteSource`, which re-sniffs the cache file from its magic bytes.
+///
+/// **T7's extension-less-CSV concern dies here, with no new `Fmt` case.** The worry was that a URL
+/// with no extension costs three fetches to identify. It does not, in this shape: `remoteFormat`'s
+/// DESCRIBE probes go parquet first, which ranges rather than downloads, and anything that falls
+/// past it is a text format that step 3 was going to download anyway. The wasted work is the ONE
+/// probe download that identified it, and buying a `Fmt` case to save that would mean a second
+/// format decision living outside `remoteFormat` — two places to disagree about what a URL is, to
+/// save one fetch on the rarest shape of URL there is.
+func buildRemoteOpen(
+    database: Database, home: String, url: RemoteURL, fetchedAtNs: Int,
+    sheet: String?, nullPadding: Bool, skipPreamble: Bool
+) async throws -> RemoteOpen {
+    let con = try database.connect()
+    let fmt = try remoteFormat(url, con: con)
+    let identity = await remoteIdentity(url)
+
+    var notes: [String] = []
+    let sasParquet = fmt == .parquet && url.query != nil
+    if sasParquet { notes.append(sasParquetNote) }
+
+    var cachePath: String?
+    if fmt != .parquet || sasParquet {
+        let path = try remoteCachePath(home: home, url: url)
+        try downloadRemoteObject(con: con, url: url, to: path)
+        cachePath = path
+    }
+
+    let spec = try buildRemoteSource(
+        con: con, url: url, identity: identity, cachePath: cachePath, fetchedAtNs: fetchedAtNs,
+        sheet: sheet, nullPadding: nullPadding, skipPreamble: skipPreamble
+    )
+    return RemoteOpen(spec: spec, notes: notes)
+}
+
+/// `<SIFT_HOME>/remote-cache/<fnv1a(sanitized URL)><suffix>`.
+///
+/// The URL is HASHED rather than sanitized into a filename, and that is the lazy answer to a real
+/// problem: an object key can contain `/`, a percent-decoded `displayName` can contain `..`, and
+/// both are path traversal out of the cache directory. A 16-hex-digit digest of the *sanitized* URL
+/// cannot leave the directory, is stable across launches (FNV-1a, not `Hasher` — see `fnv1a`), and
+/// keys on exactly the identity `RemoteRef` persists. Sanitized, not `wireURL`: two SAS'd fetches of
+/// one blob are the same object, and hashing the signature in would make the cache miss every time
+/// the token was re-issued.
+///
+/// The directory is created at **0700**, through the same call that enforces it on `~/.sift`
+/// itself: these files are copies of someone's real data sitting on a laptop (spec §11), and
+/// `downloadRemoteObject` writes each one 0600 inside it.
+func remoteCachePath(home: String, url: RemoteURL) throws -> String {
+    let dir = (home as NSString).appendingPathComponent(remoteCacheDirName)
+    // Named for `~/.sift`, but it is exactly "create this directory and hold it at 0700, whether or
+    // not it already existed" — which is the contract this needs, unchanged.
+    try Session.ensureHomeDirectory(dir)
+    return (dir as NSString).appendingPathComponent(fnv1a(url.sanitized) + cacheSuffix(url))
+}
+
+/// The extension a cache file must keep, including a compression suffix.
+///
+/// 🔴 **The suffix is load-bearing twice.** `detectFormat` reads magic bytes first but still
+/// consults the extension for a zip container, so a cache file with no `.xlsx` is refused as "looks
+/// like a zip archive, not a data file" (`RemoteRef.cachePath` states this). And a compressed file
+/// keeps BOTH halves — `a.csv.gz` caches as `<hash>.csv.gz`, never `<hash>.gz`: DuckDB decides to
+/// decompress from the outer suffix and `_ext_chain` reads the format from the inner one, so
+/// dropping the inner half makes every `.json.gz` in the world open as a CSV (its magic bytes are
+/// gzip's, so the sniffer's fallback guess is what would decide).
+///
+/// Built from `RemoteURL.effectiveExt`/`dataExtension`, both of which read the PATH only — never
+/// from `displayName` directly, which is percent-DECODED and can therefore contain a `/`.
+func cacheSuffix(_ url: RemoteURL) -> String {
+    guard compressionExt.contains(url.effectiveExt) else { return url.effectiveExt }
+    return dataExtension(url) + url.effectiveExt
+}
+
+/// The DuckDB extension a scheme is read through. `s3` rides on httpfs, like its secret does.
+func remoteExtensionName(_ scheme: RemoteScheme) -> String {
+    switch scheme {
+    case .az, .abfss: return "azure"
+    case .http, .https, .s3: return "httpfs"
+    }
+}
+
+/// Wall-clock nanoseconds, for `RemoteRef.fetchedAtNs`.
+///
+/// 🔴 Wall clock and NOT `DispatchTime.now().uptimeNanoseconds`, which is the reflex here and is
+/// wrong for this one job: `fetchedAtNs` is written into a staging token that is compared on a
+/// LATER LAUNCH, and uptime restarts at zero every boot — two fetches on either side of a restart
+/// could produce the same token, which is precisely the collision the `fetched=` form exists to
+/// make impossible. It doubles as `SourceKey.mtimeNs` when the server offered no `Last-Modified`,
+/// which is an epoch slot, so the epoch is also the value that belongs there.
+///
+/// `Date()`'s ~1 µs granularity (MEASURED, `Table.openedAt`) is not a risk at this scale: two
+/// distinct fetches are a HEAD and a download apart, milliseconds at the very best.
+func fetchClockNs() -> Int {
+    Int(Date().timeIntervalSince1970 * 1_000_000_000)
 }
 
 // MARK: - free helpers (no actor state; safe to call from the detached background pipeline)

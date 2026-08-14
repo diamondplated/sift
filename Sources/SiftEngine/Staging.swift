@@ -140,8 +140,14 @@ extension Session {
         var t = try table(name)
         if t.staged || t.staging != nil { return nil }
 
+        // The SAME three inputs `runAfterOpen` used, `stagingSizeBytes` included. Reading
+        // `spec.key.size` here while the background decision read the cache file's size would let
+        // the two disagree on a remote source — the banner offering a copy that `stageNow` then
+        // silently refuses as "only 0 B", which is what `key.size` is when a server sends no
+        // `Content-Length`.
         let decision = shouldStage(
-            fmt: t.spec.fmt, sizeBytes: t.spec.key.size, freeBytes: freeDiskBytes(at: siftHome)
+            fmt: t.spec.fmt, sizeBytes: stagingSizeBytes(t.spec),
+            freeBytes: freeDiskBytes(at: siftHome), transport: transport(of: t.spec)
         )
         t.stageDecision = decision
         guard decision.stage || force else {
@@ -528,14 +534,25 @@ extension Session {
     // MARK: - the staged-data lifecycle
 
     /// Every staged copy this store knows about, newest use first. Ported from `staged_entries`.
+    ///
+    /// 🔴 **A remote row is reported as neither missing nor changed, and both of those are the
+    /// honest answer rather than a default.** `path` for a remote copy is a URL, so `statInfo`
+    /// throws on it — which the local rule reads as `sourceMissing: true`, i.e. "the file this was
+    /// copied from is gone". It is not gone; nobody asked. Answering the question would take a HEAD
+    /// per row, and this method is what the staged-data panel calls to draw a list: a network round
+    /// trip per row, on a screen the user opened to free up disk, is not a thing to do quietly.
+    /// `Refresh` (T10) is where a remote copy's freshness gets checked, on purpose and one at a
+    /// time. Saying "missing" here would put a red badge on every remote copy the moment the panel
+    /// opened, which is the plausible-wrong-value failure this product exists to avoid — in Sift's
+    /// own UI.
     public func stagedEntries() throws -> [StagedSource] {
         let rows: [[Cell]]
         do {
             let con = try database.connect()
             rows = try con.query(
                 "SELECT table_name, path, fmt, epoch_ms(staged_at::TIMESTAMPTZ), "
-                    + "epoch_ms(last_used::TIMESTAMPTZ), row_count, bytes, mtime_ns, size "
-                    + "FROM _sift_sources ORDER BY last_used DESC"
+                    + "epoch_ms(last_used::TIMESTAMPTZ), row_count, bytes, mtime_ns, size, "
+                    + "source_token FROM _sift_sources ORDER BY last_used DESC"
             ).allRows()
         } catch let error as DuckDBError {
             throw SessionError(error.firstLine)
@@ -543,12 +560,13 @@ extension Session {
 
         return rows.map { row in
             let path = cellText(row[1])
-            let stat = try? statInfo(path)
+            let remote = cellText(row[9]).hasPrefix(remoteTokenPrefix)
+            let stat = remote ? nil : try? statInfo(path)
             return StagedSource(
                 table: cellText(row[0]), path: path, fmt: cellText(row[2]),
                 stagedAt: dateFromEpochMs(row[3]), lastUsed: dateFromEpochMs(row[4]),
                 rows: cellInt(row[5]), bytes: cellInt(row[6]),
-                sourceMissing: stat == nil,
+                sourceMissing: !remote && stat == nil,
                 sourceChanged: stat.map { $0.mtimeNs != cellInt(row[7]) || $0.size != cellInt(row[8]) } ?? false
             )
         }
@@ -630,7 +648,13 @@ extension Session {
             // A staged copy of a file that has since changed on disk is simply wrong. A source
             // that has *vanished* is not swept here, matching Python — the copy may be the only
             // thing left of it, and `stagedEntries` surfaces it as `sourceMissing` instead.
-            for row in rows {
+            //
+            // 🔴 A REMOTE row is skipped EXPLICITLY, not by relying on `statInfo` failing on a URL.
+            // Today it would fail — but this loop's whole job is "the source moved under the
+            // copy", and the day something makes `stat("https://…")` succeed (a mount, a path that
+            // happens to collide) every remote copy in the store gets dropped on the next purge,
+            // silently, with the suite green. The token says what kind of row this is; ask it.
+            for row in rows where !cellText(row[4]).hasPrefix(remoteTokenPrefix) {
                 let name = cellText(row[0])
                 guard let stat = try? statInfo(cellText(row[1])) else { continue }
                 if stat.mtimeNs != cellInt(row[5]) || stat.size != cellInt(row[6]),
@@ -759,7 +783,29 @@ func swapStaged(_ con: Connection, name: String, lock: NSLock) throws {
 // the prefix — one spelling, so the purge sweep and both token formats cannot drift apart.
 // (`stagingTokenVersion` here now resolves to SiftCore's, via the module import.)
 
+/// The prefix every REMOTE staging token carries, and the one string that tells a catalog row
+/// whose `path` is a URL from one whose `path` is a file.
+///
+/// 🔴 Must agree with `SiftCore.remoteStagingToken`'s second field, and the compiler cannot check
+/// that either — same shape as the `stagingTokenVersion` hazard one layer down, and the same
+/// answer: `remoteTokenPinnedAgainstTheRealTokenBuilder` builds a real token and asserts this
+/// prefixes it. Get it wrong and the two consumers below stop recognising remote rows: the
+/// staleness sweep starts `stat()`ing URLs and `stagedEntries` starts reporting every remote copy
+/// as `sourceMissing`.
+let remoteTokenPrefix = "\(stagingTokenVersion)|remote|"
+
 /// The identity a staged copy is matched on: the exact bytes it was made from.
+///
+/// 🔴 **A remote source's identity is the `RemoteRef`'s, never a `stat()` of its path** — the
+/// branch below is the first line for that reason. `spec.key.path` for a remote source is a URL,
+/// so every filesystem call in the local half fails silently: `statInfo` throws (no ctime),
+/// `directoryDigest` returns `nil` (no members), and what is left is
+/// `v3|<url>|<mtimeNs>|<size>` — a token that (a) carries no `remote` marker, so the sweep and
+/// `stagedEntries` below cannot tell it apart from a file's, and (b) is STABLE across opens
+/// whenever the server sent a `Last-Modified`, so a copy of a URL whose contents changed under a
+/// re-used date would be adopted forever. `RemoteRef.stagingToken` is the identity that was
+/// actually measured off the wire, `fetched=` form included — which is the form that can never be
+/// adopted twice, and the whole reason the format has it.
 ///
 /// **`SourceKey.token()` is not enough, and that was a Critical.** It is `path:mtimeNs:size` from a
 /// single `stat()` of the path, which identifies neither of the two source shapes Sift supports:
@@ -786,6 +832,7 @@ func swapStaged(_ con: Connection, name: String, lock: NSLock) throws {
 /// files, so it is noise next to the parse — if a folder ever gets big enough for the walk to show
 /// up, cache it against the directory's own mtime.
 func stagingToken(_ spec: SourceSpec) -> String {
+    if let remote = spec.remote { return remote.stagingToken }
     var parts = [stagingTokenVersion, spec.key.path, String(spec.key.mtimeNs), String(spec.key.size)]
     if let ctime = try? statInfo(spec.key.path).ctimeNs { parts.append("ctime=\(ctime)") }
     if let sheet = spec.sheet, !sheet.isEmpty { parts.append("sheet=\(sheet)") }
@@ -813,7 +860,12 @@ private func directoryDigest(_ path: String) -> String? {
 /// `Hasher` is seeded per process, so it would never match itself twice. Not a cryptographic digest
 /// either — nothing here is adversarial, the question is only "did these files change".
 /// `String(_:radix:)` is locale-independent, unlike anything from `NumberFormatter`.
-private func fnv1a(_ text: String) -> String {
+///
+/// Internal rather than `private` since Task 8: `Session.remoteCachePath` names a downloaded
+/// object's cache file after its URL and needs the same across-launch-stable, filesystem-safe
+/// digest for the same reason — a second copy seeded differently would silently stop finding
+/// yesterday's cache.
+func fnv1a(_ text: String) -> String {
     var hash: UInt64 = 0xcbf2_9ce4_8422_2325
     for byte in text.utf8 {
         hash = (hash ^ UInt64(byte)) &* 0x100_0000_01b3

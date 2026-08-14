@@ -58,12 +58,41 @@ public func shouldProfileEagerly(fmt: Fmt, sizeBytes: Int, staged: Bool) -> Bool
     sizeBytes <= profileEagerMaxBytes || staged || neverStage.contains(fmt)
 }
 
+/// Where the bytes a staging decision is about came from.
+///
+/// 🔴 **It changes no threshold and no branch, and that is the finding rather than an omission.**
+/// A remote text source is DOWNLOADED ONCE before any of this is asked (MEASURED — spike §7: a
+/// bare `read_csv(url)` fetches 200 % of the object, so reading one in place re-downloads it per
+/// statement), which means by the time `shouldStage` runs the bytes are a local file and every
+/// local rule applies to them unchanged: the ≥ 25 MB threshold still separates "a re-parse is
+/// imperceptible" from "a copy buys typed columns and materialized sorts", and the free-disk
+/// refusal is about the same disk. Making remote text stage at a different size would be inventing
+/// a rule that no measurement supports.
+///
+/// What it changes is what the reason SAYS. `StageDecision.reason` is read by a user, and
+/// "re-reading it is faster than copying it" describes re-reading *the source* — which for a remote
+/// source would mean the network, and is not what happens. Naming the downloaded copy keeps the
+/// sentence true.
+///
+/// `estSeconds` needs no adjustment either, and that is worth stating because it looks like it
+/// should: it is `sizeBytes / parseBytesPerSec`, a PARSE estimate, and the download it might be
+/// expected to omit has already finished by the time this is called. It was honest for a local
+/// file and it is honest here.
+public enum Transport: Sendable, Equatable { case local, remote }
+
 /// Decide whether this source earns a native DuckDB copy.
 ///
 /// The payoff is not just aggregate speed: `LIMIT/OFFSET` on a CSV view is O(offset), while a
 /// native table seeks by row group. Staging and smooth scrolling are the same feature.
+///
+/// `transport` is wording only — see `Transport`. Note in particular that an in-place remote
+/// parquet goes down the `neverStage` branch untouched: it is refused for exactly the local
+/// reason (per-file statistics, row-group skipping) and the fact that the statistics are being
+/// read over ranged HTTP makes the copy *less* worth building, not more. "Download Local Copy" is
+/// `stageNow(force:)`, which does not consult this function's verdict at all.
 public func shouldStage(
-    fmt: Fmt, sizeBytes: Int, freeBytes: Int, threshold: Int = stageMinBytes
+    fmt: Fmt, sizeBytes: Int, freeBytes: Int, threshold: Int = stageMinBytes,
+    transport: Transport = .local
 ) -> StageDecision {
     if neverStage.contains(fmt) {
         return StageDecision(
@@ -73,9 +102,10 @@ public func shouldStage(
         )
     }
     if sizeBytes < threshold {
+        let what = transport == .remote ? "the downloaded copy" : "it"
         return StageDecision(
             stage: false,
-            reason: "only \(human(Double(sizeBytes))) — re-reading it is faster than copying it"
+            reason: "only \(human(Double(sizeBytes))) — re-reading \(what) is faster than copying it"
         )
     }
     if freeBytes < sizeBytes {
@@ -94,9 +124,10 @@ public func shouldStage(
             estSeconds: est, needsConfirm: true
         )
     }
+    let text = transport == .remote ? "of downloaded text" : "of text"
     return StageDecision(
         stage: true,
-        reason: "\(human(Double(sizeBytes))) of text — a native copy makes scrolling and grouping instant",
+        reason: "\(human(Double(sizeBytes))) \(text) — a native copy makes scrolling and grouping instant",
         estSeconds: est
     )
 }

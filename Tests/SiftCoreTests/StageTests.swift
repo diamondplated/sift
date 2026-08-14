@@ -115,6 +115,42 @@ func humanUsesACommaGroupSeparatorAndAPeriodDecimalAtEveryUnitBoundary(n: Double
     )
 }
 
+// MARK: - transport
+//
+// 🔴 The finding is that `transport` changes NO threshold and NO branch, which is why it is asserted
+// that way round below: a remote text source has already been downloaded once by the time this is
+// asked (MEASURED — spike §7: reading one in place re-fetches 200 % of the object per statement),
+// so it is a local file and every local rule applies to it unchanged. Inventing a different size
+// for remote text would be a policy no measurement supports.
+
+@Test func transportChangesNoThresholdAndNoVerdict() {
+    for size in [5 * MB, 25 * MB - 1, 25 * MB, 500 * MB, 40 * GB] {
+        let local = shouldStage(fmt: .csv, sizeBytes: size, freeBytes: free)
+        let remote = shouldStage(fmt: .csv, sizeBytes: size, freeBytes: free, transport: .remote)
+        #expect(local.stage == remote.stage, "\(size)")
+        #expect(local.needsConfirm == remote.needsConfirm, "\(size)")
+        // `estSeconds` is a PARSE estimate and the download already finished, so it needs no
+        // adjustment either — the number that looks like it should move is the one that must not.
+        #expect(local.estSeconds == remote.estSeconds, "\(size)")
+    }
+    // …and an in-place remote parquet is `neverStage` for exactly the local reason.
+    #expect(shouldStage(fmt: .parquet, sizeBytes: 100 * GB, freeBytes: free, transport: .remote).stage == false)
+}
+
+/// What it DOES change: the sentence. "re-reading it is faster than copying it" describes
+/// re-reading the source, which for a remote source would mean the network — and is not what
+/// happens, because the bytes are already on disk.
+@Test func aRemoteReasonNamesTheDownloadedCopyRatherThanTheSource() {
+    #expect(
+        shouldStage(fmt: .csv, sizeBytes: 5 * MB, freeBytes: free, transport: .remote).reason
+            == "only 5.0 MB — re-reading the downloaded copy is faster than copying it"
+    )
+    #expect(
+        shouldStage(fmt: .csv, sizeBytes: 500 * MB, freeBytes: free, transport: .remote).reason
+            == "500.0 MB of downloaded text — a native copy makes scrolling and grouping instant"
+    )
+}
+
 // MARK: - ctas_sql / swap_sql
 
 // Turning off preserve_insertion_order makes the swap VISIBLE as the grid reshuffling.
