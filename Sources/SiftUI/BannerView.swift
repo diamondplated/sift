@@ -177,7 +177,9 @@ public struct BannerStack: View {
                     .frame(width: 16)
                 Spacer(minLength: 12)
                 Button("Cancel") {
-                    Task { await state.session.cancel(staging.jobID) }
+                    // Through AppState, not straight at the session: the engine answers `false`
+                    // for a cancel that cannot land, and that answer must reach the user.
+                    Task { await state.cancelStaging(staging.jobID) }
                 }
                 .controlSize(.small)
             }

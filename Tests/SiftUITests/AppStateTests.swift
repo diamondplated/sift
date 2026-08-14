@@ -11,6 +11,20 @@ import Testing
 // added to the engine to make a test easier (plan, "Landmines").
 
 @MainActor
+/// The staging banner's Cancel routes through `AppState.cancelStaging` so the engine's `false` —
+/// "that cancel cannot land" — reaches the user as a sentence. The whole-UI review (I2) found the
+/// button discarding it: the one answer the engine deliberately made observable, dropped on the
+/// floor. A job id that is not running is exactly what an already-finished job looks like, so it
+/// is the honest way to produce the `false` without racing a real CTAS.
+@Test func aCancelThatCannotLandTellsTheUserInsteadOfPretending() async throws {
+    let (state, _) = try await openedFixture(rows: 12)
+    #expect(state.banner == nil)
+
+    await state.cancelStaging("stage-no-such-job")
+    #expect(state.banner == "That copy had already finished — nothing left to cancel.")
+}
+
+@MainActor
 @Test func openingACSVPutsItInTheCatalogAndReadsItsFirstPage() async throws {
     let (state, model) = try await openedFixture(rows: 12)
 

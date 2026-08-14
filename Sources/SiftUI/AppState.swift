@@ -314,6 +314,17 @@ public final class AppState {
 
     public func presentStaged() { modalSheet = .staged }
 
+    /// The staging banner's Cancel. `Session.cancel` returns `false` for a cancel that cannot
+    /// land — the job already finished, or its copy is already being published — and its own
+    /// comment says a cancel that cannot land must not report that it did. The engine kept that
+    /// promise; the button was breaking it by discarding the answer (whole-UI review, I2). The
+    /// sentence names what actually happened instead of pretending the click worked.
+    public func cancelStaging(_ jobID: String) async {
+        if await !session.cancel(jobID) {
+            banner = "That copy had already finished — nothing left to cancel."
+        }
+    }
+
     public func presentBadRows() {
         guard canShowBadRows, let subject = activeName else { return }
         modalSheet = .badRows(table: subject)
