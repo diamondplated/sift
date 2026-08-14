@@ -35,7 +35,15 @@ import Testing
 @Test func workOutstandingPastTheDelayRaisesTheOverlay() async throws {
     let busy = BusyState(delay: .milliseconds(10))
     busy.begin("Loading rows…")
-    #expect(await waitFor { busy.visible }, "the overlay never came up")
+    // 🔴 `await` the timer this `begin` armed, rather than polling a clock for its effect. Both
+    // halves are asserted — that a timer exists at all, and that its firing raises the overlay —
+    // and neither depends on when the `MainActor` gets around to it. The polling version of this
+    // line went red on CI with nothing wrong: the runner has two cores and most of the 919 tests
+    // drive an engine from the `MainActor`, so the five-second deadline was reachable by
+    // contention alone. See `BusyState.timer`.
+    let armed = try #require(busy.timer, "begin() armed no timer, so nothing was ever going to fire")
+    await armed.value
+    #expect(busy.visible, "the timer fired without raising the overlay")
     #expect(busy.message == "Loading rows…")
 }
 
@@ -43,7 +51,10 @@ import Testing
 @Test func aSecondBeginWhileVisibleSwapsTheMessageWithoutBlinkingTheOverlay() async throws {
     let busy = BusyState(delay: .milliseconds(10))
     busy.begin("Loading rows…")
-    #expect(await waitFor { busy.visible }, "nothing to replace if the overlay never came up")
+    // Same seam as above: this test is about the *second* begin, so getting to a visible overlay
+    // must not be able to fail for timing reasons of its own.
+    await (try #require(busy.timer, "begin() armed no timer")).value
+    #expect(busy.visible, "nothing to replace if the overlay never came up")
 
     busy.begin("Sorting 1,000,000 rows…")
     // 🔴 Asserted SYNCHRONOUSLY, and that is the whole test. An implementation that cleared

@@ -41,7 +41,16 @@ public final class BusyState {
 
     /// `@ObservationIgnored` because no view draws it, and an observed handle would invalidate
     /// every reader on each begin/end pair — including the ones that never became visible.
-    @ObservationIgnored private var timer: Task<Void, Never>?
+    ///
+    /// 🔴 `private(set)` rather than `private` for the same reason `delay` is injectable, and it
+    /// fixed a real CI failure: a test that polled a wall clock for `visible` raced the `MainActor`
+    /// it needed, and on the 2-core runner — 919 tests, most of them driving an engine from the
+    /// `MainActor` — five seconds of contention was reachable, so the suite went red with nothing
+    /// wrong. Holding the handle lets a test `await` the timer it armed instead of waiting on a
+    /// clock: the decision (a timer was armed, and firing raises the overlay) is asserted, and the
+    /// delivery time is not. `aFetchThatFinishesInsideTheDelayNeverDrawsAnything` is still what
+    /// proves the delay is not zero, and `theShippedDelayIsStill400ms` still pins its value.
+    @ObservationIgnored private(set) var timer: Task<Void, Never>?
 
     public init(delay: Duration = .milliseconds(400)) {
         self.delay = delay
