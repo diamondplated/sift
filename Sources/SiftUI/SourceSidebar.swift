@@ -173,28 +173,36 @@ public func refreshOutcomeText(table: String, _ outcome: RefreshOutcome) -> Stri
     }
 }
 
-/// The one cause a failed refresh cannot be told apart from, stated as the conditional it is.
+/// The refusal every route that RE-OPENS an already-open source from `RemoteRef.url` owes, or `nil`
+/// when there is nothing to refuse.
 ///
-/// 🔴 **A SAS-signed source cannot be refreshed, and that is T8's no-persisted-credential ruling
-/// holding rather than a defect.** `RemoteRef.url` is sanitized by contract, so `refreshRemote`
-/// re-derives a URL with no query, the HEAD comes back 403, and the retry fails with DuckDB's own
-/// HTTP line. That line is a status code: true, clean, and useless to act on.
+/// 🔴 **`RemoteRef.url` is sanitized by contract, so re-opening from it is a different request from
+/// the one that worked** — no signature, anonymous, 403. Three routes do exactly that and all three
+/// hold the `Table`: the sidebar's "Open Another Sheet…", the inspector's sheet list, and
+/// `AppState.reopen`, which is the notes' one-click "re-open with null padding". The last one is the
+/// worst of the three, because it CLOSES the table first: without this guard a signed remote CSV's
+/// recovery button costs the user their tab and then fails.
 ///
-/// It is appended to *every* refusal rather than to the signed ones because **there is no honest
-/// marker to test.** `RemoteRef` deliberately carries no `hadQuery` flag (T10 declined to add one:
-/// a SAS'd parquet gets `sasParquetNote` and a SAS'd CSV gets nothing, and half a signal is worse
-/// than none), and inventing one here would mean guessing. A conditional sentence naming the one
-/// fix beats a bare 403 on the failure it most often explains; the alternative the brief allows —
-/// not offering Refresh at all — would remove it from every unsigned remote source too.
-public let refreshSignedURLNote =
-    "If you opened this from a signed URL — one with a ?sv=…&sig=… SAS token — Sift never saved the "
-    + "signature, so a refresh reaches the server as an anonymous request. Paste the whole URL into "
-    + "the box again to re-open it."
-
-/// The engine's own sentence first, then the one thing it cannot know. Never a `try?`, never a
-/// paraphrase of the engine's half.
-public func refreshFailureText(table: String, error: String) -> String {
-    "\(error) \(refreshSignedURLNote)"
+/// **`spec.remote?.signed`, not a guess.** T10 declined to add a marker and T12 declined to
+/// special-case the error text, both correctly at their own scope — a SAS sentence bolted onto
+/// "No such file or folder" would be worse than the gap. `signed` is that gap closed at the source:
+/// the engine knew at open time and now says so, so this is a fact being read rather than a cause
+/// being guessed at. This is also why `refreshSignedURLNote` is gone: it was appended to EVERY
+/// refresh failure because nothing could tell the signed ones apart, and now that they are refused
+/// before they can fail, every failure that still reaches a user is from an unsigned source — where
+/// that sentence was speculation, and is now a provably wrong one.
+///
+/// A refusal rather than a hidden affordance: the sentence names a fix the user can take (the path
+/// box has accepted a whole URL, query included, since T12), and a menu item that quietly vanished
+/// would teach them nothing.
+///
+/// Deliberately free of a `?` so it can join `nothingTheSidebarDrawsCanCarryASASSignature`'s sweep
+/// of every string this file renders, rather than needing an exemption the way the deleted note did.
+public func signedReopenRefusal(_ t: SiftEngine.Table) -> String? {
+    guard t.spec.remote?.signed == true else { return nil }
+    return "\(t.name) was opened from a signed URL and Sift never saved the signature, so opening "
+        + "it again would reach the server as an anonymous request \u{2014} paste the whole URL "
+        + "into the path box again."
 }
 
 /// SF Symbols the sidebar draws that are not a format chip.

@@ -54,7 +54,10 @@ public struct SourceTab: View {
                 Text("Sheets").font(.system(size: 11, weight: .semibold))
                 ForEach(table.spec.sheets, id: \.name) { sheet in
                     Button {
-                        Task { await state.open(path: table.spec.key.path, sheet: sheet.name) }
+                        // The same route the sidebar's "Open Another Sheet…" takes — one rule about
+                        // which path a re-open uses, and one refusal for a signed source, rather
+                        // than two views each spelling `open(path: spec.key.path, sheet:)`.
+                        Task { await state.openSheet(of: table, sheet: sheet.name) }
                     } label: {
                         HStack {
                             Text(sheet.name).lineLimit(1)

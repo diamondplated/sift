@@ -627,11 +627,18 @@ private func write(_ text: String, _ name: String, in dir: URL) throws -> String
     #expect(state.modalSheet == nil)
 }
 
-/// A refresh of a local table is the engine's refusal, reaching the user as one clean sentence —
-/// plus the one thing the engine cannot know about a failure. Driven through a real `Session` so
-/// the sentence is the engine's own and not a string this test typed.
+/// A refresh of a local table is the engine's refusal, reaching the user as one clean sentence and
+/// NOTHING ELSE. Driven through a real `Session` so the sentence is the engine's own and not a
+/// string this test typed.
+///
+/// 🔴 The banner used to carry `refreshSignedURLNote` glued to the end of every failure — "if you
+/// opened this from a signed URL…" — because nothing could tell the signed failures apart. The
+/// engine can now (`RemoteRef.signed`) and refuses them before they reach the network, so the only
+/// failures that still arrive here are from sources that sentence is FALSE about. Whole and alone is
+/// therefore a stronger claim than the `hasPrefix` this used to make: a re-added speculative tail
+/// fails the equality below.
 @MainActor
-@Test func refreshingALocalTableBannersTheEnginesOwnRefusalAndNotASilence() async throws {
+@Test func refreshingALocalTableBannersTheEnginesOwnRefusalWholeAndAlone() async throws {
     let (state, _) = try await openedFixture(rows: 12)
     let name = try #require(state.activeName)
     #expect(state.banner == nil)
@@ -639,16 +646,82 @@ private func write(_ text: String, _ name: String, in dir: URL) throws -> String
     await state.refreshRemote(name)
 
     let banner = try #require(state.banner, "a refresh that cannot happen did nothing at all")
-    #expect(banner.contains("opened from a local file"), "\(banner)")
-    #expect(banner.contains(name))
-    #expect(banner.hasSuffix(refreshSignedURLNote))
-    // The engine's sentence is first and whole — never paraphrased, never replaced.
-    #expect(banner.hasPrefix("Refresh re-fetches a source Sift opened from a URL"), "\(banner)")
+    #expect(
+        banner == "Refresh re-fetches a source Sift opened from a URL, and \(name) was opened from "
+            + "a local file \u{2014} Sift already reads it from disk on every query.",
+        "\(banner)")
 
     // A table that is not open at all gets `table(_:)`'s existing sentence, not a silence.
     state.banner = nil
     await state.refreshRemote("no-such-table")
     #expect(try #require(state.banner).contains("No open table named"))
+}
+
+/// A `Table` the catalog really holds, wearing a `RemoteRef` it did not earn — the UI-side twin of
+/// the engine's `setSourceSpecForTest`, built with public initializers only.
+///
+/// The name, the generation and the query spec are the REAL table's, so `close` and `open` behave
+/// exactly as they would for it; only `spec` moves. That is what makes the mutants below legible:
+/// a guard that is not there lets the real close run, and the real close is observable.
+@MainActor
+private func wearingSignedRemote(_ t: SiftEngine.Table, url: String) -> SiftEngine.Table {
+    let spec = SourceSpec(
+        key: SourceKey(path: url, mtimeNs: 0, size: 0), fmt: t.spec.fmt, readFn: t.spec.readFn,
+        columns: t.spec.columns,
+        sheet: "Q1", sheets: [SheetInfo(name: "Q1", rows: 9, cols: 2), SheetInfo(name: "Q2", rows: 4, cols: 2)],
+        remote: RemoteRef(url: url, etag: "\"v1\"", fetchedAtNs: 1, cachePath: "/tmp/c.xlsx", signed: true)
+    )
+    return SiftEngine.Table(name: t.name, spec: spec, qspec: t.qspec, openedAt: t.openedAt)
+}
+
+/// 🔴 **The notes' recovery button must not cost the tab it cannot recover.** `reopen` CLOSES the
+/// table and then opens `spec.key.path` again — which for a signed remote source is the sanitized
+/// URL, i.e. an anonymous request. Without the guard the user presses "re-open with null padding",
+/// the table goes away, and the re-open fails: the one destructive shape of this bug.
+///
+/// **The surviving table is the assertion, not the banner alone.** A banner is set on either side of
+/// the mutation — the guard sets the refusal, and the mutant's failed re-open sets the engine's
+/// posture refusal — so a bare `banner != nil` proves nothing. `tables.count == 1` can only be true
+/// if the close never ran.
+@MainActor
+@Test func theNotesReopenRefusesASignedSourceRatherThanClosingItAndFailing() async throws {
+    let (state, _) = try await openedFixture(rows: 12)
+    let real = try #require(state.active)
+    let signed = wearingSignedRemote(real, url: "https://acct.blob.core.windows.net/c/sales.xlsx")
+
+    await state.reopen(signed, with: .nullPadding)
+
+    #expect(state.banner == signedReopenRefusal(signed), "\(state.banner ?? "no banner")")
+    #expect(state.tables.count == 1, "the refusal closed the table it was refusing to re-open")
+    #expect(state.tables.first?.name == real.name)
+    #expect(state.activeName == real.name)
+}
+
+/// The second sheet of a signed remote workbook, which is where T12 met this from the other end: the
+/// bytes are already downloaded, but the re-open goes back to the server with no signature and 403s.
+///
+/// Same shape of assertion as the reopen above and for the same reason — `openSheet` on a signed
+/// source must leave the catalog EXACTLY as it found it, and the count is what says so. Without the
+/// guard the strict session's own posture refusal lands on the banner instead, which is a different
+/// sentence about a different problem.
+@MainActor
+@Test func openingASecondSheetOfASignedRemoteWorkbookIsRefusedBeforeTheRequest() async throws {
+    let (state, _) = try await openedFixture(rows: 12)
+    let real = try #require(state.active)
+    let signed = wearingSignedRemote(real, url: "https://acct.blob.core.windows.net/c/book.xlsx")
+
+    await state.openSheet(of: signed, sheet: "Q2")
+
+    #expect(state.banner == signedReopenRefusal(signed), "\(state.banner ?? "no banner")")
+    #expect(state.tables.count == 1, "a refused sheet open added a table")
+
+    // …and the route still works for a source that is not signed: `openSheet` is the ONE place both
+    // sheet lists go through now, so a guard that refused everything would take the ordinary pasted
+    // workbook with it. The local fixture is a CSV, so the open lands on `sheet:` being ignored —
+    // what matters is that it reached the engine at all rather than being turned away here.
+    state.banner = nil
+    await state.openSheet(of: real, sheet: "Q2")
+    #expect(state.banner != signedReopenRefusal(signed), "an unsigned source was refused")
 }
 
 /// Nothing calls `presentConnections()` in this target — the two routes are `AppDelegate`'s menu

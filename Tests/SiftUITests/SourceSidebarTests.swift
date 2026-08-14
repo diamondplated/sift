@@ -189,11 +189,11 @@ private let fortyOnePointTwoMB = 43_201_331
 /// A `RemoteRef` as the engine writes one — `url` is `RemoteURL.sanitized` by contract.
 private func remoteRef(
     _ url: String = "https://acct.blob.core.windows.net/c/sales.csv",
-    fetchedAtNs: Int = 1_755_180_720_000_000_000
+    fetchedAtNs: Int = 1_755_180_720_000_000_000, signed: Bool = false
 ) -> RemoteRef {
     RemoteRef(
         url: url, etag: "\"v1\"", lastModifiedMs: nil, contentLength: 4096,
-        fetchedAtNs: fetchedAtNs, cachePath: "/tmp/remote-cache/1a2b3c.csv")
+        fetchedAtNs: fetchedAtNs, cachePath: "/tmp/remote-cache/1a2b3c.csv", signed: signed)
 }
 
 /// 🔴 The row's three missing facts, all three of them. `spec.remote` is non-nil for exactly the
@@ -259,20 +259,30 @@ private func remoteRef(
     #expect(unchanged.contains("14:32"))
 }
 
-/// 🔴 **A SAS-signed source cannot be refreshed, and Sift cannot tell which sources those are.**
-/// `RemoteRef.url` is sanitized by contract, so the refresh sends no signature and the server
-/// answers 403 — T8's no-persisted-credential ruling holding, not a bug. `RemoteRef` carries no
-/// `hadQuery` marker (T10 declined to add one: half a signal is worse than none), so the sentence
-/// is conditional and always shown. What must never happen is a bare HTTP status with no way out,
-/// which is what the engine's own sentence is on its own.
-@Test func aFailedRefreshCarriesTheEnginesSentenceAndTheOneThingItCannotKnow() {
-    let engineSentence = "HTTP Error: HTTP GET error on 'https://acct/c/sales.csv' (HTTP 403)"
-    let text = refreshFailureText(table: "sales", error: engineSentence)
+/// 🔴 **A signed source cannot be RE-OPENED from `RemoteRef.url` either, and now Sift knows which
+/// ones those are.** T10 shipped `refreshSignedURLNote` — a conditional sentence appended to every
+/// refresh failure — because `RemoteRef` carried no marker and inventing one at the view layer would
+/// have been guessing. `RemoteRef.signed` is that marker, so the guess is gone and this is a fact
+/// being read: `nil` for a local table, `nil` for an unsigned remote one, a sentence for a signed
+/// one.
+///
+/// The pair is the point. A refusal that fires on every remote source would pass an "it refuses a
+/// signed one" assertion just as happily, and would break the ordinary pasted-URL workbook — which
+/// is the common case this whole phase was designed around.
+@Test func onlyASignedSourceIsRefusedAReopenFromTheUrlSiftKept() throws {
+    let url = "https://acct.blob.core.windows.net/c/sales.csv"
+    let signed = fixture(name: "sales", path: url, remote: remoteRef(url, signed: true))
+    let unsigned = fixture(name: "sales", path: url, remote: remoteRef(url))
+    let local = fixture(name: "sales")
 
-    #expect(text.hasPrefix(engineSentence), "the engine's own sentence was paraphrased or dropped")
-    #expect(text.contains(refreshSignedURLNote))
-    #expect(refreshSignedURLNote.contains("sig="), "the note has to name the shape it is about")
-    #expect(refreshSignedURLNote.contains("Paste the whole URL"), "a cause with no fix is a shrug")
+    #expect(signedReopenRefusal(unsigned) == nil, "an ordinary pasted URL re-opens fine")
+    #expect(signedReopenRefusal(local) == nil, "a file on disk has no signature to have lost")
+
+    let text = try #require(
+        signedReopenRefusal(signed), "the one source that cannot be re-opened was offered the try")
+    #expect(text.hasPrefix("sales "), "the sentence must name the table it is about: \(text)")
+    #expect(text.contains("never saved the signature"), "\(text)")
+    #expect(text.contains("paste the whole URL"), "a cause with no fix is a shrug: \(text)")
 }
 
 /// 🔴 `Image(systemName:)` handed a name macOS does not know draws **nothing** and reports nothing —
@@ -394,15 +404,22 @@ private func remoteRef(
     // …and everything the window draws afterwards is built from the sanitized form, which is what
     // `RemoteRef.url` holds by contract.
     let sheets = [SheetInfo(name: "Q1", rows: 40, cols: 3), SheetInfo(name: "Q2", rows: 9, cols: 3)]
+    // 🔴 `signed: true` — the marker is on for this whole sweep, so every string below is drawn for
+    // a source that really did arrive with a signature. A marker that leaked would leak here.
     let t = fixture(
         name: "sales", fmt: .xlsx, path: u.sanitized, size: 4096, rowCount: 40, sheet: "Q1",
-        sheets: sheets, remote: remoteRef(u.sanitized))
+        sheets: sheets, remote: remoteRef(u.sanitized, signed: true))
 
     var shown = [
         t.name, t.spec.key.path, t.spec.target, sourceSubtitle(t), sourceTooltip(t),
         try #require(remoteFetchedAt(t)),
         refreshOutcomeText(table: t.name, .refetched),
         refreshOutcomeText(table: t.name, .unchanged(since: "14:32")),
+        // The refusal the marker now produces. It joins the sweep rather than needing the exemption
+        // `refreshSignedURLNote` used to need: that note SPELLED `?sv=…&sig=…` to help the user
+        // recognise their URL and had to be checked separately, and every separately-checked string
+        // is one the next person can forget. This one names the shape without quoting it.
+        try #require(signedReopenRefusal(t)),
     ]
     shown += t.spec.sheets.map(\.name)
     shown += t.spec.sheets.map(sheetRowLabel)
@@ -412,14 +429,11 @@ private func remoteRef(
         #expect(!text.contains("sig="), "a query string reached a display surface: \(text)")
         #expect(!text.contains("?"), "the query delimiter survived into: \(text)")
     }
-
-    // 🔴 `refreshFailureText` is the one string that PRINTS the shape `?sv=…&sig=…` — deliberately,
-    // because naming it is how the user recognises the URL they pasted. It is a constant this file
-    // wrote, never anything derived from a URL, so what it must not carry is a real signature.
-    let failure = refreshFailureText(table: t.name, error: "HTTP Error: (HTTP 403)")
-    #expect(!failure.contains(sig), "the SAS signature reached the refresh banner: \(failure)")
-    #expect(!failure.contains(u.sanitized), "the failure quotes a URL rather than the table name")
-    #expect(!refreshSignedURLNote.contains(sig))
+    // …and the refusal names the TABLE, never the URL — the tooltip is where a path belongs, and a
+    // banner that quotes a URL is one keystroke of a future edit away from quoting the wire form.
+    let refusal = try #require(signedReopenRefusal(t))
+    #expect(!refusal.contains(u.sanitized), "\(refusal)")
+    #expect(refusal.contains(t.name))
 
     // 🔴 **The route that would have drawn a query string 15 pt tall at the top of a modal sheet.**
     // The pre-open picker titles itself `(path as NSString).lastPathComponent`, and `needsSheetPicker`

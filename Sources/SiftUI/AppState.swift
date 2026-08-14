@@ -92,6 +92,14 @@ public final class AppState {
     /// applies to a workbook — re-opening one without its sheet lands on whichever sheet
     /// `buildSource` auto-picks and serves a different sheet's rows under the same name.
     public func reopen(_ table: SiftEngine.Table, with fix: ReopenFix) async {
+        // 🔴 Before the close, which is the whole point. `spec.key.path` for a remote source is the
+        // SANITIZED URL, so re-opening a signed one is an anonymous request — and this method closes
+        // first, so without the guard the button that promises to recover the columns takes the tab
+        // away and then fails. See `signedReopenRefusal`.
+        if let refusal = signedReopenRefusal(table) {
+            banner = refusal
+            return
+        }
         await close(table.name)
         // `close` puts a refusal on the banner and carries on — a live merge reading this table is
         // the one that happens. Opening a second copy on top of that sentence would be the app
@@ -345,9 +353,15 @@ public final class AppState {
     }
 
     /// The sidebar row's ⟳. `Session.refreshRemote` owns every rule about whether a refresh may
-    /// happen — a local table, a staging job in flight, a connection removed since the open, a tab
-    /// closed mid-probe — and each of those already has one clean sentence, so nothing is restated
-    /// here.
+    /// happen — a local table, a **signed** URL, a staging job in flight, a connection removed since
+    /// the open, a tab closed mid-probe — and each of those already has one clean sentence, so
+    /// nothing is restated here.
+    ///
+    /// 🔴 **The failure is the engine's sentence and nothing else.** It used to have
+    /// `refreshSignedURLNote` bolted onto it — "if you opened this from a signed URL…" — appended to
+    /// every failure because nothing could tell the signed ones apart. The engine can now, and
+    /// refuses them up front, so that sentence would only ever be shown to someone it is false
+    /// about. Adding UI speculation on top of an engine that knows is how a banner starts lying.
     ///
     /// 🔴 **The outcome is rendered, not inferred.** `.unchanged` and `.refetched` leave the same
     /// grid, and a UI that read a side effect instead would be right half the time. `refresh()` runs
@@ -359,8 +373,29 @@ public final class AppState {
             await refresh()
             banner = refreshOutcomeText(table: name, outcome)
         } catch {
-            banner = refreshFailureText(table: name, error: error.localizedDescription)
+            banner = error.localizedDescription
         }
+    }
+
+    /// Open another sheet of a workbook that is ALREADY open — the sidebar's "Open Another Sheet…"
+    /// picker and the inspector's sheet list, which are the same question asked from two views.
+    ///
+    /// One method rather than two call sites spelling `open(path: t.spec.key.path, sheet:)`
+    /// independently, which is what they did: that is the rule "which path does a re-open use", and
+    /// this codebase has already lost `compactCount`, `humanBytes` and `offersSheetPicker` to two
+    /// copies of one rule drifting. It is also the only place the signed refusal has to live for
+    /// both of them.
+    ///
+    /// `spec.key.path` and never `spec.target`: `key.path` is the file path for a local source and
+    /// the sanitized URL for a remote one, so one call serves both, while `target` is the download
+    /// cache's hashed filename — which would open a second table pointing at a file the startup
+    /// sweep collects.
+    public func openSheet(of table: SiftEngine.Table, sheet: String) async {
+        if let refusal = signedReopenRefusal(table) {
+            banner = refusal
+            return
+        }
+        await open(path: table.spec.key.path, sheet: sheet)
     }
 
     /// The staging banner's Cancel. `Session.cancel` returns `false` for a cancel that cannot

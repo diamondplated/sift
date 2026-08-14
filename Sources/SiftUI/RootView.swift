@@ -110,17 +110,15 @@ public struct RootView: View {
                 }
             case .sheets(let name):
                 if let t = state.tables.first(where: { $0.name == name }) {
-                    // 🔴 `spec.key.path` and not `spec.target`: `key.path` is the file path for a
-                    // local source and the **sanitized** URL for a remote one, so one call site
-                    // serves both — while `target` is the download cache's hashed filename, which
-                    // would open a second table pointing at a file the startup sweep collects.
+                    // 🔴 `openSheet(of:sheet:)` and not a second spelling of
+                    // `open(path: t.spec.key.path, sheet:)`: that decision — which path a re-open
+                    // uses, and that a signed source cannot take it — belongs in one place, and
+                    // `SourceTab` asks the same question from the inspector.
                     SheetPickerSheet(
                         title: t.name, sheets: t.spec.sheets, alreadyOpen: t.spec.sheet
                     ) { picked in
                         Task {
-                            for sheet in picked {
-                                await state.open(path: t.spec.key.path, sheet: sheet)
-                            }
+                            for sheet in picked { await state.openSheet(of: t, sheet: sheet) }
                         }
                     }
                 } else {
