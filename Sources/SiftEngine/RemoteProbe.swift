@@ -156,26 +156,71 @@ public func remoteIdentity(_ url: RemoteURL, timeout: TimeInterval = 5) async ->
 /// the SDK skew AGENTS.md warns about in its sharpest form: the local machine makes an unbounded
 /// call look bounded, so the documented 5 s contract was really "whatever the host felt like".
 ///
-/// A `TaskGroup` rather than a detached task and a continuation: the loser is cancelled by the group
-/// and the whole thing stays structured, so nothing outlives the call. `Task.sleep` and
-/// `URLSession.data(for:)` both honour cancellation, so the group exits as soon as the winner is in.
+/// 🔴 **The timer is a real `Thread`, and that is the second measurement.** The first version of
+/// this raced `Task.sleep` inside a `TaskGroup`, and CI stayed red at **32.4 s** — because a
+/// `Task.sleep` child has to be *scheduled* before its budget even begins counting, and on a 2-core
+/// runner under this suite's load it never got a cooperative thread inside the window, while
+/// `URLSession`'s own threads went right on ticking to the OS default. A deadline that needs the
+/// resource it is protecting against is not a deadline. This is the same escape `StageJob` makes
+/// for the same reason, and its comment says so: a real `Thread`, because the cooperative pool is
+/// exactly what is jammed.
+///
+/// The wait is a `DispatchSemaphore`, not `Thread.sleep`, so the thread is released the instant the
+/// work wins rather than parked for the whole budget on every successful probe.
+///
+/// The loser is `cancel()`ed and **never awaited**, so a slow unwind cannot hold the caller — the
+/// price is one unstructured `Task` that outlives the call, which is the honest cost of not waiting
+/// for it.
 ///
 /// ponytail: generic and one call site, which is normally a smell. It is a separate function for
 /// one reason — `theDeadlineIsSiftsOwnClockAndNotTheHostOperatingSystems` can then test the
 /// mechanism directly, and on a machine where the OS knob happens to work (this one) that is the
-/// ONLY test that can tell a raced probe from an unraced one.
+/// ONLY test that can tell a raced probe from an unraced one. Six attempts were made to reproduce
+/// the runner's starvation locally and jam that door shut — semaphore-blocked and CPU-spinning
+/// jammers at 1x, 2x and 4x the core count — and every one of them answered in 1.0 s: this 8-core
+/// Mac over-subscribes for blocked threads and time-slices spinning ones, so it cannot be starved
+/// the way a 2-core runner is. CI is the oracle for the wiring; this function's own behaviour is
+/// pinned locally and without a clock.
 func withDeadline<T: Sendable>(
     _ timeout: TimeInterval, _ work: @Sendable @escaping () async -> T?
 ) async -> T? {
-    await withTaskGroup(of: T?.self) { group in
-        group.addTask { await work() }
-        group.addTask {
-            try? await Task.sleep(nanoseconds: UInt64(max(0, timeout) * 1_000_000_000))
-            return nil
+    await withCheckedContinuation { (continuation: CheckedContinuation<T?, Never>) in
+        let gate = OnceGate(continuation)
+        let finished = DispatchSemaphore(value: 0)
+        let job = Task {
+            let value = await work()
+            _ = gate.finish(value)
+            finished.signal()   // the timer thread stops waiting the moment the work is in
         }
-        let first = await group.next() ?? nil
-        group.cancelAll()
-        return first
+        Thread.detachNewThread {
+            if finished.wait(timeout: .now() + max(0, timeout)) == .timedOut, gate.finish(nil) {
+                job.cancel()
+            }
+        }
+    }
+}
+
+/// One continuation, resumed at most once, by whichever of two racers gets there first.
+///
+/// A `CheckedContinuation` resumed twice is a crash, so the winner is decided under a lock and the
+/// loser's `finish` is dropped. `@unchecked Sendable` for the same reason `StageJob` is: the whole
+/// point is to be touched from a thread other than the one that made it, and everything crossing
+/// that boundary goes through `lock`.
+private final class OnceGate<T: Sendable>: @unchecked Sendable {
+    private let lock = NSLock()
+    private var continuation: CheckedContinuation<T, Never>?
+
+    init(_ continuation: CheckedContinuation<T, Never>) { self.continuation = continuation }
+
+    /// Resume with `value` if nobody has yet; `true` if this call was the winner.
+    func finish(_ value: T) -> Bool {
+        let winner = lock.withLock { () -> CheckedContinuation<T, Never>? in
+            defer { continuation = nil }
+            return continuation
+        }
+        guard let winner else { return false }
+        winner.resume(returning: value)
+        return true
     }
 }
 

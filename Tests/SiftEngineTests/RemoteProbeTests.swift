@@ -23,6 +23,16 @@ import SiftCore
 
 private let remoteFacts = ProcessInfo.processInfo.environment["SIFT_REMOTE_FACTS"] == "1"
 
+/// The budget every test whose subject is *parsing* passes, so none of them is secretly a test of
+/// the deadline.
+///
+/// 🔴 It has to be explicit now that the deadline is real. `remoteIdentity`'s 5 s default is a
+/// wall-clock promise kept by a `Thread`, so a HEAD that SUCCEEDS but whose delivery is starved past
+/// 5 s is cut off — correct in the app, and reachable in this suite, where MEASURED starvation has
+/// delayed a resumption by 9.3 s. Three parsing tests went red on exactly that the first time the
+/// deadline started being enforced, which is the clearest possible evidence that it now is.
+private let parsingBudget: TimeInterval = 60
+
 /// A `RemoteURL` or a failed test — every one of these strings is a literal in this file.
 private func remote(_ text: String) throws -> RemoteURL {
     try #require(classifyRemote(text), "\(text) did not classify as remote")
@@ -78,7 +88,7 @@ func remoteIdentityReadsEtagDateLengthAndRangeSupportOffOneHead() async throws {
         headers: ["ETag": "\"v1\"", "Last-Modified": "Wed, 21 Oct 2026 07:28:00 GMT"]
     )
 
-    let identity = try #require(await remoteIdentity(try remote("\(server.baseURL)/a.csv")))
+    let identity = try #require(await remoteIdentity(try remote("\(server.baseURL)/a.csv"), timeout: parsingBudget))
     #expect(identity.etag == "\"v1\"")
     #expect(identity.contentLength == body.count)
     #expect(identity.acceptsRanges)
@@ -100,7 +110,7 @@ func aServerWithNoEtagStillYieldsALastModifiedAndALength() async throws {
         headers: ["Last-Modified": "Sun, 06 Nov 1994 08:49:37 GMT"]
     )
 
-    let identity = try #require(await remoteIdentity(try remote("\(server.baseURL)/a.csv")))
+    let identity = try #require(await remoteIdentity(try remote("\(server.baseURL)/a.csv"), timeout: parsingBudget))
     #expect(identity.etag == nil)
     #expect(identity.lastModifiedMs == 784_111_777_000)
     #expect(identity.contentLength == 5)
@@ -121,8 +131,8 @@ func acceptsRangesFollowsTheHeaderRatherThanHope() async throws {
     server.register(path: "/no.parquet", body: Data("PAR1".utf8), rangeMode: .ignore)
     server.register(path: "/yes.parquet", body: Data("PAR1".utf8), rangeMode: .honor)
 
-    let no = try #require(await remoteIdentity(try remote("\(server.baseURL)/no.parquet")))
-    let yes = try #require(await remoteIdentity(try remote("\(server.baseURL)/yes.parquet")))
+    let no = try #require(await remoteIdentity(try remote("\(server.baseURL)/no.parquet"), timeout: parsingBudget))
+    let yes = try #require(await remoteIdentity(try remote("\(server.baseURL)/yes.parquet"), timeout: parsingBudget))
     #expect(!no.acceptsRanges)
     #expect(yes.acceptsRanges)
 }
@@ -137,7 +147,7 @@ func anUnparseableLastModifiedIsNoLastModifiedRatherThanAGuess() async throws {
         path: "/a.csv", body: Data("id\n".utf8),
         headers: ["Last-Modified": "Sunday, 06-Nov-94 08:49:37 GMT"]
     )
-    let identity = try #require(await remoteIdentity(try remote("\(server.baseURL)/a.csv")))
+    let identity = try #require(await remoteIdentity(try remote("\(server.baseURL)/a.csv"), timeout: parsingBudget))
     #expect(identity.lastModifiedMs == nil)
     #expect(httpDateMs("not a date at all") == nil)
     #expect(httpDateMs("Wed, 21 Xxx 2026 07:28:00 GMT") == nil)
@@ -183,8 +193,9 @@ func theDeadlineIsSiftsOwnClockAndNotTheHostOperatingSystems() async throws {
     // that would never finish on any machine.
     // No wall-clock assertion, deliberately: with a zero budget the deadline must win against work
     // that takes 30 s, and the ANSWER says whether it did. That is decidable under any load, where
-    // "did it come back fast" is not (see `deadlineTakes`), and it goes red the instant the race is
-    // deleted instead of thirty seconds later.
+    // "did it come back fast" is not — MEASURED, this suite's cooperative pool is starved enough by
+    // blocking DuckDB calls that a 1 s deadline has been seen firing at 9.3 s. It goes red the
+    // instant the race is deleted, in 0.001 s rather than thirty seconds.
     let answer: String? = await withDeadline(0) {
         try? await Task.sleep(nanoseconds: 30_000_000_000)
         return "the slow answer nobody waited for"
@@ -221,7 +232,7 @@ func aRefusedHeadIsNoIdentityRatherThanAnEmptyOne() async throws {
     // 404: the object is not there, so there is nothing to be the identity OF. Returning an
     // all-nil `RemoteIdentity` would let the caller build a `SourceKey` for a file that does not
     // exist.
-    #expect(await remoteIdentity(try remote("\(server.baseURL)/gone.csv")) == nil)
+    #expect(await remoteIdentity(try remote("\(server.baseURL)/gone.csv"), timeout: parsingBudget) == nil)
     #expect(server.requestLog.map(\.status) == [404])
 }
 

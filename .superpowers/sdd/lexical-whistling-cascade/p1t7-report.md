@@ -265,3 +265,112 @@ and with the reasoning and both measurements in the comment beside it.
    one's, or the same measurement will bite it.
 4. **`sift --verify` now reports 21 checks, one skipped** — the sibling's remote check, gated behind
    `SIFT_REMOTE_FACTS=1`. Not mine, but it changes the line the last report quoted as 20/20.
+
+---
+
+# Follow-up 2 (p1t7c) — the deadline gets off the cooperative pool
+
+Base `7e193c1`. The `TaskGroup` race shipped in p1t7b was still red on CI at **32.4 s**. The race was
+real; the racehorse could not reach the track.
+
+**Status: done.** Warning-free from a wiped `.build`. **846 tests**, four consecutive full runs
+green. `SIFT_REMOTE_FACTS=1 swift test --filter remoteFact` → 24/24. `swift run sift --verify` →
+20 passed, 1 skipped.
+
+## Why the first race lost
+
+A `Task.sleep` child has to be **scheduled before its budget starts counting**. On a 2-core runner
+under this suite's load it never got a cooperative thread inside the window, while `URLSession`'s
+own threads went on ticking to the OS default. A deadline that queues behind the resource it is
+protecting against is not a deadline.
+
+The repo already had the answer and I had already quoted it: `StageJob` escapes the cooperative pool
+with a real `Thread`, for this exact reason.
+
+## The mechanism now
+
+```swift
+await withCheckedContinuation { continuation in
+    let gate = OnceGate(continuation)          // NSLock; first resume wins, the loser is dropped
+    let finished = DispatchSemaphore(value: 0)
+    let job = Task { let v = await work(); _ = gate.finish(v); finished.signal() }
+    Thread.detachNewThread {
+        if finished.wait(timeout: .now() + max(0, timeout)) == .timedOut, gate.finish(nil) {
+            job.cancel()
+        }
+    }
+}
+```
+
+Three properties, each load-bearing:
+
+- **The timer is a real `Thread`**, armed synchronously before any `await`, so the budget starts at
+  call time whatever the pool is doing.
+- **The wait is a `DispatchSemaphore`, not `Thread.sleep`** — the thread is released the instant the
+  work wins, instead of parked for the whole budget on every successful probe.
+- **The loser is cancelled and never awaited**, so a slow unwind cannot hold the caller. The honest
+  cost is one unstructured `Task` that outlives the call.
+
+`OnceGate` exists because a `CheckedContinuation` resumed twice is a crash. `@unchecked Sendable`
+for the same reason `StageJob` is, and everything crossing the boundary goes through its lock.
+
+## The local reproduction the plan asked for: built six ways, and it does not reproduce
+
+The prize was turning the unkillable Mutant A ("race removed, knobs only") into a killable one by
+saturating the pool inside the test. I built it and measured it, twice over: jammers blocking on a
+semaphore and jammers **spinning on the CPU** (the pool grows extra threads when its own are
+*blocked*, so only a spin actually jams it), at 1x, 2x and 4x the core count, three trials each.
+
+| Jam | A — `Thread` timer | B — `Task.sleep` timer | C — knobs only |
+|---|---|---|---|
+| spin x1 | 1.01 s | 1.07 s | 1.00 s |
+| spin x1 | 1.01 s | 1.06 s | 1.01 s |
+| spin x4 | 1.01 s | 1.03 s | 1.01 s |
+| spin x4 | 1.00 s | 1.04 s | 1.00 s |
+| blocked x1/x2/x4 (9 trials) | 1.00–1.02 s | 1.06 s | 1.00–1.01 s |
+
+**All three variants answer in ~1.0 s under every saturation this machine can be put into.** An
+8-core Mac over-subscribes for blocked threads and time-slices spinning ones; it cannot be starved
+the way a 2-core runner is. One early reading of C = 4.02 s was cross-test interference from a
+second jamming test running in parallel, not a reproducible separation — chased down and discarded
+rather than shipped as a green bar.
+
+So the harness is **not shipped**. It would have been a 5-second, load-sensitive test in an already
+contended parallel suite, proving nothing on the machine that runs it. What is shipped instead is
+the finding, written on `withDeadline` itself so the next person does not spend the same afternoon.
+
+## The failure that proves the deadline is now real
+
+Three tests went red the moment the `Thread` timer landed —
+`acceptsRangesFollowsTheHeaderRatherThanHope`, `anUnparseableLastModified…`, and the etag/date/length
+one — because a HEAD that **succeeds** but whose delivery is starved past 5 s now gets cut off. That
+is correct in the app and reachable in this suite, and it is the clearest evidence available that
+the budget is being enforced: under the old mechanism the deadline was starved by exactly as much as
+the response, so the response always won.
+
+Fixed where it belongs: those tests are about *parsing*, so they now pass an explicit
+`parsingBudget` (60 s) instead of silently riding the 5 s default. A test about header parsing must
+not be a test about the deadline.
+
+## Mutations
+
+| Mutation | Result |
+|---|---|
+| the timer thread deleted | 🔴 `theDeadlineIsSiftsOwnClockAndNotTheHostOperatingSystems` — **30.7 s**, work outlived a zero budget |
+| the `Thread` swapped back to a `Task.sleep` | 🟢 survives locally (0.001 s) — this Mac cannot be starved, see the table |
+| `remoteIdentity` stops calling `withDeadline` | 🟢 survives locally (1.017 s vs 1.010 s raced) — unchanged from p1t7b |
+
+## Concerns
+
+1. **Two mutants survive locally and CI is the only oracle for both.** That is now measured rather
+   than asserted — six jam configurations, twelve trials — and recorded on `withDeadline`. If a
+   future change makes the deadline pool-dependent again, only the runner will say so.
+2. **The unstructured `Task` outlives the call when the deadline wins.** It is cancelled, and
+   `URLSession` unwinds it promptly here, but nothing awaits it. That is the deliberate price of not
+   letting a slow loser hold the caller — the thing that made the `TaskGroup` version wrong.
+3. **`parsingBudget` is 60 s, which is generous on purpose.** If a parsing test ever fails on the
+   deadline again, the pool is starved for a minute and the suite has a bigger problem than this
+   file.
+4. **One OS thread per probe, for at most the budget.** `remoteIdentity` is called once per remote
+   open, so this is cheap — but a caller that probed hundreds of URLs in a loop would want a shared
+   timer, and there is no such caller today.
