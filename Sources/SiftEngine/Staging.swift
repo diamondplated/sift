@@ -755,7 +755,9 @@ func swapStaged(_ con: Connection, name: String, lock: NSLock) throws {
 /// Bumped whenever `stagingToken`'s format changes, and the first field of every token, so a token
 /// written by an older build can never compare equal to one written by this build. A copy whose
 /// identity we can no longer interpret must never be adopted.
-let stagingTokenVersion = "v3"
+// The version constant moved to SiftCore (`Remote.swift`) the day remote tokens started sharing
+// the prefix — one spelling, so the purge sweep and both token formats cannot drift apart.
+// (`stagingTokenVersion` here now resolves to SiftCore's, via the module import.)
 
 /// The identity a staged copy is matched on: the exact bytes it was made from.
 ///
