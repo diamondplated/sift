@@ -332,6 +332,10 @@ public actor Session {
             // a copy that aged out, blew the budget, or no longer matches its source gets
             // collected. `try?`: a store that cannot be purged must not stop the engine starting.
             _ = try? Self.purgeStagedTables(con, open: [], tables: nil, all: false)
+            // And the downloaded copies, which nothing collected until T10 — same clock, same
+            // "a copy of someone's real data on a laptop" reasoning, one directory nobody could
+            // see. AFTER the purge, so a copy it just dropped takes its cache file with it.
+            Self.sweepRemoteCache(in: resolvedHome, con: con)
 
             // Credentials last, and only in the permissive posture. A secret on a strict engine is
             // inert — every network filesystem is denied, so nothing could resolve it — and issuing
@@ -593,6 +597,24 @@ public actor Session {
         tables[name] = t
     }
 
+    /// Test support: is there still a TEMP TABLE by this name on `pagingConnection`?
+    ///
+    /// The only way to see one from outside. A TEMP TABLE is visible solely to the connection that
+    /// created it (this file's header, fact 3, MEASURED), so a test cannot open its own connection
+    /// and look — and `pagingConnection` is not `Sendable`, so it cannot be handed out either.
+    ///
+    /// It exists to kill a mutant that is otherwise invisible. Dropping the materialized sort that a
+    /// refresh or a staged swap orphans is NOT a correctness guard — `Table.sortKey` is cleared
+    /// either way, so `sortedRelation` re-materializes and nothing ever reads the stale copy — it is
+    /// up to `sortMaterializeMax` rows (51.9 MB measured) held for the life of the session. A leak
+    /// has no observable answer to assert on except this one.
+    func tempTableExistsForTest(_ name: String) -> Bool {
+        let rows = try? pagingConnection.query(
+            "SELECT count(*) FROM duckdb_tables() WHERE table_name = ?", [.text(name)]
+        ).allRows()
+        return (rows?.first.map { cellInt($0[0]) } ?? 0) > 0
+    }
+
     /// Test support: shorten (or lengthen) the staging dwell. The same internal-seam trick as
     /// `setFilteredCountForTest`/`setProfileForTest` above, applied to a clock: a test that
     /// really slept `stageDwellSeconds` would add three seconds to a parallel suite to prove a
@@ -745,39 +767,66 @@ public actor Session {
     /// `RemoteURL.displayName` for a URL. `extraNotes` is what the branch learned on the way in
     /// that the spec cannot say for itself; today that is exactly one thing, the SAS'd parquet that
     /// had to be downloaded.
+    ///
+    /// `replacing` is `refreshRemote`'s mode, and it is a parameter rather than a second function
+    /// for the reason above stated in the other direction: a refreshed table has to keep its
+    /// GENERATION and its query spec while resetting every derived field, and the list of derived
+    /// fields is `Table.init`'s to know, not a caller's. Passing the live table through here means
+    /// the rebuild reuses the same staged-copy adoption, the same view creation and the same
+    /// background re-kick — one place for all three.
     private func finishOpen(
-        spec: SourceSpec, requestedName: String?, displayName: String, extraNotes: [String] = []
+        spec: SourceSpec, requestedName: String?, displayName: String, extraNotes: [String] = [],
+        replacing existing: Table? = nil
     ) throws -> Table {
-        let taken = Set(tables.keys)
-        let base: String
-        if let requestedName, !requestedName.isEmpty {
-            base = requestedName
+        let tname: String
+        let generation: Int
+        if let existing {
+            tname = existing.name
+            generation = existing.openedAt
         } else {
-            let raw = spec.fmt == .xlsx ? (spec.sheet ?? displayName) : displayName
-            base = try sanitizeTableName(raw)
+            let taken = Set(tables.keys)
+            let base: String
+            if let requestedName, !requestedName.isEmpty {
+                base = requestedName
+            } else {
+                let raw = spec.fmt == .xlsx ? (spec.sheet ?? displayName) : displayName
+                base = try sanitizeTableName(raw)
+            }
+            tname = taken.contains(base) ? try sanitizeTableName(base, taken: taken) : base
+            nextOpenGeneration += 1
+            generation = nextOpenGeneration
         }
-        let tname = taken.contains(base) ? try sanitizeTableName(base, taken: taken) : base
 
-        nextOpenGeneration += 1
-        var t = Table(name: tname, spec: spec, qspec: QuerySpec(relation: tname), openedAt: nextOpenGeneration)
+        var t = Table(
+            name: tname, spec: spec, qspec: existing?.qspec ?? QuerySpec(relation: tname),
+            openedAt: generation
+        )
         if let rowCount = spec.rowCount { t.rowCount = rowCount }
         t.notes.append(contentsOf: extraNotes)
+        t.notes.append(contentsOf: specNotes(spec))
 
-        if spec.fmt == .xlsx, !spec.sheets.isEmpty {
-            t.notes.append(
-                "Sheet \u{201C}\(spec.sheet ?? "")\u{201D} of \(spec.sheets.count)"
-                    + (spec.sheets.count > 1 ? " — use the sheet picker to open others" : "")
-            )
-        }
-        if spec.fmt == .globParquet || spec.fmt == .globCsv {
-            t.notes.append("Folder read as one table (union by name, with filename provenance)")
-        }
-        if spec.fmt == .delta {
-            // Python renders a missing delta_version via its f-string as the literal "None";
-            // "unknown" says the same thing without leaking a Python-ism into a native app, for a
-            // branch that's effectively unreachable (isDeltaDir already confirmed a real log).
-            let version = spec.deltaVersion.map(String.init) ?? "unknown"
-            t.notes.append("Delta table at version \(version) — tombstones honored")
+        if let existing {
+            // What survives a refresh, and it is the whole point of the mode: the tab (the
+            // generation), the filters and sort (`qspec`, carried into `Table.init` above), the
+            // user's typed SQL, and where the tab sits in `state()`'s order. Everything NOT carried
+            // here — row counts, bad rows, the profile, the staged flag, the cached filtered count —
+            // is derived from bytes that just changed, and `Table.init` has already reset all of it
+            // by construction rather than by a list somebody has to keep up to date.
+            t.lastUsed = existing.lastUsed
+            t.firstAggregateAt = existing.firstAggregateAt
+            t.sqlMode = existing.sqlMode
+            t.sqlText = existing.sqlText
+            // The materialized sort is a COPY of the old bytes. Dropped rather than merely forgotten
+            // for exactly `applyStaged`'s reason: `Table.init` has already cleared `sortKey`, so the
+            // next sorted page re-materializes and NOTHING reads the stale copy — but it can hold up
+            // to `sortMaterializeMax` rows (51.9 MB measured) for the life of the session. Safe on
+            // `pagingConnection` because nothing suspends between here and the write below.
+            if let key = existing.sortKey {
+                try? pagingConnection.execute("DROP TABLE IF EXISTS \(q(key))")
+            }
+            // Same revocation as `applyStaged`: a profile in flight is reading the relation this is
+            // about to replace, so its answer is about bytes that are gone.
+            profileJobs.removeValue(forKey: tname)
         }
 
         // A staged copy of this exact file, left in the store by an earlier open, is reused rather
@@ -809,6 +858,33 @@ public actor Session {
         return t
     }
 
+    /// The notes a spec earns that `Table.init` does not seed for itself.
+    ///
+    /// Split out when `refreshRemote` arrived, for the reason `finishOpen`'s own comment gives about
+    /// copies: a refreshed workbook that silently lost its "Sheet X of 3" note would look like a
+    /// single-sheet file. `Table.init` keeps the two it seeds (`raggedCollapseNote`,
+    /// `preambleNote`) because those are properties of the spec that no construction site may drop.
+    private nonisolated func specNotes(_ spec: SourceSpec) -> [String] {
+        var notes: [String] = []
+        if spec.fmt == .xlsx, !spec.sheets.isEmpty {
+            notes.append(
+                "Sheet \u{201C}\(spec.sheet ?? "")\u{201D} of \(spec.sheets.count)"
+                    + (spec.sheets.count > 1 ? " — use the sheet picker to open others" : "")
+            )
+        }
+        if spec.fmt == .globParquet || spec.fmt == .globCsv {
+            notes.append("Folder read as one table (union by name, with filename provenance)")
+        }
+        if spec.fmt == .delta {
+            // Python renders a missing delta_version via its f-string as the literal "None";
+            // "unknown" says the same thing without leaking a Python-ism into a native app, for a
+            // branch that's effectively unreachable (isDeltaDir already confirmed a real log).
+            let version = spec.deltaVersion.map(String.init) ?? "unknown"
+            notes.append("Delta table at version \(version) — tombstones honored")
+        }
+        return notes
+    }
+
     // MARK: - open: the remote branch
 
     /// Open a URL. Four gates that never touch the network, then one detached build that does.
@@ -827,12 +903,36 @@ public actor Session {
         try checkRemoteConnection(url)
 
         let opened = try await remoteOpen(
-            url, sheet: sheet, nullPadding: nullPadding, skipPreamble: skipPreamble
+            url, sheet: sheet, nullPadding: nullPadding, skipPreamble: skipPreamble,
+            knownToken: cachedObjectToken(for: url)
         )
         return try finishOpen(
             spec: opened.spec, requestedName: name, displayName: url.displayName,
             extraNotes: opened.notes
         )
+    }
+
+    /// The identity of the cache file an OPEN table already vouches for at this URL, or `nil`.
+    ///
+    /// 🔴 **This is what makes the second SHEET of a remote workbook free.** `openPath(url,
+    /// sheet: "Q3")` walks the whole remote open again, and without this it re-downloads bytes that
+    /// are already on the disk, byte-identical, under a deterministic name — somebody's object, on
+    /// somebody's metered connection, twice.
+    ///
+    /// The open catalog is the identity store rather than a map of its own, and that is not laziness
+    /// twice over: a `RemoteRef` already carries exactly the fetched identity (`stagingToken`), the
+    /// catalog already expires it correctly (a closed tab stops vouching), and a parallel map would
+    /// be a second thing to keep in step with `tables`. The token is the OBJECT's —
+    /// `RemoteRef.stagingToken` names the URL, never the sheet — which is precisely why a different
+    /// sheet of the same workbook matches it.
+    ///
+    /// Newest open wins when several tables share a URL: they should all carry the same token, and
+    /// if a refresh has moved one of them on, the newest is the one that fetched last.
+    private func cachedObjectToken(for url: RemoteURL) -> String? {
+        tables.values
+            .filter { $0.spec.remote?.url == url.sanitized && $0.spec.remote?.cachePath != nil }
+            .max { $0.openedAt < $1.openedAt }?
+            .spec.remote?.stagingToken
     }
 
     /// May this session reach the network at all? MEASURED (remote facts §2, and `Connections.swift`
@@ -954,7 +1054,8 @@ public actor Session {
     /// sentence they already are — the identical wrap `openPath`'s local half puts around
     /// `buildSource`.
     private func remoteOpen(
-        _ url: RemoteURL, sheet: String?, nullPadding: Bool, skipPreamble: Bool
+        _ url: RemoteURL, sheet: String?, nullPadding: Bool, skipPreamble: Bool,
+        knownToken: String? = nil
     ) async throws -> RemoteOpen {
         let database = self.database
         let home = self.siftHome
@@ -963,7 +1064,8 @@ public actor Session {
             return try await Task.detached {
                 try await buildRemoteOpen(
                     database: database, home: home, url: url, fetchedAtNs: fetchedAtNs,
-                    sheet: sheet, nullPadding: nullPadding, skipPreamble: skipPreamble
+                    sheet: sheet, nullPadding: nullPadding, skipPreamble: skipPreamble,
+                    knownToken: knownToken
                 )
             }.value
         } catch let error as UnsupportedSource {
@@ -973,6 +1075,112 @@ public actor Session {
         } catch let error as DuckDBError {
             throw SessionError(error.firstLine)
         }
+    }
+
+    // MARK: - refresh: the second look at the same object
+
+    /// Ask the server whether this table's object has changed, and rebuild it if it has.
+    ///
+    /// The plan's wording, which is the contract: *HEAD unchanged → "unchanged since HH:MM";
+    /// changed or identity-less → drop copy, rebuild spec, re-kick pipeline under the same
+    /// `openedAt` so filters/sort/tab survive.*
+    ///
+    /// 🔴 **"Unchanged" is a token comparison, not field-by-field equality, and the difference is
+    /// the whole correctness argument.** `RemoteRef.stagingToken` is already the single spelling of
+    /// "is this the same object" — an ETag alone when there is one, `(Last-Modified, Content-Length)`
+    /// together when there is not, and `fetched=<ns>` when there is neither. That last form is what
+    /// makes an identity-less source (`az://`, `s3://`, a 404, a timeout, a server that offers
+    /// nothing) *always* refetch: it is different on every probe, so it cannot compare equal, and
+    /// the never-adopt rule is therefore a property of the format rather than a branch anybody can
+    /// delete. Comparing fields instead would need that branch, and would also have to decide what
+    /// two `nil` etags mean — which is exactly the "a nil that means timed out and a nil that means
+    /// the server said nothing" trap T7's `DeadlineOutcome` seam exists for. **Sift never reports
+    /// "unchanged" from a probe that could not run.**
+    ///
+    /// ONE HEAD is the cost of the common case, and nothing else: the probe happens here, and only
+    /// a probe that says "changed" pays for `remoteOpen` (which runs its own HEAD before the GET it
+    /// is there to authorise). The alternative — rebuilding the spec unconditionally and reporting
+    /// the outcome afterwards — costs a re-sniff of the cache file, or a ranged parquet read, every
+    /// time the answer is "nothing to do".
+    ///
+    /// The stale cache file is not deleted up front, deliberately. A successful rebuild overwrites
+    /// it at the same deterministic path; a rebuild that FAILS (the object is now over the download
+    /// cap, the server is down) leaves the table exactly as it was, still readable, with one clean
+    /// sentence — where a pre-emptive delete would leave a live table pointing at a file that no
+    /// longer exists. Stale bytes surviving under a live name is safe because nothing adopts a cache
+    /// file on presence (see `buildRemoteOpen`'s `knownToken`), and `sweepRemoteCache` collects the
+    /// orphan at the next launch.
+    @discardableResult
+    public func refreshRemote(_ name: String) async throws -> RefreshOutcome {
+        let t = try table(name)
+        guard let ref = t.spec.remote else {
+            throw SessionError(
+                "Refresh re-fetches a source Sift opened from a URL, and \(name) was opened from a "
+                    + "local file \u{2014} Sift already reads it from disk on every query."
+            )
+        }
+        guard let url = classifyRemote(ref.url) else {
+            // Unreachable through `openPath` (every remote spec was built from a URL that
+            // classified), and a sentence rather than a crash because "unreachable" is a claim about
+            // today's call sites, not about the type.
+            throw SessionError("\(name) was opened from \(ref.url), which Sift can no longer read as a URL.")
+        }
+        // A copy of the OLD bytes is being built right now, and `applyStaged` checks only
+        // `openedAt` — which refresh deliberately preserves — so the job would publish yesterday's
+        // rows over today's view. Refusing is honest; cancelling somebody's nearly-finished CTAS in
+        // order to re-run it is not cheaper.
+        if let staging = t.staging {
+            throw SessionError(
+                "\(name) is being copied into Sift's local store right now (job \(staging.jobID))"
+                    + " \u{2014} wait for that to finish, then refresh."
+            )
+        }
+        // The posture and the extension were settled when this table opened and cannot have
+        // narrowed since (both are frozen for the life of the `Database`). A saved connection CAN
+        // have been removed in between, and that has a sentence of its own.
+        try checkRemoteConnection(url)
+
+        let openedAt = t.openedAt
+        let fetchedAtNs = fetchClockNs()
+        // `remoteIdentity` is `URLSession` only — no DuckDB call, nothing that blocks a thread — so
+        // it awaits here on the actor rather than in a detached task, and the actor is free for the
+        // duration. The DuckDB half below is still detached, for the reason `remoteOpen` states.
+        let identity = await remoteIdentity(url)
+        // RECORDED SURVIVING MUTANT, both this guard and its twin below: they close the window
+        // opened by the two `await`s in this method (a tab closed mid-probe, mid-download), and
+        // reaching either one means losing a race deliberately, which is not reproducible at unit
+        // speed. What they protect IS covered structurally — `finishOpen`'s `replacing` mode writes
+        // through `tables[name]`, and the generation it is handed is the one it just re-read.
+        guard isStillOpen(name, openedAt: openedAt) else {
+            throw SessionError("\(name) was closed while Sift was checking whether it had changed.")
+        }
+
+        guard remoteObjectToken(url, identity, fetchedAtNs: fetchedAtNs) != ref.stagingToken else {
+            return .unchanged(since: clockHHMM(epochNs: ref.fetchedAtNs))
+        }
+
+        // `nullPadding` is carried across because it is the user's own escape hatch from a ragged
+        // file and re-sniffing without it puts the collapse straight back. `skipPreamble: false` is
+        // NOT recoverable from a spec — the sniffed `skip` is baked either way, so there is nothing
+        // to read it back off — and refresh therefore re-sniffs with the default; `preambleNote`
+        // still fires, which is the same one-click way out the user already took.
+        let rebuilt = try await remoteOpen(
+            url, sheet: t.spec.sheet,
+            nullPadding: t.spec.readArgs["null_padding"] == .bool(true), skipPreamble: true
+        )
+        guard let live = tables[name], live.openedAt == openedAt else {
+            throw SessionError("\(name) was closed while Sift was re-fetching it.")
+        }
+        // `finishOpen` in `replacing` mode: same name, same generation, same query spec, and the
+        // staged copy of the old bytes dropped by `adoptStagedCopy` — whose token check cannot match
+        // the identity we just measured as different, so it drops the copy and its catalog row and
+        // falls through to a fresh view. That IS `unstage`'s machinery, reached by the path that
+        // already knows when to run it.
+        _ = try finishOpen(
+            spec: rebuilt.spec, requestedName: nil, displayName: url.displayName,
+            extraNotes: rebuilt.notes, replacing: live
+        )
+        return .refetched
     }
 
     // MARK: - post-open background work
@@ -1292,6 +1500,28 @@ public struct SessionState: Sendable {
     public let engine: EngineInfo
 }
 
+/// What `refreshRemote` actually did — MEASURED, not asserted, in the shape T6's
+/// `ConnectionOutcome` established.
+///
+/// 🔴 It reports the outcome rather than leaving the caller to infer one, because both cases end
+/// with a table that still works and the two are indistinguishable from outside: a refetch that
+/// happened to return identical bytes and an unchanged object produce the same grid. A test that
+/// asserted a side effect ("the row count is still 500") would pass for either, which is the class
+/// of test this branch has spent the whole phase deleting.
+///
+/// `since` is already rendered — `"14:32"`, 24-hour, in the user's own time zone — because the UI
+/// has no way to format a `Date` that this codebase permits (`DateFormatter` and friends are banned
+/// after four shipped locale bugs). The sentence is "unchanged since 14:32".
+public enum RefreshOutcome: Sendable, Equatable {
+    /// The server's identity for the object is the one Sift already has. Nothing was fetched,
+    /// nothing was rebuilt, and the tab is untouched. `since` is when Sift last fetched it.
+    case unchanged(since: String)
+    /// The object changed, or it has no identity to compare (`az://`, `s3://`, a server that offers
+    /// neither an ETag nor a date-and-length, a probe that failed) — either way the bytes were
+    /// fetched again and the table was rebuilt in place.
+    case refetched
+}
+
 public struct TablePage: Sendable {
     public struct ColumnInfo: Sendable {
         public let name: String
@@ -1364,6 +1594,19 @@ let sasParquetNote =
 ///     when a SAS is in the URL (see `sasParquetNote`).
 ///  4. **The spec**, `buildRemoteSource`, which re-sniffs the cache file from its magic bytes.
 ///
+/// `knownToken` is a caller's claim about the file already at the cache path: "the last time I put
+/// bytes there, the object's identity was this". Two callers make it — `openRemote`, from an open
+/// table on the same URL (which is what makes a second SHEET of one workbook free), and
+/// `refreshRemote`, which never passes one because it has already decided to refetch. When the
+/// fresh identity matches the claim AND the file is still there, the download is skipped.
+///
+/// 🔴 **The file's PRESENCE is not identity, and the two halves of that condition are not
+/// interchangeable.** A cache name is `fnv1a(sanitized URL)`, so an object that changed under a URL
+/// keeps the same filename — adopting on presence alone serves yesterday's bytes forever, which is
+/// the exact failure `remoteStagingToken` exists to prevent. It is the token that decides; the
+/// `fileExists` is only there because a sweep (or a user) can delete a file the catalog still
+/// vouches for.
+///
 /// **T7's extension-less-CSV concern dies here, with no new `Fmt` case.** The worry was that a URL
 /// with no extension costs three fetches to identify. It does not, in this shape: `remoteFormat`'s
 /// DESCRIBE probes go parquet first, which ranges rather than downloads, and anything that falls
@@ -1373,11 +1616,12 @@ let sasParquetNote =
 /// save one fetch on the rarest shape of URL there is.
 func buildRemoteOpen(
     database: Database, home: String, url: RemoteURL, fetchedAtNs: Int,
-    sheet: String?, nullPadding: Bool, skipPreamble: Bool
+    sheet: String?, nullPadding: Bool, skipPreamble: Bool, knownToken: String? = nil
 ) async throws -> RemoteOpen {
     let con = try database.connect()
     let fmt = try remoteFormat(url, con: con)
     let identity = await remoteIdentity(url)
+    let token = remoteObjectToken(url, identity, fetchedAtNs: fetchedAtNs)
 
     var notes: [String] = []
     let sasParquet = fmt == .parquet && url.query != nil
@@ -1386,7 +1630,9 @@ func buildRemoteOpen(
     var cachePath: String?
     if fmt != .parquet || sasParquet {
         let path = try remoteCachePath(home: home, url: url)
-        try downloadRemoteObject(con: con, url: url, to: path)
+        if token != knownToken || !FileManager.default.fileExists(atPath: path) {
+            try downloadRemoteObject(con: con, url: url, to: path)
+        }
         cachePath = path
     }
 
@@ -1456,6 +1702,31 @@ func remoteExtensionName(_ scheme: RemoteScheme) -> String {
 /// distinct fetches are a HEAD and a download apart, milliseconds at the very best.
 func fetchClockNs() -> Int {
     Int(Date().timeIntervalSince1970 * 1_000_000_000)
+}
+
+/// `RemoteRef.fetchedAtNs` as `HH:MM` on a 24-hour clock, in the machine's own time zone — the
+/// `since` half of `RefreshOutcome.unchanged`.
+///
+/// 🔴 **The epoch was checked, not assumed, and the check is the reason this function is allowed to
+/// exist.** A "caller's clock in nanoseconds" is as likely to be `DispatchTime.uptimeNanoseconds`,
+/// which restarts at zero every boot and cannot be rendered as a wall time at all — printing an
+/// hour from one would put a confident wrong number on screen, which is the failure this product is
+/// built to avoid. `fetchedAtNs` is written at exactly one call site (`Session.remoteOpen`) by
+/// exactly one function (`fetchClockNs`, immediately above), and that function is
+/// `Date().timeIntervalSince1970 * 1e9` — UNIX epoch nanoseconds, chosen deliberately over uptime
+/// because the value is compared on a LATER LAUNCH. So it is a wall time, and this renders it.
+///
+/// Hand-built from `Calendar` components, never a formatter (AGENTS.md bans the `DateFormatter`
+/// family from anything user-visible after four shipped locale bugs, one of which deleted user
+/// data). An explicit Gregorian calendar, whose `timeZone` defaults to `TimeZone.current` — which is
+/// the point: the hour the user wants is the hour on their own wall.
+func clockHHMM(epochNs: Int) -> String {
+    let parts = Calendar(identifier: .gregorian).dateComponents(
+        [.hour, .minute], from: Date(timeIntervalSince1970: Double(epochNs) / 1_000_000_000)
+    )
+    let hour = parts.hour ?? 0
+    let minute = parts.minute ?? 0
+    return "\(hour < 10 ? "0" : "")\(hour):\(minute < 10 ? "0" : "")\(minute)"
 }
 
 // MARK: - free helpers (no actor state; safe to call from the detached background pipeline)

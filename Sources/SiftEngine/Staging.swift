@@ -572,9 +572,98 @@ extension Session {
         }
     }
 
-    /// Real bytes on disk, not the sum of per-table estimates — the file the user could go and
+    /// Real bytes on disk, not the sum of per-table estimates — the files the user could go and
     /// delete, which is the number that answers "what is this tool holding on to".
-    public nonisolated func stagedTotalBytes() -> Int { dbBytes() }
+    ///
+    /// 🔴 **The downloaded remote copies are in this number, and leaving them out was the sheet
+    /// lying.** A user who opens ten remote CSVs has ten full copies of somebody's data on their
+    /// laptop; none of them is in the DuckDB store, so `dbBytes()` reported them as nothing while
+    /// the Staged Data screen — whose entire job is to say what Sift is holding and let the user
+    /// take it back — showed a total that was short by exactly the amount that mattered. The purge
+    /// budget is untouched by this: `selectForPurge` compares per-copy `bytes` from the catalog, not
+    /// this total, and the cache has its own collector (`sweepRemoteCache`).
+    public nonisolated func stagedTotalBytes() -> Int { dbBytes() + remoteCacheBytes() }
+
+    /// What `<SIFT_HOME>/remote-cache/` occupies right now. Public so the Staged Data screen can
+    /// break the total above into "the store" and "downloaded copies" if it wants to — one number
+    /// that is honest beats two that need explaining, but the split is available rather than
+    /// re-derived.
+    ///
+    /// Deliberately NOT folded into `dbBytes()`, which is documented as the store file plus its WAL
+    /// and is read by `engineInfo()` on every `state()` — a directory enumeration on the UI's polling
+    /// path, to change a number nothing reads, is a cost with no buyer.
+    public nonisolated func remoteCacheBytes() -> Int {
+        let dir = (siftHome as NSString).appendingPathComponent(remoteCacheDirName)
+        guard let names = try? FileManager.default.contentsOfDirectory(atPath: dir) else { return 0 }
+        return names.reduce(0) { $0 + fileSize((dir as NSString).appendingPathComponent($1)) }
+    }
+
+    /// Collect downloaded remote objects: the ones nothing points at, and the ones that have aged
+    /// out. Runs at startup beside `purgeStagedTables` and after it, so a copy the purge just
+    /// dropped takes its cache file with it.
+    ///
+    /// `static` for the same reason the purge is: `Session.init` runs this before the actor exists.
+    ///
+    /// Two rules, and the first is the one that does the work:
+    ///
+    ///  * **Orphans.** The expected filename of a remote catalog row is recomputable from what the
+    ///    row already persists — `fnv1a(sanitized url) + cacheSuffix(url)`, both pure, both reading
+    ///    the URL's path only. Anything else in the directory is a copy of somebody's data that
+    ///    nothing in Sift can reach: a table opened and closed without ever being staged, a source
+    ///    whose object changed (the old bytes keep the old name only until the refetch overwrites
+    ///    them — but a source that stopped being downloaded at all, e.g. a URL that used to have no
+    ///    extension and now resolves as parquet, leaves the file behind), or a row a purge collected.
+    ///    Hashing the SANITIZED url is what keeps T8's ruling true: two SAS'd fetches of one blob
+    ///    share one cache entry, so they also share one expected name and neither is an orphan.
+    ///  * **Age.** `stageMaxAgeDays()` — the same number `stagePolicy()` reports and `selectForPurge`
+    ///    enforces on the store, read from the same one place — against the file's mtime. Staged data
+    ///    is client data on a laptop and ages out on a clock; a downloaded copy is the same data.
+    ///
+    /// 🔴 **THE TRAVERSAL GUARD IS THE LOAD-BEARING PART: this function DELETES.** It enumerates one
+    /// directory non-recursively, and every name it acts on must be a single path component that
+    /// `contentsOfDirectory` handed it — never a name it followed, never a path it joined from
+    /// anything a URL, a catalog row or an object key could influence. Directories are skipped
+    /// outright rather than removed recursively (nothing here creates one, and a recursive delete of
+    /// something unexpected is not a thing to do quietly). A symlink IS collected — but
+    /// `removeItem` unlinks the link, never the target, and `attributesOfItem` does not follow it
+    /// either, so the file it points at is untouched. `remoteCacheSurvivesOutsideItsOwnDirectory`
+    /// is the test that says so, and it is worth more than three that prove files inside it die.
+    static func sweepRemoteCache(in home: String, con: Connection) {
+        let dir = (home as NSString).appendingPathComponent(remoteCacheDirName)
+        guard let names = try? FileManager.default.contentsOfDirectory(atPath: dir) else { return }
+
+        let rows = (try? con.query("SELECT source_token, path FROM _sift_sources").allRows()) ?? []
+        let expected = Set(rows.compactMap { row -> String? in
+            guard cellText(row[0]).hasPrefix(remoteTokenPrefix),
+                let url = classifyRemote(cellText(row[1]))
+            else { return nil }
+            return fnv1a(url.sanitized) + cacheSuffix(url)
+        })
+        let cutoff = Date().addingTimeInterval(-Double(stageMaxAgeDays()) * 86400)
+        let manager = FileManager.default
+
+        for name in names {
+            // A name that is not a single component of this directory is not one this sweep put
+            // here, and it is the only shape that could reach outside. `contentsOfDirectory` does
+            // not produce one; the guard is here because the consequence of one arriving is a
+            // deleted file somewhere else on the disk.
+            guard name == (name as NSString).lastPathComponent, name != ".", name != ".." else {
+                continue
+            }
+            let path = (dir as NSString).appendingPathComponent(name)
+            let attributes = try? manager.attributesOfItem(atPath: path)
+            let type = attributes?[.type] as? FileAttributeType
+            guard type == .typeRegular || type == .typeSymbolicLink else { continue }
+
+            guard expected.contains(name) else {
+                try? manager.removeItem(atPath: path)
+                continue
+            }
+            if let modified = attributes?[.modificationDate] as? Date, modified < cutoff {
+                try? manager.removeItem(atPath: path)
+            }
+        }
+    }
 
     /// The age-out and size limits this session is actually enforcing, so the staged-data
     /// manager can state them rather than restating a default that `SIFT_STAGE_BUDGET_GB` may
@@ -832,7 +921,18 @@ let remoteTokenPrefix = "\(stagingTokenVersion)|remote|"
 /// files, so it is noise next to the parse — if a folder ever gets big enough for the walk to show
 /// up, cache it against the directory's own mtime.
 func stagingToken(_ spec: SourceSpec) -> String {
-    if let remote = spec.remote { return remote.stagingToken }
+    if let remote = spec.remote {
+        // 🔴 The sheet joins a REMOTE token for exactly the reason it joins a local one, and it was
+        // missing here — a hole T10 opened the door to by making a remote workbook's second sheet a
+        // real feature. `RemoteRef` identifies the OBJECT (that is its job: it is what decides
+        // whether the downloaded copy may be reused, and every sheet shares one download), so every
+        // sheet of one workbook produced the same STAGED-COPY token. Stage `Q1 2024`, close it, open
+        // `Q1-2024` — `sanitizeTableName` derives the same table name from both, the tokens matched,
+        // and `adoptStagedCopy` served the first sheet's rows under the second sheet's name. That is
+        // the local bug this function's own comment says was REPRODUCED, one transport over.
+        guard let sheet = spec.sheet, !sheet.isEmpty else { return remote.stagingToken }
+        return remote.stagingToken + "|sheet=\(sheet)"
+    }
     var parts = [stagingTokenVersion, spec.key.path, String(spec.key.mtimeNs), String(spec.key.size)]
     if let ctime = try? statInfo(spec.key.path).ctimeNs { parts.append("ctime=\(ctime)") }
     if let sheet = spec.sheet, !sheet.isEmpty { parts.append("sheet=\(sheet)") }

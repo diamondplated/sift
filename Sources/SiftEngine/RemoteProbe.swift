@@ -81,6 +81,28 @@ public struct RemoteIdentity: Sendable, Equatable {
     }
 }
 
+/// The identity token a fresh probe of `url` produces — the ONE value every "is this still the same
+/// object" question in the engine is decided on.
+///
+/// Built from a `RemoteIdentity` rather than from a `RemoteRef`, so the answer exists before
+/// anything has been downloaded, and built by calling the SAME `remoteStagingToken` that
+/// `RemoteRef.stagingToken` calls, so a fresh token and a stored one are comparable by `==`. Two
+/// spellings of one identity is how a cache serves the wrong bytes.
+///
+/// 🔴 **The never-adopt rule for an identity-less source falls out of the FORMAT, not out of a
+/// branch here.** `remoteIdentity` is `nil` by design for `az`/`s3` and `nil` for every failure, and
+/// with no etag and no (date, length) pair `remoteStagingToken` emits the `fetched=<ns>` form —
+/// different on every call given a distinct `fetchedAtNs`, so it can never equal a stored token. Do
+/// not "help" it with an `if identity == nil { return false }` at a comparison site: a branch can be
+/// tidied away, a format cannot.
+func remoteObjectToken(_ url: RemoteURL, _ identity: RemoteIdentity?, fetchedAtNs: Int) -> String {
+    remoteStagingToken(
+        sanitizedURL: url.sanitized, etag: identity?.etag,
+        lastModifiedMs: identity?.lastModifiedMs, contentLength: identity?.contentLength,
+        fetchedAtNs: fetchedAtNs
+    )
+}
+
 /// One HEAD, through `URLSession`, for `http`/`https` only.
 ///
 /// **`nil` for `s3`/`az`/`abfss`, deliberately.** `URLSession` has no idea how to sign an Azure or

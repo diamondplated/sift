@@ -61,7 +61,7 @@ private func smallFixture(dir: String, name: String, cols: Int, rows: Int) throw
 /// Poll until the job registers. `profiling` is published in the same non-`async` step of
 /// `profileJob(for:)` that registers the job, so it cannot be observed apart from it — which makes
 /// it the exact signal wanted here.
-private func waitForProfileJob(_ session: Session, _ name: String) async throws -> Bool {
+func waitForProfileJob(_ session: Session, _ name: String) async throws -> Bool {
     let deadline = Date().addingTimeInterval(10)
     while try await session.table(name).profiling == false {
         if Date() > deadline { return false }
@@ -90,7 +90,10 @@ private func waitForProfileJob(_ session: Session, _ name: String) async throws 
 /// ones `computeProfile`'s own retry starts — pass straight through instead of deadlocking.
 ///
 /// `@unchecked Sendable` around an `NSLock` is the same documented exception `StageJob` makes.
-private final class ProfileGate: @unchecked Sendable {
+// Not `private`: RemoteOpenTests reuses both of these to hold a profile job across a Refresh —
+// the same window, the same reason, and a second copy of a synchronisation primitive is a second
+// place for it to be subtly wrong.
+final class ProfileGate: @unchecked Sendable {
     private let lock = NSLock()
     private var opened = false
     private var waiting: [CheckedContinuation<Void, Never>] = []
