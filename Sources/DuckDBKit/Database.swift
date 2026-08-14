@@ -37,8 +37,16 @@ public final class Database: @unchecked Sendable {
     ///
     /// MEASURED (`docs/…/2026-08-16-duckdb-remote-facts.md` §1): `SET disabled_filesystems` never
     /// validates a name, and the registry is not introspectable — a typo here is a security layer
-    /// that does nothing and says nothing.
-    public static let remoteFilesystems = "HTTPFileSystem,S3FileSystem"
+    /// that does nothing and says nothing. The two Azure names are the ones that fact went looking
+    /// for: `AzureBlobStorageFileSystem` serves `az://`/`azure://`, `AzureDfsStorageFileSystem`
+    /// serves `abfss://`/`abfs://`, and `AzureStorageFileSystem` — the name that appears in the
+    /// extension's own error text — is a C++ base class that is not registered and blocks nothing.
+    /// Because a wrong name is silent, the only defence is behavioral: every name here is dropped
+    /// one at a time in `theGateScratchConnectionIsHardenedLikeEveryOtherOne` and in
+    /// `hardenDisablesEveryNameOnTheDenyList…`, and the Azure half is read end to end in
+    /// `remoteFact1_…`.
+    public static let remoteFilesystems =
+        "HTTPFileSystem,S3FileSystem,AzureBlobStorageFileSystem,AzureDfsStorageFileSystem"
 
     public init(path: String) throws {
         var db: duckdb_database?
@@ -82,13 +90,31 @@ public final class Database: @unchecked Sendable {
     /// `Catalog Error: unrecognized configuration parameter`, so the signal exists, and
     /// discarding it would let a DuckDB rename disable a security layer with nothing to show
     /// for it. The four settings are a frozen contract (design spec §11).
-    public func harden() {
-        let settings = [
-            ("disabled_filesystems", "'\(Self.remoteFilesystems)'"),
+    ///
+    /// `allowRemote: true` is the one posture the Connections work adds, and it changes exactly one
+    /// setting: `disabled_filesystems` is never SET, so a `LOAD`ed `httpfs`/`azure` can actually
+    /// reach the network. The other three still apply — a remote session is still not allowed to
+    /// autoload or community-load an extension. MEASURED (§2): the disabled set only ever grows
+    /// within a `Database` and reads back `''`, so this cannot be a live toggle and there is nothing
+    /// to undo — a posture change is a new `Database`, which is why it is a parameter of the one
+    /// call that runs before any query rather than a `var` on the class.
+    ///
+    /// The default keeps every existing call site both compiling and airtight; `true` only ever
+    /// arrives from a user choosing a remote connection.
+    ///
+    /// In the permissive posture `hardened` has no `disabled_filesystems` key at all. **Absent is
+    /// not `false`** — same tri-state discipline as `ExtensionState`: `false` means the SET was
+    /// issued and DuckDB refused it, which is a bug report; absent means Sift deliberately never
+    /// asked.
+    public func harden(allowRemote: Bool = false) {
+        var settings = [
             ("autoinstall_known_extensions", "false"),
             ("autoload_known_extensions", "false"),
             ("allow_community_extensions", "false"),
         ]
+        if !allowRemote {
+            settings.insert(("disabled_filesystems", "'\(Self.remoteFilesystems)'"), at: 0)
+        }
         guard let con = try? connect() else {
             for (name, _) in settings { hardened[name] = false }
             return

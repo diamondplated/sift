@@ -129,6 +129,60 @@ import TestSupport
                             "allow_community_extensions": true])
 }
 
+/// The four names `harden()` denies, spelled out here rather than read from
+/// `Database.remoteFilesystems` — a test that derives its expectation from the constant it is
+/// checking cannot notice the constant losing a name.
+private let deniedFilesystems = ["HTTPFileSystem", "S3FileSystem",
+                                 "AzureBlobStorageFileSystem", "AzureDfsStorageFileSystem"]
+
+/// 🔴 **`hardened["disabled_filesystems"] == true` proves the SET succeeded, not that it denied
+/// anything.** MEASURED (`docs/…/2026-08-16-duckdb-remote-facts.md` §1): `SET disabled_filesystems`
+/// accepts any string, so the dictionary above reads exactly the same with the list typo'd to
+/// `NotAFileSystem` — and reading it back is no help either, `current_setting` returns `''`.
+///
+/// What is observable is monotonicity: the disabled set only ever grows, so once `harden()` has
+/// run, a SET that drops one name is refused *and names the name*. Dropping them one at a time is
+/// what gives each of the four teeth — with any one name missing from the deny list, that
+/// iteration's SET succeeds instead and this test says which one. Needs no network and no
+/// extension: the set is tracked by name whether or not that filesystem is registered.
+///
+/// The second half is the `allowRemote: true` branch, in the only form that cannot be faked: the
+/// same SETs are *accepted*, because nothing was ever disabled.
+@Test func hardenDisablesEveryNameOnTheDenyListAndAllowRemoteDisablesNone() throws {
+    for dropped in deniedFilesystems {
+        let rest = deniedFilesystems.filter { $0 != dropped }.joined(separator: ",")
+
+        let strict = try Database.inMemory()
+        strict.harden()
+        var message = ""
+        do {
+            try strict.connect().execute("SET disabled_filesystems='\(rest)'")
+        } catch let error as DuckDBError {
+            message = error.message
+        }
+        #expect(message.contains(dropped),
+                "harden() never disabled \(dropped) — \(message.isEmpty ? "re-enabling it was accepted" : message)")
+        #expect(message.contains("cannot be re-enabled"))
+
+        // A fresh Database per posture: the set is Database-wide and monotonic, so the permissive
+        // half has to start from a clean engine or it would be reading the strict half's state.
+        let open = try Database.inMemory()
+        open.harden(allowRemote: true)
+        try open.connect().execute("SET disabled_filesystems='\(rest)'")   // must not throw
+    }
+}
+
+@Test func hardenWithAllowRemoteAppliesTheOtherThreeSettingsAndSkipsOnlyTheDenyList() throws {
+    let db = try Database.inMemory()
+    db.harden(allowRemote: true)
+    #expect(db.hardened == ["autoinstall_known_extensions": true,
+                            "autoload_known_extensions": true,
+                            "allow_community_extensions": true])
+    // Absent, never `false`: `false` is "DuckDB refused the SET", which is a bug report. This is
+    // "Sift chose not to ask" — the same tri-state discipline ExtensionState exists for.
+    #expect(db.hardened["disabled_filesystems"] == nil)
+}
+
 @Test func loadExtensionsRejectsANameThatCarriesSQL() throws {
     // LOAD takes no bound parameters, so the name is interpolated. MEASURED before the
     // guard: this exact call created evil.db, attached it, and recorded the whole string

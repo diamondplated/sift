@@ -63,6 +63,11 @@ private let allow = [
     "EXPLAIN SELECT 1",
 ]
 
+/// Every name `Database.remoteFilesystems` denies, written out independently of it — see
+/// `theGateScratchConnectionIsHardenedLikeEveryOtherOne` for why this is not read from the constant.
+private let deniedFilesystems = ["HTTPFileSystem", "S3FileSystem",
+                                 "AzureBlobStorageFileSystem", "AzureDfsStorageFileSystem"]
+
 @Test(arguments: deny)
 func deniedByTheCombinedGate(sql: String) {
     #expect(throws: SQLRejected.self) {
@@ -140,9 +145,17 @@ func allowedByTheCombinedGate(sql: String) throws {
 /// one of the two names fails. Each half names the *other* name, which pins both entries of
 /// `Database.remoteFilesystems` rather than just the string being non-empty. Needs no network and
 /// no extension — the disabled set is tracked by name whether or not that filesystem is registered.
+///
+/// The list is spelled out below rather than read from `Database.remoteFilesystems`: a test that
+/// derives its expectation from the constant it is checking cannot notice that constant losing a
+/// name, and losing a name is the whole failure mode — `SET disabled_filesystems` never validates,
+/// so a dropped or misspelled entry is a security layer that does nothing and says nothing.
 @Test func theGateScratchConnectionIsHardenedLikeEveryOtherOne() throws {
-    // Narrowing to one name at a time: the error names whichever name is being dropped.
-    for (narrowTo, mustName) in [("HTTPFileSystem", "S3FileSystem"), ("S3FileSystem", "HTTPFileSystem")] {
+    // Dropping ONE name at a time: the error names whichever name is being dropped, so each of the
+    // four is pinned individually. Drop one from the source list and exactly this test goes red,
+    // naming it.
+    for dropped in deniedFilesystems {
+        let narrowTo = deniedFilesystems.filter { $0 != dropped }.joined(separator: ",")
         // "" means the SET succeeded, i.e. nothing was disabled to begin with. nil would mean
         // DuckDB could not start at all, which `#require` reports as its own thing.
         let message = try #require(withGuardScratchConnection { con -> String in
@@ -153,19 +166,21 @@ func allowedByTheCombinedGate(sql: String) throws {
             return duckdb_result_error(&result).map(String.init(cString:)) ?? ""
         })
         #expect(!message.isEmpty,
-                "the gate's scratch connection let \(mustName) be re-enabled — it was never disabled")
-        #expect(message.contains(mustName), "expected \(mustName) to be locked out; got: \(message)")
+                "the gate's scratch connection let \(dropped) be re-enabled — it was never disabled")
+        #expect(message.contains(dropped), "expected \(dropped) to be locked out; got: \(message)")
         #expect(message.contains("cannot be re-enabled"))
     }
 }
 
-/// The control for the test above: the same two SETs succeed on a connection nothing hardened, so
-/// the assertion is reading the hardening rather than a property DuckDB has anyway.
+/// The control for the test above: the same SETs succeed on a connection nothing hardened, so the
+/// assertion is reading the hardening rather than a property DuckDB has anyway.
 @Test func aScratchConnectionNobodyHardenedAcceptsThoseSameSets() throws {
-    // A fresh database per SET: the set is monotonic and Database-wide, so running both on one
+    // A fresh database per SET: the set is monotonic and Database-wide, so running them all on one
     // connection would itself be a narrowing and would fail for the right reason on the wrong
     // connection — which is exactly the confusion this control exists to rule out.
-    for sql in ["SET disabled_filesystems='HTTPFileSystem'", "SET disabled_filesystems='S3FileSystem'"] {
+    for dropped in deniedFilesystems {
+        let sql = "SET disabled_filesystems='"
+            + deniedFilesystems.filter { $0 != dropped }.joined(separator: ",") + "'"
         var db: duckdb_database?
         #expect(duckdb_open(nil, &db) == DuckDBSuccess)
         defer { duckdb_close(&db) }

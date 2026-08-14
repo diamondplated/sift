@@ -77,18 +77,25 @@ Three traps fell out of this:
   returns success. There is no `duckdb_filesystems()` table function, no `PRAGMA show_filesystems`,
   and nothing in `duckdb_functions()` — the registry is not introspectable. The error class above
   is the only way to check a name, and the only way to keep checking it as versions move.
-- **`harden()` currently blocks neither.** Its frozen list is `HTTPFileSystem,S3FileSystem`. With
-  `azure` loaded, `az://` sails past the VFS check and dies on credentials, not permission.
+- **`harden()` blocked neither, at the time of measurement.** Its frozen list was
+  `HTTPFileSystem,S3FileSystem`. With `azure` loaded, `az://` sailed past the VFS check and died on
+  credentials, not permission.
 
 **Consequence.** `harden()`'s list must become
 `'HTTPFileSystem,S3FileSystem,AzureBlobStorageFileSystem,AzureDfsStorageFileSystem'` in the same
 change that makes `azure` a core extension — not in a follow-up. Because the list is unvalidated
-and the registry is not introspectable, the only defence against a rename is
-`remoteFact1_azureRegistersTwoFilesystemsAndHardenBlocksNeither`, which asserts each Permission
-Error by name and asserts that today's `harden()` does *not* cover Azure. Order does not matter:
-setting the name before `LOAD azure` blocks just as well as setting it after.
+and the registry is not introspectable, the only defence against a rename is the pin below, which
+asserts each Permission Error by name. Order does not matter: setting the name before `LOAD azure`
+blocks just as well as setting it after.
 
-**Pinned:** `remoteFact1_azureRegistersTwoFilesystemsAndHardenBlocksNeither`.
+**Taken in P1-T3**, which is why the pin's name and its last block changed: `harden()` now denies
+all four names, so every Azure URL family is refused by permission on a default database, and the
+permissive posture (`harden(allowRemote: true)`) is the control that still reaches the credential
+check. The four names are each dropped one at a time in
+`theGateScratchConnectionIsHardenedLikeEveryOtherOne` and
+`hardenDisablesEveryNameOnTheDenyListAndAllowRemoteDisablesNone`, which need no network.
+
+**Pinned:** `remoteFact1_azureRegistersTwoFilesystemsAndHardenNowBlocksBoth`.
 
 ---
 

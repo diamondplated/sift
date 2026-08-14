@@ -389,6 +389,18 @@ These are behavior, not implementation, and the rewrite must preserve every one:
   simply 404s, which throws too. Any test here must assert on the error *message*.
 
   This applies equally to the current Python engine, which sets the same four options.
+
+  **Amended by the Connections work (P1-T3).** Two things move, and the default posture is not
+  one of them. First, the *content* of `disabled_filesystems` is now four names —
+  `HTTPFileSystem,S3FileSystem,AzureBlobStorageFileSystem,AzureDfsStorageFileSystem` — because
+  `azure` becomes a core extension and, measured, it registers exactly those two names (one per
+  URL family; `AzureStorageFileSystem` is a decoy that blocks nothing). Second, `harden()` gains
+  `allowRemote:`, defaulting to `false`: `true` skips that one SET entirely, and is only ever
+  reached by a user deliberately opening a remote connection. The other three settings apply in
+  both postures, the four settings themselves are still frozen, and every existing call site is
+  unchanged — a local open is exactly as locked down as it was. The setting only ever grows within
+  a `Database` and reads back `''`, so a posture is chosen once, at open, and changing it means a
+  new `Database`, never a toggle.
 - `enable_external_access` stays untouched — setting it false would block `read_csv` itself.
 - `~/.sift` created and enforced at `0700`.
 - Identifiers quoted via `q()`, values always bound as parameters. Never interpolated.

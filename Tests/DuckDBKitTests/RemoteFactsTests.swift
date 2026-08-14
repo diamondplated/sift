@@ -44,10 +44,10 @@ private func failure(_ c: Connection, _ sql: String) -> String {
     do { _ = try c.query(sql).allRows(); return "no error" } catch { return "\(error)" }
 }
 
-// MARK: - 1. Azure registers TWO filesystems, and `harden()` blocks neither
+// MARK: - 1. Azure registers TWO filesystems, and `harden()` now blocks both
 
 @Test(.enabled(if: remoteFacts))
-func remoteFact1_azureRegistersTwoFilesystemsAndHardenBlocksNeither() throws {
+func remoteFact1_azureRegistersTwoFilesystemsAndHardenNowBlocksBoth() throws {
     // `SET disabled_filesystems` accepts any string — an unknown name is silently ignored — so the
     // registered names can only be read off the ERROR CLASS: a name that is registered turns the
     // read into a Permission Error that names it, and a name that is not leaves the read to fail
@@ -70,16 +70,34 @@ func remoteFact1_azureRegistersTwoFilesystemsAndHardenBlocksNeither() throws {
     #expect(try read(disabling: "AzureStorageFileSystem", "az://c/x.parquet")
         .contains("No valid Azure credentials found"))
 
-    // The consequence, pinned: `harden()`'s frozen four disable HTTPFileSystem and S3FileSystem
-    // only, so the moment `azure` is loaded, az:// egress is wide open. Adding azure as a core
-    // extension REQUIRES adding both names above to that list.
+    // The consequence, taken (P1-T3): both names are on `Database.remoteFilesystems`, so a default
+    // `harden()` covers Azure the moment `azure` is loaded — one URL family per name, and the read
+    // dies at the VFS gate instead of running on to credentials. THIS is the assertion the deny
+    // list's Azure half has to be worth: with either name dropped, the matching line below stops
+    // saying Permission Error and says "No valid Azure credentials found" instead.
     let hardened = try Database.inMemory()
     hardened.harden()
     hardened.loadExtensions(["azure"])
     try #require(hardened.loadedExtensions["azure"] == .loaded)
-    let text = failure(try hardened.connect(), "SELECT * FROM read_parquet('az://c/x.parquet')")
-    #expect(!text.contains("Permission Error"), "harden() must not be assumed to cover Azure")
-    #expect(text.contains("No valid Azure credentials found"))
+    let strict = try hardened.connect()
+    for (url, name) in [("az://c/x.parquet", "AzureBlobStorageFileSystem"),
+                        ("azure://c/x.parquet", "AzureBlobStorageFileSystem"),
+                        ("abfss://c@a.dfs.core.windows.net/x.parquet", "AzureDfsStorageFileSystem"),
+                        ("abfs://c@a.dfs.core.windows.net/x.parquet", "AzureDfsStorageFileSystem")] {
+        let text = failure(strict, "SELECT * FROM read_parquet('\(url)')")
+        #expect(text.contains("Permission Error: File system \(name) has been disabled by configuration"),
+                "\(url) escaped harden(): \(text)")
+    }
+
+    // …and the permissive posture is the control, on the same URL: without the deny list the read
+    // reaches the credential check, which is exactly how far this test can see without an account.
+    let open = try Database.inMemory()
+    open.harden(allowRemote: true)
+    open.loadExtensions(["azure"])
+    try #require(open.loadedExtensions["azure"] == .loaded)
+    let permissive = failure(try open.connect(), "SELECT * FROM read_parquet('az://c/x.parquet')")
+    #expect(!permissive.contains("Permission Error"), "\(permissive)")
+    #expect(permissive.contains("No valid Azure credentials found"), "\(permissive)")
 }
 
 // MARK: - 2. `disabled_filesystems` only ever grows, and it is per-Database
