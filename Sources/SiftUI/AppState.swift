@@ -204,10 +204,10 @@ public final class AppState {
 
     /// The one modal the window is showing, or `nil`.
     ///
-    /// Set here, rendered by `RootView`'s sheet presentation. One optional rather than five
-    /// booleans, because two modals up at once is not a state this app has — and five booleans is
+    /// Set here, rendered by `RootView`'s sheet presentation. One optional rather than six
+    /// booleans, because two modals up at once is not a state this app has — and six booleans is
     /// exactly how it would become one.
-    /// `Identifiable` so one `.sheet(item:)` in `RootView` presents all five. The id is the
+    /// `Identifiable` so one `.sheet(item:)` in `RootView` presents all six. The id is the
     /// case, not the payload: presenting `.workbook` for a second file while the first picker
     /// is up should replace it, not stack.
     ///
@@ -228,6 +228,9 @@ public final class AppState {
         case badRows(table: String)
         /// A workbook on its way in, waiting for a sheet to be chosen. See `needsSheetPicker`.
         case workbook(path: String)
+        /// Remote data: the master switch and the saved connections. About the app, not about any
+        /// open table — see `subject`.
+        case connections
         public var id: String {
             switch self {
             case .export: return "export"
@@ -235,19 +238,23 @@ public final class AppState {
             case .staged: return "staged"
             case .badRows: return "badRows"
             case .workbook: return "workbook"
+            case .connections: return "connections"
             }
         }
 
         /// The open table this sheet is about, if it is about one.
         ///
-        /// 🔴 Subject-aware and not blanket. `.staged` is about the store on disk and `.workbook` is
-        /// about a file that is not open yet — neither has a table in the catalog, and a blanket
-        /// "close the sheet when the catalog changes" would dismiss both out from under the user.
-        /// `.merge` is about the whole catalog; see `MergeSheet`'s captured `tables:` list.
+        /// 🔴 Subject-aware and not blanket. `.staged` is about the store on disk, `.workbook` is
+        /// about a file that is not open yet and `.connections` is about the app's own posture —
+        /// none of them has a table in the catalog, and a blanket "close the sheet when the catalog
+        /// changes" would dismiss all three out from under the user. `.connections` in particular
+        /// would be dismissed by a *remote* table dropping, which is the one moment its contents are
+        /// most likely to be what the user needs. `.merge` is about the whole catalog; see
+        /// `MergeSheet`'s captured `tables:` list.
         public var subject: String? {
             switch self {
             case .export(let table), .badRows(let table): return table
-            case .merge, .staged, .workbook: return nil
+            case .merge, .staged, .workbook, .connections: return nil
             }
         }
     }
@@ -313,6 +320,12 @@ public final class AppState {
     }
 
     public func presentStaged() { modalSheet = .staged }
+
+    /// Data > Connections…. No `can*` guard beside it, deliberately: the master switch and the
+    /// saved-connection list are about the app rather than about anything open, so there is no state
+    /// in which this screen has nothing to say — and the one it has most to say in (remote off,
+    /// nothing saved) is exactly the state a guard would refuse to open it in.
+    public func presentConnections() { modalSheet = .connections }
 
     /// The staging banner's Cancel. `Session.cancel` returns `false` for a cancel that cannot
     /// land — the job already finished, or its copy is already being published — and its own

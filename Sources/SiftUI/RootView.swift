@@ -71,7 +71,7 @@ public struct RootView: View {
         // The whole window is the drop target. It publishes `\.sourceDragHot`, which is how the
         // sidebar's dropzone and the empty state below both learn that a drag is over it.
         .sourceDrop(state: state)
-        // The five sheets, presented from one place. Every route that raises one — the File menu,
+        // The six sheets, presented from one place. Every route that raises one — the File menu,
         // the toolbar, the clickable dropped-rows chip, a dropped workbook, the sidebar's context
         // menu — sets `AppState.modalSheet` and stops; until this modifier existed they all set a
         // value nothing read, so five finished features were unreachable.
@@ -108,6 +108,11 @@ public struct RootView: View {
                 SheetPickerSheet(path: path) { picked in
                     Task { for name in picked { await state.open(path: path, sheet: name) } }
                 }
+            case .connections:
+                // `state.engine.extensions` and not `session.engineInfo()`: that snapshot was taken
+                // once, on the MainActor, while `AppState` was built. See `extensionsAtLaunch`.
+                ConnectionsSheet(
+                    session: state.session, extensionsAtLaunch: state.engine.extensions)
             }
         }
     }
