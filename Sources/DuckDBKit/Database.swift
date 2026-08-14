@@ -20,12 +20,28 @@ public enum ExtensionState: Sendable, Equatable {
 /// which is why this is `@unchecked Sendable` while `Connection` is not.
 public final class Database: @unchecked Sendable {
     private var handle: duckdb_database?
-    // loadedExtensions and hardened are written only during configure-time (harden/
-    // loadExtensions) and read afterwards, making the unsynchronized dictionaries safe on
+    // loadedExtensions, hardened and networkInstalls are written only during configure-time
+    // (harden/loadExtensions) and read afterwards, making the unsynchronized collections safe on
     // @unchecked Sendable.
     public private(set) var loadedExtensions: [String: ExtensionState] = [:]
     /// Per-setting outcome of the last `harden()`, keyed by setting name.
     public private(set) var hardened: [String: Bool] = [:]
+    /// Every name this `Database` issued an `INSTALL` for, in order — **the decision, not the
+    /// delivery**.
+    ///
+    /// 🔴 It exists because `.loaded` has two provenances and nothing could tell them apart: a
+    /// binary already sitting in `~/.duckdb/extensions` from an earlier run, or a download this
+    /// process just made. Both this Mac and the macos-15 runner keep that cache warm, so every
+    /// assertion about "the extension is present" passes identically whether or not Sift went to
+    /// `extensions.duckdb.org` — which is how a strict session's `INSTALL` survived a whole phase
+    /// and three written claims that it could not happen. This array is empty on a machine that
+    /// installed nothing and non-empty on one that did, on a warm cache and a cold one alike, so a
+    /// test can assert what the process DID.
+    ///
+    /// `INSTALL` is the only outbound network call anything in this package makes. Appended before
+    /// the statement runs, so a failed download is recorded too: the request left the machine
+    /// either way, and that is what is being measured.
+    public private(set) var networkInstalls: [String] = []
 
     /// The filesystems `harden()` denies, as `disabled_filesystems` wants them: a bare
     /// comma-separated list, no quoting.
@@ -80,6 +96,30 @@ public final class Database: @unchecked Sendable {
         return Connection(handle: con)
     }
 
+    /// The `SET`s that make a connection safe to be handed SQL, as `(name, value)` ready to
+    /// interpolate. `harden()` issues them; so does the SELECT-only gate's raw scratch connection
+    /// (`SiftEngine.withGuardScratchConnection`), which cannot use `harden()` because
+    /// `duckdb_extract_statements` needs a raw `duckdb_connection`.
+    ///
+    /// 🔴 **Public and shared for `remoteFilesystems`' reason, and this list drifted exactly the way
+    /// that one was built to prevent.** The gate applied `disabled_filesystems` and none of the
+    /// other three, so its scratch connection kept DuckDB's default `autoinstall_known_extensions`
+    /// — and `disabled_filesystems` gates the VFS, **not** the extension installer. MEASURED:
+    /// `assertSelectOnly("SELECT * FROM read_csv('https://example.com/a.csv')")` on a machine
+    /// without `httpfs` downloaded it from `extensions.duckdb.org` in 0.81 s, from a strict session,
+    /// out of SQL a user typed. Two lists could not both be right; there is one now.
+    public static func hardeningSettings(allowRemote: Bool = false) -> [(name: String, value: String)] {
+        var settings = [
+            (name: "autoinstall_known_extensions", value: "false"),
+            (name: "autoload_known_extensions", value: "false"),
+            (name: "allow_community_extensions", value: "false"),
+        ]
+        if !allowRemote {
+            settings.insert((name: "disabled_filesystems", value: "'\(remoteFilesystems)'"), at: 0)
+        }
+        return settings
+    }
+
     /// Settings applied before any query runs. Blocking the network filesystems is
     /// the part that matters: a SELECT can still read any local file the user could
     /// `cat`, but it cannot ship results anywhere.
@@ -107,14 +147,7 @@ public final class Database: @unchecked Sendable {
     /// issued and DuckDB refused it, which is a bug report; absent means Sift deliberately never
     /// asked.
     public func harden(allowRemote: Bool = false) {
-        var settings = [
-            ("autoinstall_known_extensions", "false"),
-            ("autoload_known_extensions", "false"),
-            ("allow_community_extensions", "false"),
-        ]
-        if !allowRemote {
-            settings.insert(("disabled_filesystems", "'\(Self.remoteFilesystems)'"), at: 0)
-        }
+        let settings = Self.hardeningSettings(allowRemote: allowRemote)
         guard let con = try? connect() else {
             for (name, _) in settings { hardened[name] = false }
             return
@@ -144,6 +177,7 @@ public final class Database: @unchecked Sendable {
                 continue
             }
             do {
+                networkInstalls.append(name)
                 try con.execute("INSTALL \(name)")
                 try con.execute("LOAD \(name)")
                 loadedExtensions[name] = .loaded
@@ -160,7 +194,12 @@ public final class Database: @unchecked Sendable {
 
     /// `^[a-z_][a-z0-9_]*$` — every DuckDB extension name, and nothing that can carry a
     /// statement separator, a quote or whitespace.
-    static func isExtensionName(_ s: String) -> Bool {
+    ///
+    /// Public for `Database.remoteFilesystems`' reason: `loadExtensions` is no longer the only place
+    /// in the product that interpolates an extension name into SQL — `SiftEngine`'s
+    /// `extensionIsInstalled` probe does too — and one validator is the only way the two cannot
+    /// drift.
+    public static func isExtensionName(_ s: String) -> Bool {
         func lower(_ u: Unicode.Scalar) -> Bool { ("a"..."z").contains(u) || u == "_" }
         guard let first = s.unicodeScalars.first, lower(first) else { return false }
         return s.unicodeScalars.allSatisfy { lower($0) || ("0"..."9").contains($0) }

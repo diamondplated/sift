@@ -41,7 +41,20 @@ import SiftCore
 /// `duckdb_open`/`duckdb_connect` with every default in place, including `autoload_known_extensions`
 /// and an unrestricted VFS. "It only parses" was never a reason to leave the network on: binding a
 /// table function is what resolves a URL, and this file's whole job is to hand DuckDB SQL a user
-/// typed. `Database.remoteFilesystems` is the same list `harden()` denies, so the two cannot drift.
+/// typed.
+///
+/// 🔴 **And the first repair of that only did half of it.** It applied `disabled_filesystems` and
+/// stopped, leaving `autoinstall_known_extensions` at DuckDB's default `true` — and
+/// `disabled_filesystems` gates the VFS, **not** the extension installer, which is the same trap
+/// `addConnection` fell into one layer up. MEASURED against the vendored 1.5.5 with `httpfs` moved
+/// out of `~/.duckdb/extensions`:
+///
+///     assertSelectOnly("SELECT * FROM read_csv('https://example.com/a.csv')")
+///     -> httpfs.duckdb_extension downloaded from extensions.duckdb.org, 0.81 s
+///
+/// on a session that had never been allowed to reach the network, out of a string the user typed
+/// into the SQL box. So the whole set goes on now, from `Database.hardeningSettings()` — the one
+/// list `harden()` reads too, so a name added to the posture cannot miss this connection again.
 ///
 /// Raw C handles rather than `DuckDBKit.Connection`, for the reason the file header already gives:
 /// `duckdb_extract_statements` needs a `duckdb_connection`, and that handle is internal to
@@ -59,12 +72,15 @@ func withGuardScratchConnection<T>(_ body: (duckdb_connection) throws -> T) reth
     }
 
     // MEASURED: `current_setting('disabled_filesystems')` reads back `''` even on the connection
-    // that set it, so nothing can confirm this landed by asking. What confirms it is what it
+    // that set it, so nothing can confirm THAT one landed by asking. What confirms it is what it
     // forbids — the disabled set only ever grows, so a narrowing SET fails once this has run, and
-    // that is what `theGateScratchConnectionIsHardenedLikeEveryOtherOne` asserts. The result is
+    // that is what `theGateScratchConnectionIsHardenedLikeEveryOtherOne` asserts. The other three
+    // DO read back (`theGateScratchConnectionAlsoDisablesTheExtensionInstaller`). Every result is
     // discarded for the same reason `harden()` is non-fatal: the gate is a message improver, and a
     // hardening setting must not be what stops a query being classified.
-    _ = duckdb_query(con, "SET disabled_filesystems='\(Database.remoteFilesystems)'", nil)
+    for (name, value) in Database.hardeningSettings() {
+        _ = duckdb_query(con, "SET \(name)=\(value)", nil)
+    }
 
     return try body(con)
 }

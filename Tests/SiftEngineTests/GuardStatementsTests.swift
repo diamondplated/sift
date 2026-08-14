@@ -172,6 +172,39 @@ func allowedByTheCombinedGate(sql: String) throws {
     }
 }
 
+/// 🔴 **`disabled_filesystems` was only half the repair, and the other half is the one that costs
+/// packets.** The deny list gates DuckDB's VFS, not its extension installer, so the gate's scratch
+/// connection kept DuckDB's default `autoinstall_known_extensions = true`. MEASURED, with `httpfs`
+/// moved out of `~/.duckdb/extensions/v1.5.5/osx_arm64/`:
+///
+///     assertSelectOnly("SELECT * FROM read_csv('https://example.com/a.csv')")
+///     -> httpfs.duckdb_extension downloaded from extensions.duckdb.org, 0.81 s
+///
+/// on a strict session, out of a string a user typed into the SQL box. `duckdb_prepare_extracted_
+/// statement` is a binder call, and binding a table function over an `https://` path is what makes
+/// DuckDB go and get the extension that can read it.
+///
+/// Unlike `disabled_filesystems`, these three DO read back — so this is a direct assertion on what
+/// the process configured, not on what happens to be on disk afterwards. Delete any of the three
+/// SETs from `Database.hardeningSettings()` and this test names it.
+@Test(arguments: ["autoinstall_known_extensions", "autoload_known_extensions",
+                  "allow_community_extensions"])
+func theGateScratchConnectionAlsoDisablesTheExtensionInstaller(setting: String) throws {
+    let value = try #require(withGuardScratchConnection { con -> String in
+        var result = duckdb_result()
+        defer { duckdb_destroy_result(&result) }
+        guard duckdb_query(con, "SELECT current_setting('\(setting)')::VARCHAR", &result)
+            == DuckDBSuccess
+        else { return "<query failed>" }
+        return duckdb_value_varchar(&result, 0, 0).map { s in
+            defer { duckdb_free(s) }
+            return String(cString: s)
+        } ?? "<no value>"
+    })
+    #expect(value == "false",
+            "the gate has \(setting)=\(value), so binding user SQL over an https:// path fetches an extension from the network")
+}
+
 /// The control for the test above: the same SETs succeed on a connection nothing hardened, so the
 /// assertion is reading the hardening rather than a property DuckDB has anyway.
 @Test func aScratchConnectionNobodyHardenedAcceptsThoseSameSets() throws {
