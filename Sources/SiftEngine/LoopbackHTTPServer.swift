@@ -44,7 +44,8 @@ public final class LoopbackHTTPServer: @unchecked Sendable {
         case reject
     }
 
-    private typealias Hit = (method: String, path: String, range: String?, status: Int)
+    private typealias Hit =
+        (method: String, path: String, range: String?, status: Int, bytesSent: Int)
 
     private struct Resource {
         let body: Data
@@ -69,9 +70,24 @@ public final class LoopbackHTTPServer: @unchecked Sendable {
     public var baseURL: String { "http://127.0.0.1:\(port)" }
 
     /// Every request received, in order: method, path, the `Range` header if the client sent one,
-    /// and the status answered. Safe to read while the server is serving.
-    public var requestLog: [(method: String, path: String, range: String?, status: Int)] {
+    /// the status answered, and the body bytes actually written. Safe to read while the server is
+    /// serving.
+    ///
+    /// `bytesSent` is the measurement `range` cannot stand in for. A 206's span is recoverable
+    /// from the request header, but a path registered `.ignore` answers 200 with the whole object
+    /// to a client that asked for ten bytes — and "was it ranged" and "how much crossed the wire"
+    /// are then different questions with different answers. It is 0 for a HEAD and for every
+    /// bodyless status (404, 405, 416).
+    public var requestLog:
+        [(method: String, path: String, range: String?, status: Int, bytesSent: Int)] {
         lock.withLock { hits }
+    }
+
+    /// Forget every request logged so far. For a test that acts more than once — open, then stage,
+    /// then refresh — and wants each act's requests on their own rather than index arithmetic over
+    /// one growing array.
+    public func clearLog() {
+        lock.withLock { hits = [] }
     }
 
     public init() throws {
@@ -233,14 +249,17 @@ public final class LoopbackHTTPServer: @unchecked Sendable {
             .map { String($0.dropFirst("range:".count)).trimmingCharacters(in: .whitespaces) }
 
         /// `Content-Length` is always the length of what a GET would return, so a HEAD passes the
-        /// full body here and the body is dropped on the way out.
+        /// full body here and the body is dropped on the way out. `bytesSent` is read off the
+        /// bytes that are about to be written rather than computed alongside them, so the log
+        /// cannot drift from the wire.
         func reply(_ status: Int, _ reason: String, _ headers: [String: String], _ body: Data) -> Data {
-            lock.withLock { hits.append((method, path, range, status)) }
+            let sent = method == "HEAD" ? Data() : body
+            lock.withLock { hits.append((method, path, range, status, sent.count)) }
             var text = "HTTP/1.1 \(status) \(reason)\r\nContent-Length: \(body.count)\r\n"
             for (name, value) in headers.sorted(by: { $0.key < $1.key }) {
                 text += "\(name): \(value)\r\n"
             }
-            return Data((text + "\r\n").utf8) + (method == "HEAD" ? Data() : body)
+            return Data((text + "\r\n").utf8) + sent
         }
 
         // The method is a property of the request line alone, so it is decided before the path is.

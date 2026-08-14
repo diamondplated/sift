@@ -222,6 +222,45 @@ private func fetch(
     #expect(log.map(\.path) == ["/data.bin", "/data.bin", "/data.bin", "/other.bin"])
     #expect(log.map(\.range) == [nil, nil, "bytes=0-9", nil])
     #expect(log.map(\.status) == [200, 200, 206, 404])
+    #expect(log.map(\.bytesSent) == [0, 100, 10, 0])
+}
+
+@Test func theLogRecordsTheBytesActuallyWrittenNotTheBytesAskedFor() async throws {
+    let server = try LoopbackHTTPServer()
+    defer { server.stop() }
+    server.register(path: "/honest.bin", body: counting)
+    server.register(path: "/ignores.bin", body: counting, rangeMode: .ignore)
+    server.register(path: "/refuses.bin", body: counting, rangeMode: .reject)
+
+    try await fetch("\(server.baseURL)/honest.bin", method: "HEAD")   // no body, whatever it reports
+    try await fetch("\(server.baseURL)/honest.bin")                   // the whole object
+    try await fetch("\(server.baseURL)/honest.bin", range: "bytes=10-19")   // the span, not the file
+    // The case `range` alone cannot answer: the client asked for ten bytes and got a hundred,
+    // and only `bytesSent` says so. This is what "downloaded once and fully" is asserted from.
+    try await fetch("\(server.baseURL)/ignores.bin", range: "bytes=10-19")
+    try await fetch("\(server.baseURL)/refuses.bin", range: "bytes=10-19")  // 416, nothing written
+    try await fetch("\(server.baseURL)/missing.bin")                        // 404, nothing written
+
+    #expect(server.requestLog.map(\.status) == [200, 200, 206, 200, 416, 404])
+    #expect(server.requestLog.map(\.bytesSent) == [0, 100, 10, 100, 0, 0])
+}
+
+@Test func clearLogForgetsWhatCameBefore() async throws {
+    let server = try LoopbackHTTPServer()
+    defer { server.stop() }
+    server.register(path: "/data.bin", body: counting)
+
+    try await fetch("\(server.baseURL)/data.bin")
+    #expect(server.requestLog.count == 1)
+    server.clearLog()
+    #expect(server.requestLog.isEmpty)
+
+    // …and the server keeps serving and keeps logging afterwards.
+    try await fetch("\(server.baseURL)/data.bin", range: "bytes=0-9")
+    #expect(server.requestLog.map(\.range) == ["bytes=0-9"])
+    server.clearLog()
+    server.clearLog()   // idempotent
+    #expect(server.requestLog.isEmpty)
 }
 
 @Test func theRequestLogIsSafeToReadWhileTheServerIsServing() async throws {
@@ -389,21 +428,14 @@ func remoteFactParquetReadThroughTheOracleIsRangedNotWholeObject() throws {
     #expect(try connection.query("SELECT count(*) FROM read_parquet('\(server.baseURL)/big.parquet')")
         .allRows()[0][0] == .int(500_000))
 
-    // The verdict, read off the log: every GET was a 206 for a named byte range, and the bytes
-    // asked for are a rounding error against the file — a `count(*)` answered from the footer
-    // alone. A whole-object download would be one GET of `bytes=0-<size-1>`.
+    // The verdict, read off the log: every GET was a 206 for a named byte range, and what actually
+    // crossed the wire is a rounding error against the file — a `count(*)` answered from the
+    // footer alone. A whole-object download would be one GET of `bytes=0-<size-1>` moving all of
+    // it, and `bytesSent` is what tells the two apart even when the server ignores the header.
     let gets = server.requestLog.filter { $0.method == "GET" }
     #expect(!gets.isEmpty, "\(server.requestLog)")
-    #expect(gets.allSatisfy { $0.status == 206 }, "\(server.requestLog)")
-    let requested = gets.reduce(0) { $0 + span($1.range) }
-    #expect(requested < bytes.count / 20,
-            "footer only: \(requested) of \(bytes.count) B — \(server.requestLog)")
-}
-
-/// Bytes covered by a logged `bytes=start-end` header.
-private func span(_ range: String?) -> Int {
-    guard let range, range.hasPrefix("bytes=") else { return 0 }
-    let parts = range.dropFirst("bytes=".count).split(separator: "-", omittingEmptySubsequences: false)
-    guard parts.count == 2, let start = Int(parts[0]), let end = Int(parts[1]) else { return 0 }
-    return end - start + 1
+    #expect(gets.allSatisfy { $0.status == 206 && $0.range != nil }, "\(server.requestLog)")
+    let transferred = gets.reduce(0) { $0 + $1.bytesSent }
+    #expect(transferred < bytes.count / 20,
+            "footer only: \(transferred) of \(bytes.count) B — \(server.requestLog)")
 }

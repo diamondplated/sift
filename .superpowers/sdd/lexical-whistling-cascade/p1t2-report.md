@@ -140,3 +140,37 @@ cost.
 6. **The concurrency test is honest about its limits.** `theRequestLogIsSafeToReadWhileTheServerIsServing`
    runs 24 requests against several hundred log reads; without a sanitizer, an unlocked `hits`
    fails often rather than always. The exact final count is the part that holds every run.
+
+---
+
+## Follow-up (p1t2b) — concerns 1 and 2, closed
+
+Both while the only call sites in existence are this file's own.
+
+**`requestLog` gains `bytesSent: Int`** — `(method, path, range, status, bytesSent)`. It is read
+off the bytes about to be written (`let sent = method == "HEAD" ? Data() : body`), not computed
+alongside them, so the log cannot drift from the wire: 0 for a HEAD and for every bodyless status
+(404, 405, 416), the span for a 206, the full length for a 200 — including the `.ignore` 200 where
+the client asked for ten bytes and got a hundred, which is the case `range` alone can never answer.
+
+The gated DuckDB test now sums `bytesSent` directly instead of re-deriving spans from the logged
+`Range` headers, which deleted the `span()` helper. That is the assertion the stage-on-open task
+wants: "downloaded once *and fully*" is `bytesSent == body.count`, not a header shape.
+
+**`clearLog()`** — one line under the same lock, for a test that acts more than once and wants each
+act's requests on their own.
+
+Tests **760 → 762**: `theLogRecordsTheBytesActuallyWrittenNotTheBytesAskedFor` (HEAD 0 / 200 full /
+206 span / `.ignore` 200 full / 416 0 / 404 0) and `clearLogForgetsWhatCameBefore`.
+`theRequestLogRecordsEveryRequestInOrder` gained a `bytesSent` row.
+
+Mutation, 3 more, all red:
+
+| Mutation | Test that went red |
+|---|---|
+| log the full object length on a 206 | `theLogRecordsTheBytesActuallyWrittenNotTheBytesAskedFor` |
+| log a HEAD as if it had sent the body | `theRequestLogRecordsEveryRequestInOrder` |
+| `clearLog()` does nothing | `clearLogForgetsWhatCameBefore` |
+
+Warning-free from a wiped `.build`; `SIFT_REMOTE_FACTS=1 --filter remoteFact` still 14 green;
+`--verify` still 20/20. Concerns 3–6 above stand as written.
