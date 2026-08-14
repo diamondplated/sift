@@ -590,6 +590,39 @@ bundle.
 
 ---
 
+## 11. DuckDB caches remote objects itself, and it is on by default
+
+Measured during Task 8, not during the spike — found by debugging a test that expected one GET on a
+reopen and saw **zero**. Two `read_blob`s of one URL on one `Database`, against the loopback oracle:
+
+| | pass 1 | pass 2 |
+|---|---|---|
+| `ETag` sent, `enable_external_file_cache=true` (the default) | 1 GET | **0 GETs** |
+| `ETag` sent, cache off | 1 GET | 1 GET |
+| no `ETag`, cache default | 1 GET | 1 GET |
+
+`enable_external_file_cache` defaults to `true` (GLOBAL) and `validate_external_file_cache` to
+`VALIDATE_ALL`: a repeat remote read inside one `Database` is revalidated with a HEAD and then served
+out of the buffer manager when the server's `ETag` still matches. With no `ETag` there is nothing to
+validate against and the object is refetched in full.
+
+**Consequences, all three load-bearing:**
+
+1. **"One download per open" is an upper bound, not an exact count.** A reopen of an ETagged URL
+   inside one session legitimately costs zero GETs. A reopen assertion is therefore `<= 1`; `== 1`
+   would pin DuckDB's cache-hit rate rather than Sift's design. The **cold-session** assertion stays
+   exact, and that is where the mutation bar bites — restoring the read-the-URL-not-the-cache bug
+   still shows 3 GETs and 300 % of the object across the wire.
+2. **It is not a substitute for Sift's own cache.** DuckDB's lives in the buffer manager and dies
+   with the `Database`. Sift's is a file on disk that survives relaunch and is what the local
+   pipeline sniffs, stages, counts and bad-row-scans against.
+3. **A server that sends no `ETag` gets no benefit from either cache** — and those are the same
+   servers that force the fetched-per-open staging token, so a Sift copy of such an object is never
+   adopted across opens either. The two mechanisms degrade together, which is the honest behaviour
+   but means the worst case is a full refetch every time.
+
+---
+
 ## Requires the manual checklist (an Azure account, not guessable)
 
 Honest list of what this spike could not measure. None of it is guessed above.
