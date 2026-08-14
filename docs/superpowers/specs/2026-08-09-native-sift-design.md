@@ -408,6 +408,61 @@ These are behavior, not implementation, and the rewrite must preserve every one:
 - The atomic view→table swap under a per-table lock, with retry.
 - Staged-data age-out and budget.
 
+### Amendment — Phase 1's remote-data work (P1-T13, closing the phase)
+
+Everything above still holds; this section is what Phase 1 ADDED to it, recorded here rather than
+rewritten over the original because the app was built against the original and a reader needs to
+see which sentence is which. The amendment inside the `disabled_filesystems` bullet (P1-T3) is the
+first half of it; these are the four contracts that arrived with the rest of the feature. All four
+are covered by tests and by `sift --verify`, whose remote checks read their verdict from
+`LoopbackHTTPServer` and reach nothing off the machine.
+
+**1. The posture switch, and what it cannot do.** Remote is `false` on a fresh install: no
+`connections.json` means the strict default, and nothing loads `httpfs` or `azure`. Saving the
+first connection sets `allowRemote: true` in the file. It does **not** open the running engine —
+MEASURED (remote facts §2), `disabled_filesystems` only ever grows inside a `duckdb_database`,
+narrowing/clearing/`RESET` all fail, and `current_setting` reads back `''` so the engine cannot even
+be asked what it denies. The posture is therefore read from the file **before** the `Database` opens
+and frozen there. Every operation that changes it returns `ConnectionOutcome` — `.active` or
+`.activeAfterRelaunch` — because a comment cannot be checked and cannot reach a banner. Turning it
+off drops every issued credential immediately, which is worth having and is **not** the revoke; the
+return value says which happened. There is no live switch and there cannot be one.
+
+**2. Secret issuance is engine-side, bound, and temporary.** MEASURED (§6a) every *value* position
+in `CREATE SECRET` binds — connection string, secret key, bearer token, scope, even `TYPE` and
+`PROVIDER` — so the package invariant "nothing in Sift interpolates a user value into SQL text"
+survives contact with credentials. Only the secret's *name* is a parser-level identifier, and Sift
+generates it (`sift_conn_<n>`) rather than taking it from user text. Secrets are Database-scoped
+(§6b) so one connection issues them for the whole engine, and `TEMPORARY` (§6c) so nothing reaches
+disk; `CREATE PERSISTENT SECRET` stays unused and the Keychain is the only store that survives a
+restart. `CREATE SECRET` is unreachable from the SQL box. Redaction is start-up-only and left at
+its default, so a running engine cannot be talked into printing a credential — but note `§6c`'s
+corollary: `account_name` and `key_id` come back from `duckdb_secrets()` in the clear, so anything
+that surfaces that table leaks identity if not the key.
+
+**3. The download cache is user data, and is governed like staged data.** A remote text source is
+downloaded once into `<SIFT_HOME>/remote-cache/` and everything after that — sniff, exact count,
+bad-row scan, staging — reads the local file. The directory is `0700` and every object in it is
+`0600`, for the reason `~/.sift` is `0700`: this is a copy of someone's real data sitting on a
+laptop. It ages out on `stageMaxAgeDays()` — the same number the staged store uses, read from the
+same one place — and a copy nothing points at is collected at the next launch. `stagedTotalBytes()`
+counts it, so the one screen that answers "what is this tool holding on to" is not short by the
+amount that matters. The filename is `fnv1a(sanitized url) + suffix`: hashed so an object key
+containing `/` or `..` cannot traverse out of the directory, stable across launches so a copy can
+be found again, and keyed on the *sanitized* URL so two signed fetches of one blob share one entry.
+
+**4. A SAS token is memory-only, for the length of one open.** A `?sv=…&sig=…` query is a bearer
+credential. `RemoteURL.sanitized` — the URL with query and fragment removed — is the only form that
+may be displayed or persisted; `wireURL(_:)` is the single choke point that re-attaches the
+signature for one call and stores it nowhere. It must not reach `spec.target`, `spec.key.path`, the
+SQL DuckDB stores for a created VIEW, either persisted column of `_sift_sources`, a cache filename,
+`connections.json`, any snippet dialect, or any error message (DuckDB puts the URL it was handed
+into its own error text, which is what `redactQuery` exists for). The consequence is that a
+SAS-signed parquet is **downloaded** rather than read in place, losing the range reads that are the
+whole point of remote parquet — and that is the ruling rather than a refusal, because refusing
+would mean the shape most people are handed a private blob in simply does not open. The cost is
+stated in a note on the open, not swallowed.
+
 **Data truth**
 - `NULL` vs `''` vs `'N/A'` stay three distinct things; `allow_quoted_nulls=false`.
 - `ignore_errors=true` paired with independent `TRY_CAST` bad-row accounting — dropped rows are

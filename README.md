@@ -41,8 +41,10 @@ imported — a 20 GB CSV opens as fast as a 2 MB one, and never has to fit in me
 - ⚡ **Instant at any size.** Opening is a view over the file, not a read of it. A 6-million-row
   parquet opens with its exact count in under a second — the count comes free from the footer.
 - 🔍 **Answers, not rows.** Schema, per-column profile, and top values with counts and share.
-- 🔒 **Nothing leaves your machine.** No server, no cloud, no credentials, no telemetry, no
-  network egress. One process, one binary; there is no port because there is nothing listening.
+- 🔒 **Local until you say otherwise.** No telemetry, no analytics, no update check, and no port —
+  there is nothing listening. Remote sources are **off by default**: saving a connection is what
+  turns them on, it is revocable, and credentials go to the Keychain. [What that trades
+  away](SECURITY.md#known-and-accepted) is written down rather than glossed.
 - 🧠 **Honest about your data.** `NULL`, `''`, and `'N/A'` stay three different things. Rows the
   parser dropped get counted and shown, not silently discarded. A file whose column structure
   collapsed says so in a sentence, with a one-click way to recover it.
@@ -63,7 +65,7 @@ checkout deleted. There is also a CLI:
 
 ```bash
 swift run sift ~/Desktop/orders.csv    # schema + first rows at your terminal
-swift run sift --verify                # the engine proving itself: 20 checks, every format
+swift run sift --verify                # the engine proving itself: 26 checks, every format
 ```
 
 **Requirements:** macOS 14+. No Xcode needed — everything builds with SwiftPM and the Command Line
@@ -82,6 +84,7 @@ Tools. No Python, no Node, no third-party Swift dependencies. None.
 | **Delta table** | read through the transaction log, so tombstoned rows stay deleted |
 | **JSON / NDJSON** | `read_json_auto` handles both |
 | **`.xlsx` / `.xlsm`** | sheet picker with per-sheet dimensions. `.xls` is refused with a "re-save" message |
+| **A URL** | `https://`, `s3://`, `az://`, `abfss://` — once you have turned remote sources on |
 
 ---
 
@@ -106,6 +109,12 @@ round them. `10.50` stays `10.50`.
 **A SQL box that cannot write.** Run any `SELECT` against what's open. The enforcement isn't a
 keyword blocklist (see [below](#things-that-are-the-way-they-are-for-a-reason)).
 
+**Remote sources, off until you ask.** Paste an `https://` URL, or save an Azure or S3 connection
+in **Data → Connections…** — the credential goes to the Keychain, never to a config file. A remote
+parquet is read *in place* with ranged requests; a remote CSV, JSON or workbook is downloaded once
+and everything after that reads the local copy. Both are listed under **Staged** with the rest, and
+both age out on the same clock.
+
 **Merge, export, and staged-data management** — including one screen that answers "what is this
 tool holding on to", with sizes, last-used times, and a purge button.
 
@@ -125,14 +134,14 @@ sift/
     SiftUI/             every view and view model
     SiftApp/            @main, menus, LaunchServices — nothing with a decision in it
     sift/               the CLI
-  Tests/                ~730 tests; the spec
+  Tests/                910 tests; the spec
 ```
 
 `SiftCore` is pure on purpose — importable with no connection and no state, which is why most of
 the suite runs in milliseconds:
 
 ```bash
-swift test          # ~730 tests, ~30 s, fully parallel
+swift test          # 910 tests, ~30 s, fully parallel
 ```
 
 ---
@@ -172,11 +181,30 @@ stale copy is collected, never served. One screen answers "what is this tool hol
 
 The enforcement is not a keyword blocklist — it is that user SQL is wrapped as
 `SELECT * FROM (\n …\n) AS _q`, and `DROP`/`COPY`/`ATTACH`/`PRAGMA`/`SET` cannot occupy a subquery
-position, so they die in DuckDB's parser. Network filesystems are disabled, so a `SELECT` cannot
-exfiltrate.
+position, so they die in DuckDB's parser.
 
 A `SELECT` *can* still read any local file you could `cat` — accepted, because Sift never owns the
-only copy of anything: sources are read-only and staged tables are rebuildable.
+only copy of anything: sources are read-only and staged tables are rebuildable. With remote sources
+turned on it can also reach a URL, which means a crafted `SELECT` could send the one to the other.
+That is the stated cost of the feature and it is why the feature is off until you ask for it;
+[SECURITY.md](SECURITY.md) spells the trade out.
+</details>
+
+<details>
+<summary><strong>Remote parquet is read in place; remote text is downloaded once</strong></summary><br>
+
+Measured against DuckDB 1.5.5, not assumed. A `count(*)` over a 28.6 MB remote parquet moves 64 KB
+— the footer, ranged — and a filtered scan 0.7 %, so reading it where it lies is strictly better
+than downloading it. A remote CSV is the opposite: `sniff_csv` fetches 100 % of the object whatever
+`sample_size` says, and a bare `read_csv` fetches it *twice*, so a five-row preview costs two copies
+of the file and every statement after it costs another. So text formats are downloaded once, to
+`~/.sift/remote-cache/` (0700, files 0600), and the ordinary local pipeline sniffs, counts,
+bad-row-scans and stages that copy.
+
+One exception, and it is a credential rule rather than a performance one: a URL carrying a SAS
+signature is downloaded even when it is parquet. An in-place read would write the signature into
+the view SQL DuckDB stores on disk and into the staging catalog, and a bearer token belongs in
+neither. Sift says so in a note rather than silently costing you the range reads.
 </details>
 
 <details>
@@ -210,9 +238,9 @@ before bumping the pin.
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `SIFT_HOME` | `~/.sift` | staged data (created 0700) |
+| `SIFT_HOME` | `~/.sift` | staged data, downloaded copies, `connections.json` (created 0700) |
 | `SIFT_STAGE_BUDGET_GB` | `20` | staged-data ceiling |
-| `SIFT_STAGE_MAX_AGE_DAYS` | `14` | age-out for staged tables |
+| `SIFT_STAGE_MAX_AGE_DAYS` | `14` | age-out for staged tables **and** downloaded copies |
 
 ---
 
@@ -220,7 +248,11 @@ before bumping the pin.
 
 Sift is a file explorer, not a warehouse client:
 
-- It reads local files only. There is no connector for a live database, by design.
+- It reads files, local or at a URL. There is no connector for a live database, by design — no
+  Postgres, no Snowflake, no query pushdown to anything but DuckDB.
+- Remote is one object at a time: no wildcards in a URL (DuckDB refuses them at plan time) and no
+  Delta table over `http(s)://` (its reader never reaches the server, and falling back to a parquet
+  glob would resurrect deleted rows — so Sift refuses instead of guessing).
 - It never writes to your source files. Sources are opened read-only; export refuses to overwrite.
 - Compressed CSV gives no row estimate until it is read — compressed bytes say nothing about rows.
 - `.xls` (the pre-2007 format) is refused rather than half-supported; re-save as `.xlsx`.

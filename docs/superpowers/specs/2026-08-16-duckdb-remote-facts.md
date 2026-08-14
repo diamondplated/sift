@@ -14,9 +14,15 @@ in the default suite would put the network on the critical path of `swift test`.
 ways: `swift test` runs **729** tests before this change and **729** after it (742 declared, 13
 skipped); `SIFT_REMOTE_FACTS=1 swift test --filter remoteFact` runs the 13 in 1.3 s.
 
-**The test oracle.** Probes that need a server use a ~120-line HTTP/1.1 origin server on
-`127.0.0.1` with `Range`/206 support, a request log, and a switch for how it treats `Range`
-(honor / ignore / reject). It lives at the bottom of `RemoteFactsTests.swift`.
+Two sections were added after the spike and say so where they start: **§11** (DuckDB's own
+external file cache, found while debugging a Task 8 test) and **§12** (what a remote open costs in
+the shipped code, per format, measured at Task 13).
+
+**The test oracle.** Probes that need a server use an HTTP/1.1 origin server on `127.0.0.1` with
+`Range`/206 support, a request log, and a switch for how it treats `Range` (honor / ignore /
+reject). It has since moved to `Sources/SiftEngine/LoopbackHTTPServer.swift`, because `sift
+--verify` needs it too — it binds the loopback address on an ephemeral port, is started only by a
+test or by `--verify`, and must never grow a wildcard bind.
 
 > **Detour worth recording.** The plan called for `NWListener`. On this Mac **every** `NWListener`
 > configuration — `on: .any`, an explicit port, with and without `requiredLocalEndpoint`,
@@ -629,6 +635,59 @@ exactly one possible cause. This is the same failure the phase's timeout saga wa
 value with two possible provenances is not evidence.
 
 ---
+
+## 12. What a remote open actually costs — the shipped path, per format
+
+Facts 5, 7 and 11 are about DuckDB statements. This is about **Sift**: `Session.openPath` on a URL,
+through the shipped code, with the background pipeline settled. Measured 2026-08-14 at P1-T13
+against the loopback oracle, reading the request log the same way every other measurement here does.
+Object sizes are what the fixtures came out at, and the percentages are bytes-on-the-wire over
+object size.
+
+`enable_external_file_cache` is DuckDB's own, is **on by default**, and changes the answer — so
+every row is given both ways. "Reopen" is a `closeTable` and a fresh `openPath` of the same URL on
+the **same `Session`**; a relaunch is always the cold column.
+
+| Shape | Fixture | Open (+ exact count + bad-row scan) | First page of 50 | Reopen, cache off | Reopen, cache on |
+|---|---|---|---|---|---|
+| **parquet, in place** | 26.4 MB / 2 M rows | 4 HEAD + 4 ranged GET, **131 072 B (0.50 %)** — 1 GET / 32 768 B (0.12 %) with the cache on | 1 HEAD + 4 ranged GET, 1 727 879 B (6.5 %) — one row group | 0.50 % | 4 HEAD + **0 GET, 0 B** |
+| **text, downloaded** | 6.58 MB CSV / 400 k rows | 3 HEAD + 1 GET, **6 577 791 B (100.00 %)** — the object exactly once | **0 requests** | 100 % | 3 HEAD + **0 GET, 0 B** |
+| **SAS'd parquet** | 4.32 MB | 3 HEAD + 1 GET, **100.00 %** — downloaded, not ranged | **0 requests** | 100 % | 0 B |
+| **xlsx** | 275 KB workbook | 3 HEAD + 1 GET, **100.00 %** | **0 requests** | 100 % | 0 B |
+
+Reading the table:
+
+- **HEADs are free and there are several.** `bytesSent` is 0 for every one. They are httpfs sizing
+  the object before each statement, plus exactly one `URLSession` HEAD of Sift's own for identity
+  (`remoteIdentity`, the `ETag`/`Last-Modified`/`Content-Length` the staging token is built from).
+  They are worth counting only because a server that is slow to answer a HEAD is slow four times.
+- **A download is one GET wearing a `Range` header.** Fact 5: `read_blob` spans the whole object in
+  a single 206. There is no chunking, no resume and no progress, which is why
+  `remoteDownloadCapBytes` is a refusal threshold rather than a warning.
+- 🔴 **"Two full reads" for a remote text source is the PRE-TASK-8 number and it is no longer
+  true.** Fact 7 measured `read_csv(url)` at 200 % because it sniffs and then scans the URL. The
+  shipped path downloads once and hands the local file to `buildSource`, so the sniff, the exact
+  count, the bad-row `TRY_CAST` pass and the staging decision all read the copy — one object across
+  the wire for all of it, and the first page and the profile after it cost **nothing**. Anyone
+  citing 200 % for the bad-row scan is quoting a design that was replaced.
+- 🔴 **"One download per open" is a CEILING, not a count.** Fact 11 is why: with an `ETag` and the
+  external file cache at its default, a reopen inside one `Session` costs zero GETs for every shape
+  in the table. A reopen assertion is therefore `<= 1`; `== 1` pins DuckDB's cache-hit rate rather
+  than Sift's design. The cold-session number stays exact, and that is where mutation testing bites.
+- **And a request-count assertion needs that cache OFF to mean anything** — including a `== 1`, not
+  only a `== 0`. FOUND THE HARD WAY at T13: a deliberate second `downloadRemoteObject` call cost
+  **zero** extra GETs and left `--verify` and the shipped
+  `remoteFactOpen_aServedCsvOpensFromOneDownloadAndCountsFromTheCache` green. Both now
+  `SET GLOBAL enable_external_file_cache=false` first, and both kill that mutant. A correct-looking
+  count with two possible provenances is not evidence.
+- **Where the split pays off.** Parquet in place opens for 0.5 % of the object and pages a row group
+  at a time; the same file downloaded would cost 100 % before the first row appeared. Text is the
+  mirror image: in place it would cost 100 % to sniff and another 100 % per scan, forever. The one
+  place the rule is broken on purpose is a SAS-signed parquet, which pays the download to keep the
+  signature off disk (spec §11 amendment 4) — and that is the whole reason the open carries a note.
+- **A server with no `ETag` gets no benefit from either cache**, and those are the same servers whose
+  sources get the `fetched=` staging token, so a Sift copy of one is never adopted across opens
+  either. The two mechanisms degrade together: the worst case is a full refetch every time.
 
 ## Requires the manual checklist (an Azure account, not guessable)
 

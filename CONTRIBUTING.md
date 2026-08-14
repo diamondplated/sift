@@ -7,13 +7,24 @@ maintenance cost" rather than "is this a nice idea".
 
 ```bash
 ./scripts/fetch-duckdb.sh    # once, needs network — the pinned prebuilt libduckdb
-swift build && swift test    # ~730 tests, ~30 s
+swift build && swift test    # 910 declared (37 gated off), ~30 s
 ./build-app.sh               # -> ./Sift.app
 ```
 
 That is the whole setup. No Python, no Node, no Xcode — SwiftPM and the Command Line Tools.
 The `delta` and `excel` DuckDB extensions install themselves from DuckDB's own repository on
-first use (one-time, needs network).
+first use (one-time, needs network), and so do `httpfs` and `azure` the first time someone
+saves a remote connection.
+
+37 of those tests carry the `remoteFact` prefix and are gated behind `SIFT_REMOTE_FACTS=1` — the
+ones allowed to `INSTALL` an extension, so the default run stays offline; CI runs them as a separate
+step. If
+you touch anything under `Remote`, `Connections`, `Keychain` or the remote half of `Session`,
+run them and say so in the PR:
+
+```bash
+SIFT_REMOTE_FACTS=1 swift test --filter remoteFact
+```
 
 ## The one rule: tests are the spec
 
@@ -35,8 +46,13 @@ Two disciplines this suite runs on:
 ```bash
 swift build 2>&1 | grep -c warning:   # must be 0 — warning-free is the bar, not a nicety
 swift test                            # must be green
-swift run sift --verify               # the engine end to end: 20 checks
+swift run sift --verify               # the engine end to end: 26 checks
 ```
+
+`--verify` reaches nothing off your machine — its five remote checks run against a loopback
+HTTP server it starts and stops itself. Four of them skip, with a sentence, on a machine where
+`httpfs` is not already installed; they never install it, because a command you ran to check
+your own install has no business making an outbound request.
 
 Then actually run it end to end. A green unit run is not evidence the app works — several of the
 subtle bugs in this codebase's history were only visible with a real multi-million-row file open.
@@ -59,7 +75,14 @@ short version:
   the three states apart on screen.
 - **Bad-row accounting via `TRY_CAST`** against an all-varchar read, and exact counts from that
   same relation — never a bare `count(*)` on the typed view.
-- **`~/.sift` at `0700`**, the staged-data fingerprints, the age-out and the budget.
+- **`~/.sift` at `0700`**, the staged-data fingerprints, the age-out and the budget — and the
+  same rules on `remote-cache/`, whose downloaded objects are `0600` and age out on the same
+  clock. They are copies of someone's real data, not a cache of derived bytes.
+- **The posture switch, and the honesty about what it cannot do.** `disabled_filesystems` only
+  ever grows inside a live DuckDB database, so turning remote on or off changes the file and not
+  this session's engine. `ConnectionOutcome` is a return value rather than a comment for exactly
+  that reason. Do not "fix" it with a `SET`; it cannot work, and the failure mode is a user told
+  remote is off while every read still succeeds.
 - **One `Session` per home.** Two on one home are two databases silently overwriting each other;
   the refusal is load-bearing.
 - **No `NumberFormatter`/`DateFormatter`/`ISO8601DateFormatter`** anywhere a user can see. Four
@@ -84,6 +107,10 @@ inferred and what the engine thinks of the file, with no window in the way.
 
 ## Security
 
-Sift reads local files, runs no server, and disables network filesystems. If you find something
-that breaks one of those properties, please report it privately via GitHub's security advisory
-form rather than opening a public issue.
+`SECURITY.md` is the full statement and it is worth reading before you touch the remote path.
+The short version: remote data is **off** until a user saves a connection, credentials live in
+the Keychain and never in `connections.json` or `stage.duckdb`, a SAS query string is
+memory-only for one open, and the only listener in the program is the loopback test oracle.
+
+If you find something that breaks one of those, please report it privately via GitHub's security
+advisory form rather than opening a public issue.
