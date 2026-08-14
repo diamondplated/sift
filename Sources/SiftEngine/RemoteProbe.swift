@@ -97,6 +97,24 @@ public struct RemoteIdentity: Sendable, Equatable {
 /// The cache policy is not decoration: a HEAD answered from `URLSession`'s own cache is an identity
 /// for whatever the object USED to be, which is the one thing this function must never return.
 public func remoteIdentity(_ url: RemoteURL, timeout: TimeInterval = 5) async -> RemoteIdentity? {
+    await remoteIdentityOutcome(url, timeout: timeout).identity
+}
+
+/// The same probe, and additionally **which side of the deadline answered**.
+///
+/// 🔴 The seam exists because the wall clock could not carry the contract. MEASURED across three CI
+/// rounds: resuming a continuation enqueues the awaiting task back onto the cooperative pool, and on
+/// a 2-core runner under this suite's load that delivery waits ~30 s for a free thread. So an
+/// elapsed-time assertion measures pool availability between the DECISION and its DELIVERY, not the
+/// deadline — which is why it read 31 s, then 32.4 s, then 35.0 s while the mechanism underneath it
+/// was, in the end, correct. `outcome` is the decision itself, taken inside the once-guard at the
+/// moment it happens, and it is the same on a jammed 2-core runner as on an idle 8-core Mac.
+///
+/// Internal, and the public signature above is unchanged: callers want the identity, and one of them
+/// wanting to know who won would be a caller with something to prove.
+func remoteIdentityOutcome(
+    _ url: RemoteURL, timeout: TimeInterval = 5
+) async -> (identity: RemoteIdentity?, outcome: DeadlineOutcome) {
     // The scheme test is a CLARITY guard, not a correctness one, and it has a SURVIVING MUTANT
     // recorded rather than hidden: deleting it leaves `remoteIdentityIsNilForEveryUrlUrlSession…`
     // green, because `URLSession` refuses `az://`/`s3://` itself with `NSURLErrorUnsupportedURL`
@@ -105,7 +123,7 @@ public func remoteIdentity(_ url: RemoteURL, timeout: TimeInterval = 5) async ->
     // limitation — if URLSession ever learned a scheme, the request must still not be sent.
     guard url.scheme == .http || url.scheme == .https,
         let target = URL(string: wireURL(url))
-    else { return nil }
+    else { return (nil, .workWon) }
 
     // Both knobs, on a session of our own — `URLSession.shared`'s configuration is fixed, so
     // `timeoutIntervalForResource` cannot be set on it at all. They are belt; `withDeadline` below
@@ -126,7 +144,7 @@ public func remoteIdentity(_ url: RemoteURL, timeout: TimeInterval = 5) async ->
         return head
     }()
 
-    return await withDeadline(timeout) {
+    let raced = await withDeadline(timeout) { () async -> RemoteIdentity? in
         guard let (_, response) = try? await session.data(for: request),
             let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode)
         else { return nil }
@@ -144,6 +162,7 @@ public func remoteIdentity(_ url: RemoteURL, timeout: TimeInterval = 5) async ->
             acceptsRanges: ranges == "bytes"
         )
     }
+    return (raced.value, raced.outcome)
 }
 
 /// Run `work`, giving up and answering `nil` after `timeout` — **Sift's clock, not the host's.**
@@ -181,22 +200,38 @@ public func remoteIdentity(_ url: RemoteURL, timeout: TimeInterval = 5) async ->
 /// Mac over-subscribes for blocked threads and time-slices spinning ones, so it cannot be starved
 /// the way a 2-core runner is. CI is the oracle for the wiring; this function's own behaviour is
 /// pinned locally and without a clock.
+/// Which racer reached the guard first. **The contract, and the only part of it that can be
+/// asserted on a machine whose pool is jammed** — see `remoteIdentityOutcome`.
+enum DeadlineOutcome: Sendable, Equatable {
+    /// The work answered inside its budget. Its answer may still be `nil` (a 404, a transport
+    /// error) — "who won" and "what came back" are different questions, and conflating them is what
+    /// made the timeout regression invisible for three CI rounds.
+    case workWon
+    /// The budget ran out first. The work was cancelled and whatever it says later is dropped.
+    case deadlineWon
+}
+
 func withDeadline<T: Sendable>(
     _ timeout: TimeInterval, _ work: @Sendable @escaping () async -> T?
-) async -> T? {
-    await withCheckedContinuation { (continuation: CheckedContinuation<T?, Never>) in
+) async -> (value: T?, outcome: DeadlineOutcome) {
+    await withCheckedContinuation { (continuation: CheckedContinuation<(T?, DeadlineOutcome), Never>) in
         let gate = OnceGate(continuation)
         let finished = DispatchSemaphore(value: 0)
         let job = Task {
             let value = await work()
-            _ = gate.finish(value)
+            _ = gate.finish((value, .workWon))
             finished.signal()   // the timer thread stops waiting the moment the work is in
         }
         Thread.detachNewThread {
-            if finished.wait(timeout: .now() + max(0, timeout)) == .timedOut, gate.finish(nil) {
+            if finished.wait(timeout: .now() + max(0, timeout)) == .timedOut,
+                gate.finish((nil, .deadlineWon)) {
                 job.cancel()
             }
         }
+        // The cancelled loser still finishes and still calls `finish`; the guard drops it. The
+        // outcome rides IN the resumed value rather than in a second field somebody has to write,
+        // so recording it cannot add a second resume path — there is still exactly one `resume`,
+        // inside `OnceGate`.
     }
 }
 

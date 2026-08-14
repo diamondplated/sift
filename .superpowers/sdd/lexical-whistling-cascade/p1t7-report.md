@@ -374,3 +374,86 @@ not be a test about the deadline.
 4. **One OS thread per probe, for at most the budget.** `remoteIdentity` is called once per remote
    open, so this is cheap — but a caller that probed hundreds of URLs in a loop would want a shared
    timer, and there is no such caller today.
+
+---
+
+# Follow-up 3 (p1t7d) — assert the decision, not the delivery
+
+Base `5ffd2d9`. CI round 3: still red at **35.0 s**, and the diagnosis finally closed. The `Thread`
+timer fires on wall clock exactly as built; **resuming a continuation enqueues the awaiting task back
+onto the cooperative pool**, and on a 2-core runner under this suite's load that *delivery* waits
+~30 s for a free thread. The elapsed-time assertion was never measuring the deadline. It was
+measuring pool availability between the decision and its delivery — which is why it read 31 s, then
+32.4 s, then 35.0 s while the mechanism underneath went from wrong to right.
+
+**Status: done.** Warning-free from a wiped `.build`. **846 tests**, three consecutive full runs
+green. `SIFT_REMOTE_FACTS=1 swift test --filter remoteFact` → 24/24. `swift run sift --verify` →
+20 passed, 1 skipped.
+
+## The seam
+
+```swift
+enum DeadlineOutcome: Sendable, Equatable { case workWon, deadlineWon }
+
+func withDeadline<T: Sendable>(_ timeout: TimeInterval, _ work: …)
+    async -> (value: T?, outcome: DeadlineOutcome)
+
+func remoteIdentityOutcome(_ url: RemoteURL, timeout: TimeInterval = 5)
+    async -> (identity: RemoteIdentity?, outcome: DeadlineOutcome)
+
+public func remoteIdentity(_ url: RemoteURL, timeout: TimeInterval = 5) async -> RemoteIdentity? {
+    await remoteIdentityOutcome(url, timeout: timeout).identity
+}
+```
+
+**The public signature is unchanged** and the public function is now a one-line wrapper. Callers want
+the identity; a caller that wanted to know who won would be a caller with something to prove.
+
+**The outcome rides IN the resumed value**, not in a second field somebody has to write, so recording
+it cannot add a second resume path — there is still exactly one `resume`, inside `OnceGate`, decided
+under its lock. The cancelled loser still finishes and still calls `finish`; the guard drops it, and
+`M2` below is the test that says so.
+
+`identity == nil` cannot carry the contract on its own: a transport error answers `nil` too. That is
+precisely how "the host's timeout took over" hid inside a plausible-looking value for three rounds —
+the same class of failure this whole product exists to expose in other people's data.
+
+## The tests now
+
+- **`aServerThatNeverAnswersTimesOutIntoNilRatherThanHanging`** asserts `outcome == .deadlineWon`.
+  The decision is taken inside the once-guard at the instant it happens, so it reads the same on a
+  jammed 2-core runner as on an idle 8-core Mac. Pool-independent by construction.
+- The wall clock is demoted to `< 90` — a tripwire for a genuine hang, nothing more, with a comment
+  saying why it is loose: delivery rides the pool, and the pool is the suite's business.
+- **`theDeadlineIsSiftsOwnClockAndNotTheHostOperatingSystems`** keeps its clock-free zero-budget
+  check and gains the other direction: work that finishes inside its budget must be recorded
+  `.workWon`.
+
+## Mutations — and the one that had survived three rounds is dead
+
+| Mutation | Result |
+|---|---|
+| the timer thread deleted | 🔴 zero-budget test, **30.1 s** |
+| the outcome always reports `.deadlineWon` | 🔴 zero-budget test, **0.001 s** — the guard reports the truth, not a constant |
+| **`remoteIdentity` stops using the deadline (knobs only)** | 🔴 **1.008 s** — `outcome → .workWon` where `.deadlineWon` was required |
+| the `Thread` swapped back to a `Task.sleep` | 🟢 locally (0.001 s). On CI the sleeper loses to the 30 s response and the same assertion goes red with `.workWon` — killable at last, by the machine that matters |
+
+The third row is the one worth reading twice. That mutant was locally unkillable for three rounds and
+sent me building six saturation harnesses to try to catch it (p1t7c). It dies in one second to an
+assertion about *who answered*, because the knob and the deadline produce identical `nil`s at
+identical times and completely different winners. **The saturation harness was the wrong instrument
+for the right question** — and asking the question directly needed less code than any attempt to
+measure it.
+
+## Concerns
+
+1. **`M4` is still CI-only**, and now for a good reason rather than an unmeasurable one: the
+   `Task.sleep` variant loses the race only where the pool is genuinely starved. The assertion that
+   catches it is in place and correct; the runner is simply the only machine that can trip it.
+2. **`remoteIdentityOutcome` is an internal seam with one production caller** — the public wrapper.
+   That is the established `…ForTest` shape without the name, and it is the smallest thing that makes
+   the wiring assertable; the alternative was a global mutable flag, which a parallel suite cannot
+   have.
+3. **Three rounds of red CI came from one mistake**, worth stating plainly for whoever writes the
+   next timing test here: an elapsed time measures everything between the decision and the
+   observation, and in this suite that is dominated by the thread pool. Assert the decision.

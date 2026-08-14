@@ -163,23 +163,29 @@ func aServerThatNeverAnswersTimesOutIntoNilRatherThanHanging() async throws {
 
     let timeout: TimeInterval = 1
     let started = Date()
-    let identity = await remoteIdentity(try remote("\(rude.baseURL)/a.csv"), timeout: timeout)
+    let (identity, outcome) = await remoteIdentityOutcome(
+        try remote("\(rude.baseURL)/a.csv"), timeout: timeout)
     let elapsed = Date().timeIntervalSince(started)
+
     #expect(identity == nil)
-    // 🔴 The number this bound has to separate is 31 from 1. It was a flat 10 s, it passed here, and
-    // on the macos-15 runner the same probe took **31 s** — the OS default — because
-    // `URLRequest.timeoutInterval` did not bound the request there at all.
+    // 🔴 **THE assertion, and the wall clock is not it.** Three CI rounds failed here on elapsed
+    // time — 31 s, 32.4 s, 35.0 s — while the mechanism underneath went from "no deadline at all"
+    // to "a deadline on the starved pool" to "a deadline on its own thread", i.e. from wrong to
+    // right, with the number barely moving. MEASURED: resuming a continuation enqueues the awaiting
+    // task back onto the cooperative pool, and on a 2-core runner under this suite's load that
+    // DELIVERY waits ~30 s for a free thread. The elapsed time was measuring pool availability
+    // between the decision and its delivery.
     //
-    // Why 20 and not `timeout + 2`: MEASURED, this suite runs ~850 tests in parallel and much of
-    // that blocks a cooperative-pool thread inside a synchronous DuckDB call — the same starvation
-    // `StageJob` uses a real `Thread` to escape. Under it, a 1 s deadline has been seen firing at
-    // 9.3 s and a bare top-level `Task.sleep(1)` at 6.3 s. A tight bound measures the pool, not the
-    // deadline. Three self-calibrating yardsticks were tried and thrown away for that reason; what
-    // makes them unnecessary is that the DEADLINE ITSELF has a wall-clock-free test below, so this
-    // one only has to catch "the host's timeout took over" — 20 clears the jitter twice over and
-    // sits well under the 31 s it exists to fail on.
-    #expect(elapsed < 20,
-            "the identity probe took \(elapsed)s against a \(timeout)s deadline")
+    // `outcome` is the decision, taken inside the once-guard at the instant it happens, so it reads
+    // the same on a jammed 2-core runner as on an idle 8-core Mac. `identity == nil` alone cannot
+    // carry it: a transport error answers `nil` too, which is exactly how "the host's timeout took
+    // over" hid in a green-looking value for three rounds.
+    #expect(outcome == .deadlineWon,
+            "the HEAD was bounded by \(outcome) rather than by Sift's \(timeout)s deadline")
+    // Loose on purpose: a tripwire for a genuine hang, nothing more. Delivery rides the cooperative
+    // pool and the pool is the suite's business, not this function's — the contract is asserted
+    // above.
+    #expect(elapsed < 90, "the identity probe hung for \(elapsed)s")
 }
 
 @Test
@@ -196,18 +202,21 @@ func theDeadlineIsSiftsOwnClockAndNotTheHostOperatingSystems() async throws {
     // "did it come back fast" is not — MEASURED, this suite's cooperative pool is starved enough by
     // blocking DuckDB calls that a 1 s deadline has been seen firing at 9.3 s. It goes red the
     // instant the race is deleted, in 0.001 s rather than thirty seconds.
-    let answer: String? = await withDeadline(0) {
+    let (answer, outcome) = await withDeadline(0) { () async -> String? in
         try? await Task.sleep(nanoseconds: 30_000_000_000)
         return "the slow answer nobody waited for"
     }
     #expect(answer == nil, "the deadline never fired — work outlived a zero budget")
+    #expect(outcome == .deadlineWon)
 
     // …and it is a deadline, not a delay: work that finishes answers immediately and with its own
     // result, so a fast HEAD is never held back to the timeout. A flat ceiling is right here — the
     // failure being guarded is "the full 30 s budget is always waited out", which is far outside
     // even this suite's scheduling jitter.
     let quick = Date()
-    #expect(await withDeadline(30) { "here" } == "here")
+    let fast = await withDeadline(30) { () async -> String? in "here" }
+    #expect(fast.value == "here")
+    #expect(fast.outcome == .workWon, "a result that arrived inside its budget was recorded as late")
     #expect(Date().timeIntervalSince(quick) < 20, "a finished result waited for the deadline")
 }
 
