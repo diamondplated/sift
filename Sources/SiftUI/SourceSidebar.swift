@@ -100,26 +100,148 @@ public func stageableFormat(_ fmt: Fmt) -> Bool {
     }
 }
 
-/// The row's tooltip: where the file is, what it is, and what was thrown away reading it.
-/// `SourceCell.configure`'s `toolTip`.
+/// The row's tooltip: where the file is, what it is, when it was fetched, and what was thrown away
+/// reading it.  `SourceCell.configure`'s `toolTip`.
+///
+/// 🔴 `spec.key.path` is the **sanitized** URL for a remote source (`RemoteRef.url` by contract, and
+/// `RemoteURL.sanitized`'s own doc: "the ONLY form that may be displayed or persisted"). Never
+/// `spec.target` — that is the cache file for a downloaded object, which is not where the user's
+/// data lives — and never `wireURL`, which re-attaches the SAS token for DuckDB alone. A signature
+/// on screen is a signature in the next screenshot in the next bug report.
 public func sourceTooltip(_ t: SiftEngine.Table) -> String {
     var text = "\(t.spec.key.path)\n\(sourceSubtitle(t))"
+    if let fetched = remoteFetchedAt(t) { text += "\nFetched from the network \(fetched)" }
     if t.badRows > 0 { text += "\n\(groupDigits(String(t.badRows))) rows dropped" }
     return text
 }
 
-/// The path the box should open by itself, or `nil`. Ports the paste handler at
+// MARK: - remote sources
+//
+// `spec.remote` is non-nil for exactly the sources that came from a URL, which is why nothing below
+// re-derives remoteness from a string. `AppState.needsSheetPicker` and `SourceProbe.isCompressedPath`
+// are the two shipped sites that DID ask `NSString.pathExtension` about a URL — see
+// `RemoteURL.effectiveExt`, the field that exists because of them.
+
+/// When a remote source's bytes were fetched, as `2026-08-14 14:32`, or `nil` for a local one.
+///
+/// 🔴 `stagedTimestamp`, not a second clock and not a formatter. `RemoteRef.fetchedAtNs` is UNIX
+/// **epoch** nanoseconds — `fetchClockNs()` is `Date().timeIntervalSince1970 * 1e9`, chosen over
+/// `uptimeNanoseconds` precisely because the value is compared on a later launch — so it is a wall
+/// time and the staged sheet's own hand-rolled renderer is the right one for it. No `DateFormatter`
+/// family anywhere near this; see `stagedTimestamp`'s note for the four locale bugs that ban them.
+public func remoteFetchedAt(_ t: SiftEngine.Table) -> String? {
+    guard let remote = t.spec.remote else { return nil }
+    return stagedTimestamp(Date(timeIntervalSince1970: Double(remote.fetchedAtNs) / 1_000_000_000))
+}
+
+/// Does this row offer ⟳? A source opened from a URL, and nothing else — `Session.refreshRemote`
+/// refuses a local table with a sentence saying Sift already reads it from disk on every query, and
+/// offering a button whose only outcome is that sentence is not an affordance.
+public func offersRefresh(_ t: SiftEngine.Table) -> Bool { t.spec.remote != nil }
+
+/// Does this row offer the other sheets of its workbook?
+///
+/// 🔴 **`spec.fmt` and `spec.sheets`, never `needsSheetPicker(spec.key.path)`.** That function is
+/// `NSString.pathExtension`, which on `https://h/f.xlsx?sv=…&sig=…` answers with the tail of the SAS
+/// signature and on `https://h/get?id=5&fmt=xlsx` answers `xlsx` for a thing that is not one. The
+/// spec was built by reading the actual bytes, so it already knows both facts truthfully — and it
+/// knows them identically for a local workbook and a remote one, which is why this is one rule
+/// rather than two.
+///
+/// `> 1` because a one-sheet workbook has no choice to offer. The PRE-open picker deliberately keeps
+/// its unconditional behaviour (see `SheetPickerSheet`'s header): that is a parity contract, and this
+/// is a different question — "what else is in the file I already have open".
+public func offersSheetChoice(_ t: SiftEngine.Table) -> Bool {
+    t.spec.fmt == .xlsx && t.spec.sheets.count > 1
+}
+
+/// The banner after a refresh that worked. The engine's `RefreshOutcome` case, rendered — never
+/// re-derived from a side effect.
+///
+/// 🔴 The two cases are indistinguishable from outside: a refetch that returned identical bytes and
+/// an object that never changed leave the same grid, the same row count and the same everything.
+/// That is the whole reason `refreshRemote` returns a value at all rather than leaving the caller to
+/// guess, and a UI that guessed would put a confident wrong sentence on screen half the time.
+///
+/// `since` arrives already rendered (`"14:32"`, 24-hour, the user's own time zone, built from
+/// `Calendar` components by `clockHHMM`) because this codebase permits no formatter to render a
+/// `Date`. It is passed through, not reformatted.
+public func refreshOutcomeText(table: String, _ outcome: RefreshOutcome) -> String {
+    switch outcome {
+    case .unchanged(let since): return "\(table): unchanged since \(since)."
+    case .refetched: return "\(table): re-fetched from the source."
+    }
+}
+
+/// The one cause a failed refresh cannot be told apart from, stated as the conditional it is.
+///
+/// 🔴 **A SAS-signed source cannot be refreshed, and that is T8's no-persisted-credential ruling
+/// holding rather than a defect.** `RemoteRef.url` is sanitized by contract, so `refreshRemote`
+/// re-derives a URL with no query, the HEAD comes back 403, and the retry fails with DuckDB's own
+/// HTTP line. That line is a status code: true, clean, and useless to act on.
+///
+/// It is appended to *every* refusal rather than to the signed ones because **there is no honest
+/// marker to test.** `RemoteRef` deliberately carries no `hadQuery` flag (T10 declined to add one:
+/// a SAS'd parquet gets `sasParquetNote` and a SAS'd CSV gets nothing, and half a signal is worse
+/// than none), and inventing one here would mean guessing. A conditional sentence naming the one
+/// fix beats a bare 403 on the failure it most often explains; the alternative the brief allows —
+/// not offering Refresh at all — would remove it from every unsigned remote source too.
+public let refreshSignedURLNote =
+    "If you opened this from a signed URL — one with a ?sv=…&sig=… SAS token — Sift never saved the "
+    + "signature, so a refresh reaches the server as an anonymous request. Paste the whole URL into "
+    + "the box again to re-open it."
+
+/// The engine's own sentence first, then the one thing it cannot know. Never a `try?`, never a
+/// paraphrase of the engine's half.
+public func refreshFailureText(table: String, error: String) -> String {
+    "\(error) \(refreshSignedURLNote)"
+}
+
+/// SF Symbols the sidebar draws that are not a format chip.
+///
+/// 🔴 Named here for the same reason `ToolbarSymbol` exists: `Image(systemName:)` handed a name
+/// macOS does not know draws **nothing** and reports nothing — a hit-testable, enabled, invisible
+/// button. `theSidebarsSymbolsAllResolve` asks the running system, which matters more than usual
+/// here because this Mac carries a newer SDK than the macos-15 runner and the macOS 14 floor is
+/// lower than both.
+enum SidebarSymbol {
+    /// This table came over the network.
+    static let remote = "network"
+    static let refresh = "arrow.clockwise"
+    static let sheets = "tablecells"
+    /// The way into the Connections screen.
+    static let connections = "externaldrive.connected.to.line.below"
+
+    static let all = [remote, refresh, sheets, connections]
+}
+
+/// The path **or URL** the box should open by itself, or `nil`. Ports the paste handler at
 /// web/index.html:1796-1799 — a pasted absolute path with no newline in it opens immediately,
 /// because the whole point of ⌥⌘C in Finder is not having to press anything else.
 ///
 /// A *paste* is "more than one character arrived at once". The web had a `paste` event to key off;
 /// SwiftUI's `TextField` has no such hook, and growth is the honest substitute — typing can never
 /// add two characters in one change, so hand-typing `/Users/...` cannot fire this on its first
-/// keystroke the way a bare `hasPrefix("/")` test would.
+/// keystroke the way a bare `hasPrefix("/")` test would. That rule is unchanged by the URL half:
+/// `https://` is eight keystrokes, and none of them may open anything.
+///
+/// 🔴 **`SiftCore.classifyRemote` is the authority on what a remote URL is, and a second opinion
+/// here would be a bug rather than a duplication.** It already knows every scheme spelling DuckDB's
+/// own azure secret scopes to (`az`/`azure`/`abfss`/`abfs`, plus `s3`/`http`/`https`), and its `nil`
+/// means **local path** — so a scheme this function decided about on its own and got wrong would not
+/// be "unsupported", it would be a URL handed silently to the local-file flow to come back as a
+/// missing file. Copying a blob URL and pasting it into Sift is the gesture this whole phase was
+/// designed around; it must not be decided by `hasPrefix("http")`.
+///
+/// The **whole** pasted string is returned, query included. The SAS token has to reach DuckDB, and
+/// `Session.openPath` → `classifyRemote` → `wireURL` is the single choke point that keeps it in
+/// memory: the box clears itself, `RemoteRef.url` stores the sanitized form, and nothing on the way
+/// renders what was pasted.
 public func autoOpenPath(from old: String, to new: String) -> String? {
     guard new.count > old.count + 1 else { return nil }
     let path = new.trimmingCharacters(in: .whitespacesAndNewlines)
-    guard path.hasPrefix("/"), !path.contains("\n") else { return nil }
+    guard !path.contains("\n") else { return nil }
+    guard path.hasPrefix("/") || classifyRemote(path) != nil else { return nil }
     return path
 }
 
@@ -195,18 +317,42 @@ public struct SourceSidebar: View {
         }
     }
 
-    /// The engine, named in the window. See `engineFooterText`.
+    /// The engine, named in the window, and the way into Connections. See `engineFooterText`.
     private var engineLine: some View {
-        Text(engineFooterText(state.engine))
-            .font(.system(size: 10, design: .monospaced))
-            .foregroundStyle(.tertiary)
-            // Selectable, because the whole point of it being on screen is that it can be pasted
-            // into a bug report without anyone hunting through the About box for it.
-            .textSelection(.enabled)
-            .help("The DuckDB build Sift is reading your files with")
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .padding(.horizontal, 12)
-            .padding(.bottom, 8)
+        HStack(spacing: 8) {
+            Text(engineFooterText(state.engine))
+                .font(.system(size: 10, design: .monospaced))
+                .foregroundStyle(.tertiary)
+                // Selectable, because the whole point of it being on screen is that it can be pasted
+                // into a bug report without anyone hunting through the About box for it.
+                .textSelection(.enabled)
+                .help("The DuckDB build Sift is reading your files with")
+            Spacer(minLength: 4)
+            connectionsButton
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(.horizontal, 12)
+        .padding(.bottom, 8)
+    }
+
+    /// 🔴 **In the window, not only in the menu bar.** Phase 0's survey found Merge, Export and
+    /// Staged Data had all been buried in menus when the web build had them on screen, and this is
+    /// the same mistake one step further along: a user who has never opened a remote source has no
+    /// reason to go looking in a menu for a screen they do not know exists — and the engine's own
+    /// refusals ("switch remote sources on in Data → Connections…, then relaunch Sift") name a place
+    /// that, until this button and its menu item, did not exist anywhere in the product.
+    ///
+    /// It decides nothing: one `presentConnections()`, whose guard question is answered in
+    /// `AppState` (there isn't one, deliberately — the state this screen has most to say in is the
+    /// one a guard would refuse to open it in).
+    private var connectionsButton: some View {
+        Button { state.presentConnections() } label: {
+            Label("Connections…", systemImage: SidebarSymbol.connections)
+                .font(.system(size: 10))
+        }
+        .buttonStyle(.plain)
+        .foregroundStyle(.secondary)
+        .help("Remote data: the master switch, and the connections Sift has saved")
     }
 
     /// `web/index.html:342` — the dashed target, and the one place a drag anywhere in the window
@@ -242,7 +388,11 @@ public struct SourceSidebar: View {
     /// picker by the one route that decides that, and not by a second copy of the rule.
     private var pathBox: some View {
         HStack(spacing: 6) {
-            TextField("…or paste a path (⌥⌘C in Finder)", text: $pathText)
+            // The placeholder is the only place the URL route is advertised at all — the dropzone
+            // above it can only ever mean a file, and `ConnectionsSheet.sasNote` already tells the
+            // user to "paste the whole URL when you open it" about a box that, until now, would not
+            // take one.
+            TextField("…or paste a path or URL (⌥⌘C in Finder)", text: $pathText)
                 .textFieldStyle(.roundedBorder)
                 .font(.system(size: 11))
                 .onSubmit(submit)
@@ -312,19 +462,33 @@ struct SourceRow: View {
                     .font(.system(size: 13, weight: .semibold))
                     .lineLimit(1)
                     .truncationMode(.middle)
-                // Orange the moment a row was thrown away reading this file. The count itself is in
-                // the tooltip and the bad-rows sheet; this is the part you see without asking.
-                Text(sourceSubtitle(table))
-                    .font(.system(size: 11))
-                    .foregroundStyle(table.badRows > 0 ? AnyShapeStyle(.orange) : AnyShapeStyle(.secondary))
-                    .lineLimit(1)
-                    .truncationMode(.tail)
+                HStack(spacing: 3) {
+                    // 🔴 The glyph is LEADING, so it survives the `.tail` truncation the subtitle
+                    // takes in a 220 pt sidebar. "This table came over the network" is the fact the
+                    // row was missing entirely — the URL is in the tooltip, and a tooltip is not
+                    // something anyone reads before they need it.
+                    if offersRefresh(table) {
+                        Image(systemName: SidebarSymbol.remote)
+                            .font(.system(size: 9))
+                            .foregroundStyle(.secondary)
+                    }
+                    // Orange the moment a row was thrown away reading this file. The count itself is
+                    // in the tooltip and the bad-rows sheet; this is the part you see without asking.
+                    Text(sourceSubtitle(table))
+                        .font(.system(size: 11))
+                        .foregroundStyle(
+                            table.badRows > 0 ? AnyShapeStyle(.orange) : AnyShapeStyle(.secondary)
+                        )
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                }
             }
             Spacer(minLength: 4)
             // A small, honest sign of life while the background count is still running.
             if table.rowCount == nil {
                 ProgressView().controlSize(.small).scaleEffect(0.6).frame(width: 14)
             }
+            if offersRefresh(table) { refreshButton }
             exportButton
             closeButton
         }
@@ -351,6 +515,22 @@ struct SourceRow: View {
         .opacity(hovering ? 1 : 0)
     }
 
+    /// ⟳, on remote rows only. The counterpart of the fetched-at line in the tooltip: one says when
+    /// these bytes arrived, the other asks the server whether they are still current.
+    ///
+    /// It names this row's table rather than the selected one, exactly as ⤓ does — `presentExport`'s
+    /// note explains why, and the same reasoning holds harder here: a refresh of the wrong table
+    /// costs a download.
+    private var refreshButton: some View {
+        Button { Task { await state.refreshRemote(table.name) } } label: {
+            Image(systemName: SidebarSymbol.refresh)
+        }
+        .buttonStyle(.plain)
+        .frame(width: 20)
+        .help("Check the source for new data")
+        .opacity(hovering ? 1 : 0)
+    }
+
     private var closeButton: some View {
         Button(action: closePressed) {
             Image(systemName: armed ? "xmark.circle.fill" : "xmark")
@@ -365,16 +545,33 @@ struct SourceRow: View {
     @ViewBuilder
     private var menu: some View {
         Button("Export…") { state.presentExport(table: table.name) }
+        if offersRefresh(table) {
+            Button("Refresh from Source") { Task { await state.refreshRemote(table.name) } }
+        }
+        // The other sheets of a workbook that is already open. For a remote one this is the only
+        // route there is: the pre-open picker shells `/usr/bin/unzip` at a path, and a URL has no
+        // local path until the bytes have been downloaded — which, by the time this row exists, they
+        // have been. T10 made the second sheet cost zero downloads.
+        if offersSheetChoice(table) {
+            Button("Open Another Sheet…") { state.presentSheets(table: table.name) }
+        }
         if table.staged {
             Button("Read from Source (unstage)") { stage(false) }
         } else if stageableFormat(table.spec.fmt) {
             Button("Stage This File") { stage(true) }
         }
         Divider()
+        // The sanitized URL for a remote source, which is the string the user wants and the only one
+        // they may have: `spec.key.path` IS `RemoteRef.url`, and no SAS token has ever been in it.
         Button("Copy Full Path") { copy(table.spec.key.path) }
         Button("Copy Table Name") { copy(table.name) }
-        Button("Reveal in Finder") {
-            NSWorkspace.shared.selectFile(table.spec.key.path, inFileViewerRootedAtPath: "")
+        // Only for a row that has a file behind it. `selectFile` handed a URL — or a merge view's
+        // `merge://a+b` — returns false and does nothing at all, which is a menu item that lies.
+        // Same stat, and the same reasoning, as the proxy icon in `AppDelegate.applyChrome`.
+        if FileManager.default.fileExists(atPath: table.spec.key.path) {
+            Button("Reveal in Finder") {
+                NSWorkspace.shared.selectFile(table.spec.key.path, inFileViewerRootedAtPath: "")
+            }
         }
         Divider()
         // Straight to the close — the context menu is already a deliberate two-step, and the

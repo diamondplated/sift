@@ -25,8 +25,14 @@ public func sheetRowLabel(_ info: SheetInfo) -> String {
 
 /// Everything with something in it, in workbook order. An empty sheet is listed and disabled, not
 /// hidden: it is a sheet the user knows exists, and silently dropping it reads as a bug.
-public func defaultSheetSelection(_ sheets: [SheetInfo]) -> [String] {
-    sheets.filter { !$0.empty }.map(\.name)
+///
+/// `alreadyOpen` is the sheet the table this picker was raised from is already showing, and it is
+/// left un-ticked rather than hidden. `openPath` uniquifies a taken name, so re-opening it would
+/// produce a second `orders_2` over the same bytes — a duplicate the user did not ask for and has
+/// to tidy up — while hiding it would deny that a sheet they can see in the row exists at all.
+/// `nil` — the pre-open case, where nothing is open yet — is every existing call site unchanged.
+public func defaultSheetSelection(_ sheets: [SheetInfo], alreadyOpen: String? = nil) -> [String] {
+    sheets.filter { !$0.empty && $0.name != alreadyOpen }.map(\.name)
 }
 
 /// `3 sheets — pick what to open.` Always plural, matching the web's `${d.sheets.length} sheets`
@@ -37,25 +43,57 @@ public func sheetPickerSubtitle(count: Int) -> String { "\(count) sheets — pic
 
 /// Which sheets of this workbook to open.
 public struct SheetPickerSheet: View {
-    private let path: String
+    private let title: String
+    /// The workbook to read the sheet list off disk, or `nil` when the engine has already listed
+    /// them — see the two initializers.
+    private let path: String?
     private let onOpen: ([String]) -> Void
 
     @Environment(\.dismiss) private var dismiss
-    @State private var sheets: [SheetInfo] = []
-    @State private var picked: Set<String> = []
-    @State private var loaded = false
+    @State private var sheets: [SheetInfo]
+    @State private var picked: Set<String>
+    @State private var loaded: Bool
     @State private var error: String?
 
+    /// **Before the file is open**: a local workbook whose sheets have to be read off the disk.
+    ///
     /// `onOpen` receives the chosen sheet names in workbook order. The presenting view opens each
     /// in turn — it owns the catalog, and this sheet does not reach into it.
     public init(path: String, onOpen: @escaping ([String]) -> Void) {
+        self.title = (path as NSString).lastPathComponent
         self.path = path
+        _sheets = State(initialValue: [])
+        _picked = State(initialValue: [])
+        _loaded = State(initialValue: false)
+        self.onOpen = onOpen
+    }
+
+    /// **After it is open**: the workbook's sheets as the engine listed them.
+    ///
+    /// 🔴 `spec.sheets`, never a second `listSheets(path:)`. That function shells to `/usr/bin/unzip`
+    /// once per worksheet against a real local file, which a remote workbook does not have — its
+    /// bytes are in the download cache under a hashed name, and its URL is not something `unzip` can
+    /// open. The spec's list came from the same OOXML by the same code (`buildRemoteSource` runs the
+    /// ordinary local `buildSource` over the cache file), so this is the identical answer with no
+    /// second process, no second failure mode, and nothing that needs a path.
+    ///
+    /// It is not a remote-only path: a local workbook reaches it too, which is what keeps the "open
+    /// another sheet" flow one flow rather than two.
+    public init(
+        title: String, sheets: [SheetInfo], alreadyOpen: String? = nil,
+        onOpen: @escaping ([String]) -> Void
+    ) {
+        self.title = title
+        self.path = nil
+        _sheets = State(initialValue: sheets)
+        _picked = State(initialValue: Set(defaultSheetSelection(sheets, alreadyOpen: alreadyOpen)))
+        _loaded = State(initialValue: true)
         self.onOpen = onOpen
     }
 
     public var body: some View {
         VStack(alignment: .leading, spacing: 10) {
-            Text((path as NSString).lastPathComponent).font(.system(size: 15, weight: .semibold))
+            Text(title).font(.system(size: 15, weight: .semibold))
 
             if let error {
                 Text(error).foregroundStyle(.red).textSelection(.enabled)
@@ -109,6 +147,8 @@ public struct SheetPickerSheet: View {
     }
 
     private func load() async {
+        // Already listed by the engine — nothing to read, and nothing that could fail.
+        guard let path else { return }
         do {
             // Detached: `listSheets` shells out to `/usr/bin/unzip` once per worksheet and blocks
             // on the pipe. On the MainActor that is the window freezing for the length of a

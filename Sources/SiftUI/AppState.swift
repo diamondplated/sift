@@ -228,6 +228,9 @@ public final class AppState {
         case badRows(table: String)
         /// A workbook on its way in, waiting for a sheet to be chosen. See `needsSheetPicker`.
         case workbook(path: String)
+        /// The other sheets of a workbook that is ALREADY open — a different question from
+        /// `.workbook`, and the only one a remote workbook can be asked. See `offersSheetChoice`.
+        case sheets(table: String)
         /// Remote data: the master switch and the saved connections. About the app, not about any
         /// open table — see `subject`.
         case connections
@@ -238,6 +241,7 @@ public final class AppState {
             case .staged: return "staged"
             case .badRows: return "badRows"
             case .workbook: return "workbook"
+            case .sheets: return "sheets"
             case .connections: return "connections"
             }
         }
@@ -251,9 +255,14 @@ public final class AppState {
         /// would be dismissed by a *remote* table dropping, which is the one moment its contents are
         /// most likely to be what the user needs. `.merge` is about the whole catalog; see
         /// `MergeSheet`'s captured `tables:` list.
+        /// 🔴 `.sheets` DOES name a subject, unlike `.workbook` beside it, and the difference is the
+        /// whole point of having two cases: `.workbook` is a file that is not open yet, while
+        /// `.sheets` reads `spec.sheets` off a table in the catalog. Close that table and the
+        /// picker is listing sheets of a source nothing can open — which is the blank-undismissable
+        /// -sheet failure `dismissSheetWithoutASubject` exists for.
         public var subject: String? {
             switch self {
-            case .export(let table), .badRows(let table): return table
+            case .export(let table), .badRows(let table), .sheets(let table): return table
             case .merge, .staged, .workbook, .connections: return nil
             }
         }
@@ -326,6 +335,33 @@ public final class AppState {
     /// in which this screen has nothing to say — and the one it has most to say in (remote off,
     /// nothing saved) is exactly the state a guard would refuse to open it in.
     public func presentConnections() { modalSheet = .connections }
+
+    /// The sidebar row's "Open Another Sheet…". Guarded on the same rule the row draws itself with,
+    /// so a route that skips the row — a menu item somebody adds later — cannot put up a picker over
+    /// a CSV or over a workbook with one sheet in it.
+    public func presentSheets(table: String) {
+        guard let t = tables.first(where: { $0.name == table }), offersSheetChoice(t) else { return }
+        modalSheet = .sheets(table: table)
+    }
+
+    /// The sidebar row's ⟳. `Session.refreshRemote` owns every rule about whether a refresh may
+    /// happen — a local table, a staging job in flight, a connection removed since the open, a tab
+    /// closed mid-probe — and each of those already has one clean sentence, so nothing is restated
+    /// here.
+    ///
+    /// 🔴 **The outcome is rendered, not inferred.** `.unchanged` and `.refetched` leave the same
+    /// grid, and a UI that read a side effect instead would be right half the time. `refresh()` runs
+    /// either way rather than only on `.refetched`: the mirror sync is what the poll loop does
+    /// anyway, and a branch here would be a second copy of the engine's decision.
+    public func refreshRemote(_ name: String) async {
+        do {
+            let outcome = try await session.refreshRemote(name)
+            await refresh()
+            banner = refreshOutcomeText(table: name, outcome)
+        } catch {
+            banner = refreshFailureText(table: name, error: error.localizedDescription)
+        }
+    }
 
     /// The staging banner's Cancel. `Session.cancel` returns `false` for a cancel that cannot
     /// land — the job already finished, or its copy is already being published — and its own
@@ -415,8 +451,23 @@ public func rowSummaryText(_ table: SiftEngine.Table) -> String {
 /// six test cases in a second file, so the suite was green whichever of the two you edited and
 /// neither test would have noticed them drifting apart. `compactCount` and `humanBytes` got here
 /// first; only this one had shipped with the loser still alive.
+///
+/// 🔴 **A URL never routes here, and the guard is first for two independent reasons.**
+/// `RemoteURL.effectiveExt`'s own doc names this function as one of the two shipped sites that ask
+/// `NSString.pathExtension` about a URL, and the answers are wrong in both directions: on
+/// `https://h/f.xlsx?sv=…&sig=…` it returns the tail of the SAS signature, and on
+/// `https://h/get?id=5&fmt=xlsx` it returns `xlsx` for a thing that is not a workbook. Even a
+/// correct extension would be the wrong route: the picker behind it calls `listSheets(path:)`,
+/// which shells to `/usr/bin/unzip` and needs a real local file, and a remote workbook has none
+/// until it has been downloaded — and if it were shown anyway, its title is
+/// `(path as NSString).lastPathComponent`, which is a SAS signature on screen.
+///
+/// A remote workbook is therefore opened straight away, on whichever sheet `buildSource` picks, and
+/// its other sheets are offered from the row afterwards (`offersSheetChoice`) out of `spec.sheets`
+/// — which the engine listed from the real OOXML, and which costs zero further downloads.
 public func needsSheetPicker(_ path: String) -> Bool {
-    xlsxExt.contains("." + (path as NSString).pathExtension.lowercased())
+    guard classifyRemote(path) == nil else { return false }
+    return xlsxExt.contains("." + (path as NSString).pathExtension.lowercased())
 }
 
 // MARK: - what LaunchServices hands over

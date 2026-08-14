@@ -108,6 +108,24 @@ public struct RootView: View {
                 SheetPickerSheet(path: path) { picked in
                     Task { for name in picked { await state.open(path: path, sheet: name) } }
                 }
+            case .sheets(let name):
+                if let t = state.tables.first(where: { $0.name == name }) {
+                    // 🔴 `spec.key.path` and not `spec.target`: `key.path` is the file path for a
+                    // local source and the **sanitized** URL for a remote one, so one call site
+                    // serves both — while `target` is the download cache's hashed filename, which
+                    // would open a second table pointing at a file the startup sweep collects.
+                    SheetPickerSheet(
+                        title: t.name, sheets: t.spec.sheets, alreadyOpen: t.spec.sheet
+                    ) { picked in
+                        Task {
+                            for sheet in picked {
+                                await state.open(path: t.spec.key.path, sheet: sheet)
+                            }
+                        }
+                    }
+                } else {
+                    SheetSubjectGone()
+                }
             case .connections:
                 // `state.engine.extensions` and not `session.engineInfo()`: that snapshot was taken
                 // once, on the MainActor, while `AppState` was built. See `extensionsAtLaunch`.

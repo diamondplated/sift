@@ -44,6 +44,25 @@ public func stagedTotalSentence(totalBytes: Int, policy: StagePolicy) -> String 
     "\(humanBytes(totalBytes)) total of \(stageBudgetGB(policy)) GB."
 }
 
+/// The share of the total that no row in this panel accounts for, or `nil` when there is none.
+///
+/// 🔴 **T10 made `stagedTotalBytes()` = `dbBytes() + remoteCacheBytes()`, and the rows here are
+/// staged COPIES.** A remote source that was opened and never staged has real bytes in
+/// `<SIFT_HOME>/remote-cache/` and no row anywhere — so the total silently stopped equalling
+/// anything the table explains. The worse half: with nothing staged at all, this panel drew
+/// "Nothing staged." over a directory holding megabytes of the user's data, which is precisely the
+/// lie a sheet whose whole job is "here is what Sift is holding" must not tell.
+///
+/// `nil` at zero rather than "0 B", so a machine that has never opened a URL is not told about the
+/// feature in terms of the bytes it is not using. The lifetime sentence is `sweepRemoteCache`'s
+/// actual rule and not a paraphrase of the staged one: the sweep runs at startup, deletes every
+/// cache file no `_sift_sources` row names, and ages the survivors out on `stageMaxAgeDays()`.
+public func remoteCacheSentence(bytes: Int) -> String? {
+    guard bytes > 0 else { return nil }
+    return "\(humanBytes(bytes)) of that is data downloaded from URLs, which no row above lists. "
+        + "Sift clears a downloaded copy the next time it starts, unless a staged copy still names it."
+}
+
 /// The source column: the filename, because the full path is 280 px of ellipsis in the web build
 /// and lives in the tooltip there for the same reason.
 public func stagedSourceName(_ path: String) -> String { (path as NSString).lastPathComponent }
@@ -82,6 +101,7 @@ public struct StagedDataSheet: View {
     @Environment(\.dismiss) private var dismiss
     @State private var entries: [StagedSource] = []
     @State private var totalBytes = 0
+    @State private var remoteBytes = 0
     @State private var loaded = false
     @State private var error: String?
 
@@ -129,9 +149,21 @@ public struct StagedDataSheet: View {
                     }
                 }
                 .frame(maxHeight: 300)
+            }
+            // 🔴 OUTSIDE the `entries.isEmpty` branch, deliberately. The totals used to be drawn
+            // only when there was a table to draw them under — so the one state where they carry
+            // information the rows cannot ("Nothing staged", and 300 MB of downloaded copies on
+            // disk) was the one state that hid them.
+            if loaded {
                 Text(stagedTotalSentence(totalBytes: totalBytes, policy: policy))
                     .font(.system(size: 12))
                     .foregroundStyle(.secondary)
+                if let downloaded = remoteCacheSentence(bytes: remoteBytes) {
+                    Text(downloaded)
+                        .font(.system(size: 12))
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
             }
 
             HStack {
@@ -151,6 +183,7 @@ public struct StagedDataSheet: View {
         do {
             entries = try await session.stagedEntries()
             totalBytes = session.stagedTotalBytes()   // nonisolated
+            remoteBytes = session.remoteCacheBytes()  // nonisolated, and a subset of the total
             error = nil
         } catch {
             // The engine's own sentence, unwrapped. A `try?` here would leave the panel claiming

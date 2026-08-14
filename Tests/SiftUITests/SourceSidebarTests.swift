@@ -20,11 +20,12 @@ import TestSupport
 private func fixture(
     name: String = "orders", fmt: Fmt = .csv, path: String = "/data/orders.csv", size: Int = 0,
     rowCount: Int? = nil, estimate: RowEstimate? = nil, filteredCount: Int? = nil,
-    filters: [Filter] = [], badRows: Int = 0, counting: Bool = false, staged: Bool = false
+    filters: [Filter] = [], badRows: Int = 0, counting: Bool = false, staged: Bool = false,
+    sheet: String? = nil, sheets: [SheetInfo] = [], remote: RemoteRef? = nil
 ) -> SiftEngine.Table {
     let spec = SourceSpec(
         key: SourceKey(path: path, mtimeNs: 0, size: size), fmt: fmt, readFn: "read_csv",
-        rowEstimate: estimate)
+        rowEstimate: estimate, sheet: sheet, sheets: sheets, remote: remote)
     var t = SiftEngine.Table(
         name: name, spec: spec, qspec: QuerySpec(relation: name, filters: filters), openedAt: 1)
     t.rowCount = rowCount
@@ -173,6 +174,136 @@ private let fortyOnePointTwoMB = 43_201_331
         dirty.spec.key.path == "/data/orders.csv"
             && sourceTooltip(dirty).hasSuffix("\n12,004 rows dropped"),
         "a file that lost rows must say so somewhere the user can find it")
+
+    // A local source has no fetch to report, and must not grow a line saying so.
+    #expect(!sourceTooltip(clean).contains("Fetched"))
+    #expect(remoteFetchedAt(clean) == nil)
+}
+
+// MARK: - a remote source, on screen
+//
+// The engine has opened URLs since `eefbedc` and refreshed them since `02ceb35`. Until this task
+// the sidebar drew a remote table exactly like a local one: the row said nothing about the network,
+// nothing about when the bytes arrived, and offered no way to ask for them again.
+
+/// A `RemoteRef` as the engine writes one — `url` is `RemoteURL.sanitized` by contract.
+private func remoteRef(
+    _ url: String = "https://acct.blob.core.windows.net/c/sales.csv",
+    fetchedAtNs: Int = 1_755_180_720_000_000_000
+) -> RemoteRef {
+    RemoteRef(
+        url: url, etag: "\"v1\"", lastModifiedMs: nil, contentLength: 4096,
+        fetchedAtNs: fetchedAtNs, cachePath: "/tmp/remote-cache/1a2b3c.csv")
+}
+
+/// 🔴 The row's three missing facts, all three of them. `spec.remote` is non-nil for exactly the
+/// sources that came from a URL, which is why `offersRefresh` asks it and never a string.
+@Test func aRemoteRowSaysItCameOverTheNetworkAndWhenTheBytesArrived() throws {
+    let url = "https://acct.blob.core.windows.net/c/sales.csv"
+    let remote = fixture(
+        name: "sales", path: url, size: fortyOnePointTwoMB, rowCount: 900, remote: remoteRef(url))
+    let local = fixture(size: fortyOnePointTwoMB, rowCount: 900)
+
+    #expect(offersRefresh(remote), "no ⟳ on the only kind of table that can be refreshed")
+    #expect(!offersRefresh(local), "⟳ on a table the engine reads from disk on every query")
+
+    // The path line is the sanitized URL — what `RemoteRef.url` holds and what `_sift_sources`
+    // persists — and the fetch time is its own line rather than a segment of the subtitle, which
+    // truncates to the tail in a 220 pt sidebar.
+    let fetched = try #require(remoteFetchedAt(remote))
+    #expect(
+        sourceTooltip(remote)
+            == "\(url)\ncsv · 41.2 MB · 900 rows\nFetched from the network \(fetched)")
+    #expect(sourceTooltip(remote).contains(url))
+
+    // The subtitle itself is untouched: a remote CSV is still a CSV of that size with that many
+    // rows, and the network fact rides the glyph beside it, not the string.
+    #expect(sourceSubtitle(remote) == sourceSubtitle(local))
+}
+
+/// 🔴 **Nanoseconds since the UNIX epoch, rendered by `stagedTimestamp` and no formatter.**
+/// `fetchClockNs()` is `Date().timeIntervalSince1970 * 1e9` — deliberately a wall clock rather than
+/// `uptimeNanoseconds`, because the value is compared on a later launch — so it can be rendered at
+/// all. Getting the scale wrong is the failure this pins: a `/ 1_000` divisor puts the fetch a
+/// million years out and the row states it with total confidence.
+@Test func theFetchTimeIsTheEpochInNanosecondsAndIsBuiltWithoutAFormatter() throws {
+    let seconds = 1_755_180_720.0
+    let t = fixture(remote: remoteRef(fetchedAtNs: Int(seconds * 1_000_000_000)))
+    let rendered = try #require(remoteFetchedAt(t))
+
+    #expect(rendered == stagedTimestamp(Date(timeIntervalSince1970: seconds)))
+    #expect(rendered != stagedTimestamp(Date(timeIntervalSince1970: seconds * 1_000)),
+            "a milliseconds reading of the same field renders a different, equally confident date")
+
+    // `YYYY-MM-DD HH:MM`, zero-padded, whatever time zone this machine is in — the shape is
+    // assertable where the value is not.
+    let halves = rendered.split(separator: " ")
+    #expect(halves.count == 2)
+    #expect(halves[0].split(separator: "-").map(\.count) == [4, 2, 2])
+    #expect(halves[1].split(separator: ":").map(\.count) == [2, 2])
+}
+
+/// 🔴 The outcome is RENDERED, never inferred. `.unchanged` and `.refetched` leave the same grid,
+/// the same row count and the same everything — which is why `refreshRemote` returns the case at
+/// all, and why a UI that read a side effect would be right half the time and confident always.
+@Test func aRefreshSaysWhichOfTheTwoOutcomesTheEngineMeasured() {
+    let unchanged = refreshOutcomeText(table: "sales", .unchanged(since: "14:32"))
+    let refetched = refreshOutcomeText(table: "sales", .refetched)
+
+    #expect(unchanged == "sales: unchanged since 14:32.")
+    #expect(refetched == "sales: re-fetched from the source.")
+    #expect(unchanged != refetched, "one sentence for both outcomes says nothing")
+    // `since` is the engine's already-rendered `HH:MM` (`clockHHMM`, built from `Calendar`
+    // components), passed through rather than re-derived — this codebase has no way to format a
+    // `Date` in the UI, which is the point.
+    #expect(unchanged.contains("14:32"))
+}
+
+/// 🔴 **A SAS-signed source cannot be refreshed, and Sift cannot tell which sources those are.**
+/// `RemoteRef.url` is sanitized by contract, so the refresh sends no signature and the server
+/// answers 403 — T8's no-persisted-credential ruling holding, not a bug. `RemoteRef` carries no
+/// `hadQuery` marker (T10 declined to add one: half a signal is worse than none), so the sentence
+/// is conditional and always shown. What must never happen is a bare HTTP status with no way out,
+/// which is what the engine's own sentence is on its own.
+@Test func aFailedRefreshCarriesTheEnginesSentenceAndTheOneThingItCannotKnow() {
+    let engineSentence = "HTTP Error: HTTP GET error on 'https://acct/c/sales.csv' (HTTP 403)"
+    let text = refreshFailureText(table: "sales", error: engineSentence)
+
+    #expect(text.hasPrefix(engineSentence), "the engine's own sentence was paraphrased or dropped")
+    #expect(text.contains(refreshSignedURLNote))
+    #expect(refreshSignedURLNote.contains("sig="), "the note has to name the shape it is about")
+    #expect(refreshSignedURLNote.contains("Paste the whole URL"), "a cause with no fix is a shrug")
+}
+
+/// 🔴 `Image(systemName:)` handed a name macOS does not know draws **nothing** and reports nothing —
+/// a hover button that is present, enabled, hit-testable and invisible. The same failure
+/// `theToolbarsSymbolsAllResolve` exists for, one view over: this Mac carries a newer SDK than the
+/// macos-15 runner, and the macOS 14 deployment floor is lower than both.
+@MainActor
+@Test func theSidebarsSymbolsAllResolve() {
+    for name in SidebarSymbol.all {
+        #expect(
+            NSImage(systemSymbolName: name, accessibilityDescription: nil) != nil,
+            "the sidebar draws \(name), which this system does not have")
+    }
+    #expect(SidebarSymbol.all.count == 4, "a glyph was added or removed without its name")
+    // …and the check is not vacuous.
+    #expect(NSImage(systemSymbolName: "sift.not.a.symbol", accessibilityDescription: nil) == nil)
+}
+
+/// Which rows offer the other sheets of their workbook, and — the part that matters — what decides
+/// it. `spec.sheets` was read off the real OOXML by the engine; `NSString.pathExtension` was not.
+@Test func onlyAMultiSheetWorkbookOffersItsOtherSheets() {
+    let two = [SheetInfo(name: "Q1", rows: 40, cols: 3), SheetInfo(name: "Q2", rows: 9, cols: 3)]
+    #expect(offersSheetChoice(fixture(fmt: .xlsx, path: "/data/book.xlsx", sheets: two)))
+    #expect(!offersSheetChoice(fixture(fmt: .xlsx, path: "/data/book.xlsx", sheets: [two[0]])),
+            "a one-sheet workbook has no choice to offer")
+    #expect(!offersSheetChoice(fixture(fmt: .csv, sheets: two)), "a CSV has no sheets")
+    // A remote workbook is the case with no other route at all — the pre-open picker shells
+    // `/usr/bin/unzip` at a path, and a URL is not one.
+    let url = "https://h/c/book.xlsx"
+    #expect(offersSheetChoice(
+        fixture(fmt: .xlsx, path: url, sheets: two, remote: remoteRef(url))))
 }
 
 // MARK: - the path box
@@ -193,6 +324,117 @@ private let fortyOnePointTwoMB = 43_201_331
     #expect(autoOpenPath(from: "", to: "/a/b.csv\n/c/d.csv") == nil, "two paths is not one path")
     // A deletion is not a paste.
     #expect(autoOpenPath(from: "/data/orders.csv", to: "/data") == nil)
+}
+
+/// 🔴 **The gesture this whole phase was designed around: copy a blob URL, paste it into Sift.**
+/// Before this the box typed the URL into a field and did nothing at all.
+///
+/// The authority is `SiftCore.classifyRemote`, and the two assertions that say so are the ones a
+/// hand-rolled string test would fail: `gs://` and `ftp://` **contain `://`** and are not schemes
+/// Sift can reach, while `azure://` and `abfs://` do not appear in any obvious prefix list and are
+/// two of the four spellings DuckDB's own azure secret scopes to. `classifyRemote`'s `nil` means
+/// *local path* — so a scheme decided wrong here is not "unsupported", it is a URL handed silently
+/// to the local-file flow to come back as a missing file.
+@Test func aPastedURLOpensAndClassifyRemoteIsWhatDecidesWhichOnesDo() {
+    // Every spelling that reaches DuckDB, pasted whole.
+    for url in [
+        "https://acct.blob.core.windows.net/c/sales.csv",
+        "http://h/sales.csv",
+        "s3://bucket/key/sales.parquet",
+        "az://container/sales.csv",
+        "azure://container/sales.csv",
+        "abfss://fs@acct.dfs.core.windows.net/sales.csv",
+        "abfs://fs@acct.dfs.core.windows.net/sales.csv",
+    ] {
+        #expect(autoOpenPath(from: "", to: url) == url, "\(url) did not open")
+        #expect(classifyRemote(url) != nil, "\(url) is not remote to the engine either")
+    }
+
+    // 🔴 Not remote to `classifyRemote`, so not remote here. A `contains("://")` test opens both.
+    #expect(autoOpenPath(from: "", to: "gs://bucket/sales.csv") == nil)
+    #expect(autoOpenPath(from: "", to: "ftp://h/sales.csv") == nil)
+    #expect(autoOpenPath(from: "", to: "https://") == nil, "a scheme with no authority is not a URL")
+
+    // The growth rule is unchanged by any of it: `https://h/f.csv` is fifteen keystrokes and none
+    // of them may open anything.
+    var typed = ""
+    for character in "https://h/f.csv" {
+        let next = typed + String(character)
+        #expect(autoOpenPath(from: typed, to: next) == nil, "typing fired the paste handler at \(next)")
+        typed = next
+    }
+
+    // Finder's trailing newline is trimmed here too; two URLs in one paste is still not one URL.
+    #expect(autoOpenPath(from: "", to: "  https://h/f.csv \n") == "https://h/f.csv")
+    #expect(autoOpenPath(from: "", to: "https://h/a.csv\nhttps://h/b.csv") == nil)
+}
+
+/// 🔴 **The display half of T8's grep rule.** T8 pins the persisted and snippet surfaces from
+/// inside the engine (`RemoteOpenTests.remoteFactOpen_aSasSignedParquetIsDownloadedAndTheSignature\
+/// ReachesNothingPersisted`, which greps `spec.target`, `key.path`, `duckdb_views()`,
+/// `_sift_sources` and all four snippet dialects). It cannot reach these functions — `SiftEngineTests`
+/// does not depend on `SiftUI`, and pointing an engine test target at the view layer would invert
+/// the module graph — so this is the same grep over the strings the window draws, and the two are
+/// cross-referenced rather than merged.
+///
+/// The teeth are the last pair: `lastPathComponent` of a signed URL **is** the signature, and the
+/// pre-open picker titles itself with exactly that. Delete `needsSheetPicker`'s `classifyRemote`
+/// guard and a SAS token is drawn 15 pt tall at the top of a modal sheet.
+@Test func nothingTheSidebarDrawsCanCarryASASSignature() throws {
+    let sig = "SUPERSECRETSIGNATURE"
+    let signed = "https://acct.blob.core.windows.net/c/sales.xlsx?sv=2024-11-04&sig=\(sig)"
+    let u = try #require(classifyRemote(signed))
+
+    // The box hands the WHOLE string on — DuckDB needs the token, and `wireURL` is the one place it
+    // is re-attached. An `autoOpenPath` that sanitized here would 403 every signed blob in the
+    // product.
+    #expect(autoOpenPath(from: "", to: signed) == signed)
+    #expect(u.query == "sv=2024-11-04&sig=\(sig)", "the token has to survive as far as the engine")
+
+    // …and everything the window draws afterwards is built from the sanitized form, which is what
+    // `RemoteRef.url` holds by contract.
+    let sheets = [SheetInfo(name: "Q1", rows: 40, cols: 3), SheetInfo(name: "Q2", rows: 9, cols: 3)]
+    let t = fixture(
+        name: "sales", fmt: .xlsx, path: u.sanitized, size: 4096, rowCount: 40, sheet: "Q1",
+        sheets: sheets, remote: remoteRef(u.sanitized))
+
+    var shown = [
+        t.name, t.spec.key.path, t.spec.target, sourceSubtitle(t), sourceTooltip(t),
+        try #require(remoteFetchedAt(t)),
+        refreshOutcomeText(table: t.name, .refetched),
+        refreshOutcomeText(table: t.name, .unchanged(since: "14:32")),
+    ]
+    shown += t.spec.sheets.map(\.name)
+    shown += t.spec.sheets.map(sheetRowLabel)
+
+    for text in shown {
+        #expect(!text.contains(sig), "the SAS signature reached a display surface: \(text)")
+        #expect(!text.contains("sig="), "a query string reached a display surface: \(text)")
+        #expect(!text.contains("?"), "the query delimiter survived into: \(text)")
+    }
+
+    // 🔴 `refreshFailureText` is the one string that PRINTS the shape `?sv=…&sig=…` — deliberately,
+    // because naming it is how the user recognises the URL they pasted. It is a constant this file
+    // wrote, never anything derived from a URL, so what it must not carry is a real signature.
+    let failure = refreshFailureText(table: t.name, error: "HTTP Error: (HTTP 403)")
+    #expect(!failure.contains(sig), "the SAS signature reached the refresh banner: \(failure)")
+    #expect(!failure.contains(u.sanitized), "the failure quotes a URL rather than the table name")
+    #expect(!refreshSignedURLNote.contains(sig))
+
+    // 🔴 **The route that would have drawn a query string 15 pt tall at the top of a modal sheet.**
+    // The pre-open picker titles itself `(path as NSString).lastPathComponent`, and `needsSheetPicker`
+    // is what sends a path to it. On an endpoint shape — the same one
+    // `SiftCoreTests.aQueryStringNeverBecomesAnExtension` pins — `pathExtension` answers `xlsx` for
+    // a thing that is not a workbook, and the component it would then draw is the whole signed
+    // query. Delete `needsSheetPicker`'s `classifyRemote` guard and the last line goes red.
+    let endpoint = "https://acct.blob.core.windows.net/c/get?sv=2024-11-04&sig=\(sig)&as=report.xlsx"
+    #expect((endpoint as NSString).pathExtension == "xlsx", "the defect")
+    #expect((endpoint as NSString).lastPathComponent.contains(sig), "the defect")
+    #expect(!needsSheetPicker(endpoint),
+            "a signed URL routed into the picker, whose title is its own path component")
+    #expect(!needsSheetPicker(signed), "and neither does the ordinary signed-workbook shape")
+    // The sheets ARE still choosable — through the route that reads them off the open table.
+    #expect(offersSheetChoice(t))
 }
 
 // MARK: - the armed close
@@ -393,6 +635,34 @@ private func writePNG(_ image: CGImage, _ name: String) throws -> String {
     #expect(try inkCount(plainImage, amber) == 0, "orange in a row that dropped nothing")
     #expect(try inkCount(droppedImage, amber) > 0,
         "a row that dropped 12,004 rows says nothing about it — see \(droppedPath)")
+
+    await state.session.shutdown()
+}
+
+/// 🔴 The glyph has to reach the PIXELS, not merely the code path. `SourceRow`'s
+/// `if offersRefresh(table)` lives in a `body`, which no test can call — the failure this catches is
+/// a row that carries the right flag and draws the same thing either way, which is exactly what
+/// `theOffendingCellIsPaintedRedAndItsNeighbourIsNot` exists for one sheet over.
+///
+/// The two rows are identical in every string: same name, same size, same count, and
+/// `aRemoteRowSaysItCameOverTheNetworkAndWhenTheBytesArrived` pins that their subtitles are equal.
+/// So the difference in the bitmap can only be the network glyph.
+@MainActor
+@Test func aRemoteRowDrawsSomethingALocalRowDoesNot() async throws {
+    let state = AppState(session: try Session(home: tempHome()))
+    let url = "https://acct.blob.core.windows.net/c/sales.csv"
+    let local = fixture(
+        name: "sales", path: "/data/sales.csv", size: fortyOnePointTwoMB, rowCount: 900)
+    let remote = fixture(
+        name: "sales", path: url, size: fortyOnePointTwoMB, rowCount: 900, remote: remoteRef(url))
+    #expect(sourceSubtitle(local) == sourceSubtitle(remote), "the rows must differ only in the glyph")
+
+    let localImage = try render(SourceRow(table: local, state: state), 360, 44)
+    let remoteImage = try render(SourceRow(table: remote, state: state), 360, 44)
+    let path = try writePNG(remoteImage, "row-remote")
+
+    #expect(try pixelDigest(localImage) != pixelDigest(remoteImage),
+        "a table opened from a URL draws exactly like one opened from disk — see \(path)")
 
     await state.session.shutdown()
 }

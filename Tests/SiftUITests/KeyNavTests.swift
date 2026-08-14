@@ -178,6 +178,23 @@ import Testing
     // to unzip it would replace that sentence with a worse one.
     #expect(!needsSheetPicker("/data/ancient.xls"))
     #expect(!needsSheetPicker("/data/xlsx"))
+
+    // 🔴 **A URL never routes here, and both directions of the defect are pinned.** This function is
+    // `NSString.pathExtension`, which `RemoteURL.effectiveExt`'s own doc names as one of the two
+    // shipped sites that ask it about a URL: on a signed blob it answers with the tail of the SAS
+    // signature, and on an API endpoint it answers `xlsx` for a thing that is not a workbook. Even a
+    // correct extension would be the wrong route — the picker behind it shells `/usr/bin/unzip` at a
+    // local file, and a remote workbook has none until its bytes are downloaded.
+    #expect(!needsSheetPicker("https://h/books.xlsx"))
+    #expect(!needsSheetPicker("az://container/books.xlsx"))
+    #expect(!needsSheetPicker("https://h/books.xlsx?sv=2024&sig=SECRET"))
+    let endpoint = "https://h/get?id=5&format=json&name=report.xlsx"
+    #expect(!needsSheetPicker(endpoint))
+    #expect((endpoint as NSString).pathExtension == "xlsx", "the defect")
+    #expect((("https://h/books.xlsx?sv=2024&sig=SECRET") as NSString).pathExtension
+        == "xlsx?sv=2024&sig=SECRET", "the other half of the defect")
+    // The other sheets of a remote workbook are offered from the open row instead — see
+    // `offersSheetChoice`, which reads `spec.sheets` rather than any path at all.
 }
 
 @MainActor

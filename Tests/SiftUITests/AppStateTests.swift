@@ -540,3 +540,128 @@ private func write(_ text: String, _ name: String, in dir: URL) throws -> String
 
     #expect(state.modalSheet == nil)
 }
+
+// MARK: - the routes in, for a source that came from a URL
+//
+// The engine has opened URLs since `eefbedc` and refreshed them since `02ceb35`, and until this
+// task none of it was reachable: the paste box refused anything without a leading `/`, the
+// Connections screen had no caller at all, and `open(paths:)` asked `NSString.pathExtension` about
+// URLs on the way past. Every test below drives a REAL `Session`; none reaches the network, because
+// a default session is not allowed to and saying so is exactly what is being asserted.
+
+/// 🔴 **WHICH refusal is the entire assertion.** A default `Session` has remote data off, so the
+/// remote flow refuses by name and points at the screen that turns it on. The LOCAL flow would say
+/// `No such file or folder: https://…` — Sift refusing, in its own voice, to open something it can
+/// open — and that is the silent mis-route `classifyRemote` is the single authority against. Two
+/// different code paths produce a banner; this asserts which one ran.
+@MainActor
+@Test func aPastedURLReachesTheEngineAsAURLAndNeverAsALocalPath() async throws {
+    let state = AppState(session: try Session(home: tempHome()))
+    let url = "https://acct.blob.core.windows.net/c/sales.csv"
+
+    // Through the paste handler the box actually calls, not straight into `open`.
+    let pasted = try #require(autoOpenPath(from: "", to: url))
+    await state.open(paths: [pasted])
+
+    let banner = try #require(state.banner, "a pasted URL did nothing at all, which is the defect")
+    #expect(banner.contains("Connections"), "\(banner)")
+    #expect(banner.contains("sales.csv"), "the URL never reached `classifyRemote`: \(banner)")
+    #expect(!banner.contains("No such file"), "the URL was opened as a local path: \(banner)")
+    #expect(state.tables.isEmpty)
+}
+
+/// The `.xlsx` half of the same mis-route, which fails differently and worse: the pre-open picker
+/// shells `/usr/bin/unzip` at the path it is handed, and titles itself with that path's last
+/// component — which for a signed blob URL is the SAS signature.
+@MainActor
+@Test func aPastedWorkbookURLOpensRatherThanRaisingThePickerThatCannotReadIt() async throws {
+    let state = AppState(session: try Session(home: tempHome()))
+
+    // 🔴 The **unsigned** shape is the one that carries the mutant: `pathExtension` answers `xlsx`
+    // for it, so without `needsSheetPicker`'s guard this raises the pre-open picker and the picker
+    // shells `/usr/bin/unzip` at a URL. (The signed shape below is refused by accident either way —
+    // its extension comes back as `xlsx?sv=2024&sig=…`, which matches nothing — so asserting on it
+    // alone would have been a test that could not fail.)
+    await state.open(paths: ["https://acct.blob.core.windows.net/c/books.xlsx"])
+    #expect(state.modalSheet == nil, "a URL was routed into the local-file sheet picker")
+    let banner = try #require(state.banner)
+    #expect(banner.contains("Connections"), "\(banner)")
+    #expect(banner.contains("books.xlsx"), "\(banner)")
+
+    // …and the signed shape, whose failure mode is the worse one: the picker titles itself with the
+    // path's last component, which here IS the signature.
+    state.banner = nil
+    await state.open(paths: ["https://acct.blob.core.windows.net/c/books.xlsx?sv=2024&sig=SECRETSIG"])
+    #expect(state.modalSheet == nil)
+    let signedBanner = try #require(state.banner)
+    #expect(!signedBanner.contains("SECRETSIG"), "the SAS signature reached the banner: \(signedBanner)")
+    #expect(state.tables.isEmpty)
+}
+
+/// `presentSheets` is guarded on the same rule the row draws itself with, so a route that skips the
+/// row cannot put a picker up over a CSV.
+@MainActor
+@Test func theOpenAnotherSheetRouteRefusesEveryTableWithNoOtherSheet() async throws {
+    let (state, _) = try await openedFixture(rows: 12)
+    let name = try #require(state.activeName)
+
+    state.presentSheets(table: name)
+    #expect(state.modalSheet == nil, "a CSV was offered a choice of sheets")
+    state.presentSheets(table: "no-such-table")
+    #expect(state.modalSheet == nil)
+}
+
+/// 🔴 `.sheets` names its subject, unlike `.workbook` beside it: it lists `spec.sheets` off a table
+/// in the catalog, so closing that table leaves a picker describing a source nothing can open. That
+/// is the blank-undismissable-sheet shape `dismissSheetWithoutASubject` exists for.
+@MainActor
+@Test func aSheetPickerOverAnOpenWorkbookIsDismissedWhenThatTableCloses() async throws {
+    let (state, _) = try await openedFixture(rows: 12)
+    let name = try #require(state.activeName)
+
+    // Set directly: `presentSheets` correctly refuses a CSV, and what is under test here is the
+    // reconciliation rather than the guard.
+    state.modalSheet = .sheets(table: name)
+    #expect(AppState.ModalSheet.sheets(table: name).subject == name)
+    await state.close(name)
+    #expect(state.modalSheet == nil)
+}
+
+/// A refresh of a local table is the engine's refusal, reaching the user as one clean sentence —
+/// plus the one thing the engine cannot know about a failure. Driven through a real `Session` so
+/// the sentence is the engine's own and not a string this test typed.
+@MainActor
+@Test func refreshingALocalTableBannersTheEnginesOwnRefusalAndNotASilence() async throws {
+    let (state, _) = try await openedFixture(rows: 12)
+    let name = try #require(state.activeName)
+    #expect(state.banner == nil)
+
+    await state.refreshRemote(name)
+
+    let banner = try #require(state.banner, "a refresh that cannot happen did nothing at all")
+    #expect(banner.contains("opened from a local file"), "\(banner)")
+    #expect(banner.contains(name))
+    #expect(banner.hasSuffix(refreshSignedURLNote))
+    // The engine's sentence is first and whole — never paraphrased, never replaced.
+    #expect(banner.hasPrefix("Refresh re-fetches a source Sift opened from a URL"), "\(banner)")
+
+    // A table that is not open at all gets `table(_:)`'s existing sentence, not a silence.
+    state.banner = nil
+    await state.refreshRemote("no-such-table")
+    #expect(try #require(state.banner).contains("No open table named"))
+}
+
+/// Nothing calls `presentConnections()` in this target — the two routes are `AppDelegate`'s menu
+/// item and the sidebar's footer button, and neither target a test can import. What IS assertable
+/// is that the call it makes puts the right sheet up and that nothing dismisses it out from under
+/// the user, which `ConnectionsSheetTests` pins from the other side.
+@MainActor
+@Test func theConnectionsRouteRaisesTheSheetAndSurvivesTheCatalogEmptying() async throws {
+    let (state, _) = try await openedFixture(rows: 12)
+    let name = try #require(state.activeName)
+
+    state.presentConnections()
+    #expect(state.modalSheet == .connections)
+    await state.close(name)
+    #expect(state.modalSheet == .connections, "the one screen a dropped remote table calls for")
+}

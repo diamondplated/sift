@@ -161,6 +161,26 @@ private func appKitReady() { _ = NSApplication.shared }
     #expect(stagePolicySentence(home: "/h", policy: raised).hasSuffix("capped at 3 GB."))
 }
 
+/// 🔴 T10 made `stagedTotalBytes()` = `dbBytes() + remoteCacheBytes()`, so the total now counts
+/// bytes **no row in this panel lists**: a remote source that was opened and never staged has a real
+/// file in `<SIFT_HOME>/remote-cache/` and no catalog row anywhere. Left unsaid, the panel whose
+/// entire job is "here is what Sift is holding" draws a total nothing on screen explains — and, with
+/// nothing staged at all, drew "Nothing staged." over it.
+@Test func downloadedCopiesGetTheirOwnLineBecauseNoRowInThePanelListsThem() throws {
+    // Zero is `nil`, not "0 B": a machine that has never opened a URL is not told about the feature
+    // in terms of the bytes it is not using.
+    #expect(remoteCacheSentence(bytes: 0) == nil)
+
+    let text = try #require(remoteCacheSentence(bytes: 43_201_331))
+    #expect(text.hasPrefix("41.2 MB of that is data downloaded from URLs"))
+    #expect(text.contains("no row above lists"))
+    // The lifetime named is `sweepRemoteCache`'s own rule — it runs at startup and collects every
+    // cache file no `_sift_sources` row names — and not a paraphrase of the staged-copy policy,
+    // which has a size cap this cache is not under.
+    #expect(text.contains("next time it starts"))
+    #expect(!text.contains("GB"), "the cache is not under the store's budget cap; saying so lies")
+}
+
 /// 🔴 No `DateFormatter`. Built from `Calendar.current` components and zero-padded by hand, which
 /// is the `YYYY-MM-DD HH:MM` the web produced by slicing an ISO string to 16 characters.
 @Test func aStagedTimestampIsYearMonthDayHourMinuteWithNoFormatter() throws {
@@ -355,6 +375,17 @@ private func appKitReady() { _ = NSApplication.shared }
     #expect(sheetRowLabel(sheets[1]) == "1,204 × 7")
     #expect(sheetRowLabel(sheets[2]) == "empty")
     #expect(sheetRowLabel(sheets[3]) == "empty", "a sheet with no <dimension> is nothing to open")
+
+    // 🔴 The post-open picker — the only route a REMOTE workbook has to its other sheets, since the
+    // one above shells `/usr/bin/unzip` at a path a URL does not have. The sheet the table is
+    // already showing is listed but not ticked: `openPath` uniquifies a taken name, so re-opening
+    // it produces a second `sales_2` over the same bytes, and hiding it would deny that a sheet the
+    // user can see in the row exists.
+    #expect(defaultSheetSelection(sheets, alreadyOpen: "Summary") == ["By Store"])
+    #expect(defaultSheetSelection(sheets, alreadyOpen: "Empty") == ["Summary", "By Store"],
+            "an empty sheet was never ticked, so excluding it must change nothing")
+    #expect(defaultSheetSelection(sheets, alreadyOpen: nil) == defaultSheetSelection(sheets),
+            "the pre-open call site must be untouched by the parameter")
 }
 
 // MARK: - fixtures

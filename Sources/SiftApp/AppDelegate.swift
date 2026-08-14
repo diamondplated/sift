@@ -214,6 +214,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         dataMenu.addItem(merge)
         dataMenu.addItem(
             withTitle: "Manage Staged Data…", action: #selector(stagedAction), keyEquivalent: "")
+        // 🔴 The title is load-bearing, not decorative. `Session.checkRemotePosture` and
+        // `checkRemoteExtension` both refuse a URL with a sentence naming "Data → Connections…" — so
+        // until this item existed the engine's own instructions pointed at a place that was not in
+        // the product. `validateMenuItem` needs no case for it: it is always available, by design.
+        dataMenu.addItem(
+            withTitle: "Connections…", action: #selector(connectionsAction), keyEquivalent: "")
         dataItem.submenu = dataMenu
         main.addItem(dataItem)
 
@@ -230,6 +236,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     @objc private func exportAction() { state?.presentExport() }
     @objc private func mergeAction() { state?.presentMerge() }
     @objc private func stagedAction() { state?.presentStaged() }
+    @objc private func connectionsAction() { state?.presentConnections() }
     // `badRowsAction` is gone with the title-bar accessory that was its only caller. The way into
     // the bad-rows sheet is the toolbar's row phrase (`RootView.RowSummaryItem`), which calls
     // `presentBadRows()` directly — a dead `@objc` selector kept "in case" is how a menu ends up
