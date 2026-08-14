@@ -566,7 +566,10 @@ too. The server-backed tests now also set `SET GLOBAL http_timeout=5` (loopback 
 like 30 s), so a future environment that cannot reach the oracle fails in seconds instead of four
 minutes.
 
-**Measured — run 2, on the fixed oracle: green.** All 13 pass on macos-15.
+**Measured — run 2 (`31759402330`), on the fixed oracle: green.** All 13 pass on macos-15 in
+1.4 s, and the whole job drops from 6 m 37 s to 1 m 50 s. **Every fact in this document is now
+reproduced on a second machine** — a different core count and a different SDK — so none of the ten
+is an artifact of this Mac.
 
 **Consequence.** Keep the canary step on the branch and keep the tests gated: the default suite
 stays offline and CI stays a real check on `INSTALL`. Two lessons beyond the verdict: this project's
