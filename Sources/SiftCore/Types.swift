@@ -213,6 +213,60 @@ public enum ReadArg: Sendable, Equatable {
     case text(String)
 }
 
+/// What a source that came from a URL is, on top of what it is as a file.
+///
+/// Carried beside `SourceKey` rather than folded into it: the key is `(path, mtime, size)` and
+/// stays exactly that — `path` is the **sanitized** URL, `mtimeNs` is the promoted
+/// `Last-Modified` (or the fetch clock), `size` is the `Content-Length`. Everything a remote
+/// source knows that a local one does not lives here.
+///
+/// 🔴 **No credential is in this struct, and that is a rule rather than an omission.** `url` is
+/// `RemoteURL.sanitized`, which by contract is "the ONLY form that may be displayed or persisted"
+/// — a SAS token rides in `RemoteURL.query`, in memory, and reaches DuckDB at the moment of the
+/// call that needs it. A `SourceSpec` outlives that moment: it is rendered into a `CREATE VIEW`
+/// that DuckDB writes into the on-disk store, and its `key.path` is written into `_sift_sources`.
+/// A query string in either place is a bearer credential on disk.
+public struct RemoteRef: Sendable, Equatable {
+    /// `RemoteURL.sanitized` — no query, no fragment, no `user:password@`.
+    public let url: String
+    public let etag: String?
+    public let lastModifiedMs: Int?
+    public let contentLength: Int?
+    /// The caller's clock at the moment the object was fetched. Only load-bearing when the server
+    /// offered no identity at all — see `remoteStagingToken`, which is where it is used.
+    public let fetchedAtNs: Int
+    /// Where the object was downloaded to, or `nil` when it is read in place (parquet, which
+    /// MEASURED really does range-read: a `count(*)` costs 0.2 % of the file).
+    ///
+    /// 🔴 The cache path **must keep the object's file extension**. `detectFormat` reads magic
+    /// bytes first but still consults the extension for the one container that needs it — a zip
+    /// whose extension is not `.xlsx`/`.xlsm` is refused as "looks like a zip archive, not a data
+    /// file", so an extension-less cache path turns every remote workbook into that refusal.
+    public let cachePath: String?
+
+    public init(
+        url: String, etag: String? = nil, lastModifiedMs: Int? = nil, contentLength: Int? = nil,
+        fetchedAtNs: Int, cachePath: String? = nil
+    ) {
+        self.url = url
+        self.etag = etag
+        self.lastModifiedMs = lastModifiedMs
+        self.contentLength = contentLength
+        self.fetchedAtNs = fetchedAtNs
+        self.cachePath = cachePath
+    }
+
+    /// The identity a cached copy of this object is matched on. Derived, never stored: two copies
+    /// of a token whose format has a version prefix is exactly the drift `stagingTokenVersion`'s
+    /// own comment is about.
+    public var stagingToken: String {
+        remoteStagingToken(
+            sanitizedURL: url, etag: etag, lastModifiedMs: lastModifiedMs,
+            contentLength: contentLength, fetchedAtNs: fetchedAtNs
+        )
+    }
+}
+
 /// Everything needed to build a relation over a file, without re-sniffing it.
 public struct SourceSpec: Sendable, Equatable {
     public let key: SourceKey
@@ -243,13 +297,17 @@ public struct SourceSpec: Sendable, Equatable {
     /// three-field header and five real columns. Quoting the header's count would put a second
     /// wrong number on top of the first one, in the note whose whole job is to correct it.
     public let raggedColumns: Int?
+    /// Set only for a source that came from a URL. `nil` — the default — is every local source,
+    /// which is why this is last in the memberwise init: every existing construction site compiles
+    /// untouched and behaves identically.
+    public let remote: RemoteRef?
 
     public init(
         key: SourceKey, fmt: Fmt, readFn: String, readArgs: [String: ReadArg] = [:],
         columns: [Column] = [], rowCount: Int? = nil, rowEstimate: RowEstimate? = nil,
         compressed: Bool = false, sheet: String? = nil, sheets: [SheetInfo] = [],
         deltaVersion: Int? = nil, sniffPrompt: String? = nil, glob: String? = nil,
-        raggedColumns: Int? = nil
+        raggedColumns: Int? = nil, remote: RemoteRef? = nil
     ) {
         self.key = key
         self.fmt = fmt
@@ -265,10 +323,17 @@ public struct SourceSpec: Sendable, Equatable {
         self.sniffPrompt = sniffPrompt
         self.glob = glob
         self.raggedColumns = raggedColumns
+        self.remote = remote
     }
 
     /// The path or glob the read function is pointed at.
-    public var target: String { glob ?? key.path }
+    ///
+    /// A downloaded remote object reads from its cache copy, never from the URL again: MEASURED
+    /// (spike §7), a remote CSV is a whole-object download on *every* statement, and a bare
+    /// `read_csv` pays for the object twice. `key.path` stays the URL, because that is the source's
+    /// identity and what the user is looking at; `target` is where the bytes actually are. `nil`
+    /// `remote`/`cachePath` leaves this exactly as it was.
+    public var target: String { remote?.cachePath ?? glob ?? key.path }
 }
 
 // MARK: - Queries
