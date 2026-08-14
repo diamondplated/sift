@@ -151,12 +151,55 @@ func aServerThatNeverAnswersTimesOutIntoNilRatherThanHanging() async throws {
     let rude = try RudeServer(manner: .silent)
     defer { rude.stop() }
 
+    let timeout: TimeInterval = 1
     let started = Date()
-    let identity = await remoteIdentity(try remote("\(rude.baseURL)/a.csv"), timeout: 1)
+    let identity = await remoteIdentity(try remote("\(rude.baseURL)/a.csv"), timeout: timeout)
     let elapsed = Date().timeIntervalSince(started)
     #expect(identity == nil)
-    #expect(elapsed < 10, "the identity probe hung for \(elapsed)s instead of timing out")
+    // 🔴 The number this bound has to separate is 31 from 1. It was a flat 10 s, it passed here, and
+    // on the macos-15 runner the same probe took **31 s** — the OS default — because
+    // `URLRequest.timeoutInterval` did not bound the request there at all.
+    //
+    // Why 20 and not `timeout + 2`: MEASURED, this suite runs ~850 tests in parallel and much of
+    // that blocks a cooperative-pool thread inside a synchronous DuckDB call — the same starvation
+    // `StageJob` uses a real `Thread` to escape. Under it, a 1 s deadline has been seen firing at
+    // 9.3 s and a bare top-level `Task.sleep(1)` at 6.3 s. A tight bound measures the pool, not the
+    // deadline. Three self-calibrating yardsticks were tried and thrown away for that reason; what
+    // makes them unnecessary is that the DEADLINE ITSELF has a wall-clock-free test below, so this
+    // one only has to catch "the host's timeout took over" — 20 clears the jitter twice over and
+    // sits well under the 31 s it exists to fail on.
+    #expect(elapsed < 20,
+            "the identity probe took \(elapsed)s against a \(timeout)s deadline")
 }
+
+@Test
+func theDeadlineIsSiftsOwnClockAndNotTheHostOperatingSystems() async throws {
+    // 🔴 The ONLY test that can tell a raced probe from an unraced one on this machine, and the
+    // reason `withDeadline` is a function rather than four lines inlined into `remoteIdentity`.
+    // MEASURED here: `URLSessionConfiguration.timeoutIntervalForRequest` is honoured to the
+    // millisecond on this Mac (10 ms asked, 20 ms taken) and was ignored entirely on the macos-15
+    // runner, so no assertion about `remoteIdentity`'s elapsed time can distinguish the two locally
+    // — the OS does the right thing here either way. This tests the deadline itself, against work
+    // that would never finish on any machine.
+    // No wall-clock assertion, deliberately: with a zero budget the deadline must win against work
+    // that takes 30 s, and the ANSWER says whether it did. That is decidable under any load, where
+    // "did it come back fast" is not (see `deadlineTakes`), and it goes red the instant the race is
+    // deleted instead of thirty seconds later.
+    let answer: String? = await withDeadline(0) {
+        try? await Task.sleep(nanoseconds: 30_000_000_000)
+        return "the slow answer nobody waited for"
+    }
+    #expect(answer == nil, "the deadline never fired — work outlived a zero budget")
+
+    // …and it is a deadline, not a delay: work that finishes answers immediately and with its own
+    // result, so a fast HEAD is never held back to the timeout. A flat ceiling is right here — the
+    // failure being guarded is "the full 30 s budget is always waited out", which is far outside
+    // even this suite's scheduling jitter.
+    let quick = Date()
+    #expect(await withDeadline(30) { "here" } == "here")
+    #expect(Date().timeIntervalSince(quick) < 20, "a finished result waited for the deadline")
+}
+
 
 @Test
 func remoteIdentityIsNilForEveryUrlUrlSessionCouldNotSign() async throws {

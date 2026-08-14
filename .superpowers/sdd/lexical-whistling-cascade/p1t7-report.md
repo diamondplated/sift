@@ -168,3 +168,100 @@ it — a redundancy that also made the guard untestable.
    is; it is the value the task named. The memory ceiling behind it is measured and documented on
    `downloadRemoteObject` (≈2.3× the object, because the blob cannot be sliced), so raising the cap
    is not free.
+
+---
+
+# Follow-up (p1t7b) — the deadline is Sift's, not the host's
+
+Base `79083ca`. CI was red on `aServerThatNeverAnswersTimesOutIntoNilRatherThanHanging`: on the
+macos-15 runner the probe took **31.05 s** against a 1 s deadline, and the test's flat 10 s ceiling
+caught it. Not flakiness — a real gap.
+
+**Status: done.** Warning-free from a wiped `.build`. **845 → 846 tests**, five consecutive full runs
+green. `SIFT_REMOTE_FACTS=1 swift test --filter remoteFact` → 24/24. `swift run sift --verify` →
+20 passed, 1 skipped (the new remote check, which needs `httpfs`).
+
+## What was actually wrong
+
+`remoteIdentity` documented a 5 s contract and then handed enforcement to
+`URLRequest.timeoutInterval`. MEASURED, both ends:
+
+| Machine | Asked | Taken |
+|---|---|---|
+| This Mac | 0.01 / 0.05 / 0.1 / 0.25 / 1 / 3 s | 0.020 / 0.052 / 0.103 / 0.258 / 1.009 / 3.003 s |
+| macos-15 CI | 1 s | **31 s** — the OS default |
+
+There is no timeout value at which the knob fails locally, which is the sharpest form of the SDK
+skew AGENTS.md warns about: this Mac makes an unbounded call look bounded to the millisecond.
+
+## The fix
+
+`withDeadline(_:_:)` — a `TaskGroup` racing the work against a `Task.sleep`, first result wins,
+loser cancelled. `remoteIdentity` runs its HEAD inside it. The knobs stay, as belt, on a session of
+Sift's own (`URLSession.shared`'s configuration is fixed, so `timeoutIntervalForResource` cannot be
+set on it at all) — but the race is the enforcement, so the contract holds whatever the host does.
+
+It is a separate function rather than four inlined lines for one reason, stated in a `ponytail:`
+note: on a machine where the OS knob works, a test of `remoteIdentity`'s elapsed time cannot tell a
+raced probe from an unraced one. `withDeadline` can be tested directly.
+
+## The test bound, and three yardsticks thrown away
+
+Tightening the ceiling to `timeout + 2` (as suggested) failed immediately — but for a reason worth
+recording, because it is not about this change at all. MEASURED under the **full parallel suite**
+(~850 tests, much of that blocking a cooperative-pool thread inside a synchronous DuckDB call — the
+same starvation `StageJob` uses a real `Thread` to escape):
+
+- a bare top-level `Task.sleep(1)` took **6.3 s**;
+- a 1 s `withDeadline` fired at **9.3 s** (instrumented: the group's *winner* arrived at 9.26 s and
+  the group exited at 9.26 s — so the cancelled loser costs nothing, the sleeper itself is late);
+- the same 1 s deadline alone takes **1.02 s**.
+
+So a tight wall-clock bound measures the thread pool, not the deadline. Three self-calibrating
+yardsticks were built and deleted in turn: a bare sleep measured *after* the probe (measures a pool
+that has already freed up — 1.51 s against a 4.67 s probe), one measured *alongside* it with
+`async let` (right idea, wrong machinery — 6.33 s against a 10.12 s probe), and `withDeadline` itself
+run alongside on the same budget (closest — within ~3.2 s, the residual being the URLSession child
+contending for the same pool). Each is more code and more explanation than the thing it protects.
+
+What made all of them unnecessary: **the deadline now has a test with no clock in it.**
+
+```swift
+let answer: String? = await withDeadline(0) {
+    try? await Task.sleep(nanoseconds: 30_000_000_000)
+    return "the slow answer nobody waited for"
+}
+#expect(answer == nil)
+```
+
+A zero budget against 30 s of work: the *answer* says whether the race exists, which is decidable
+under any load. It runs in **0.001 s** and goes red immediately instead of thirty seconds later.
+
+With the mechanism pinned that way, the end-to-end test only has to separate 31 from 1, so its bound
+is a flat `< 20` — twice the worst jitter measured here, well under the number it exists to fail on,
+and with the reasoning and both measurements in the comment beside it.
+
+## Mutations
+
+| Mutation | Result |
+|---|---|
+| the deadline sleeper deleted from `withDeadline` | 🔴 `theDeadlineIsSiftsOwnClockAndNotTheHostOperatingSystems` — **30.9 s**, the work outlived a zero budget |
+| `remoteIdentity` stops calling `withDeadline` (knobs only) | 🟢 **survives locally: 1.018 s vs 1.010 s raced.** This Mac honours the knob to the millisecond, so no assertion about elapsed time can tell the two apart here. It is killed on macos-15, where the same mutant IS the 31 s failure this follow-up exists for — recorded in the code, not hidden |
+
+## Concerns
+
+1. **The surviving mutant above is CI-only, by construction.** Nothing in the local suite proves
+   `remoteIdentity` still routes through `withDeadline`; the runner is the oracle. That is now
+   written on `withDeadline` itself so the next reader does not "simplify" the race away on the
+   evidence of a green local run.
+2. **`withTaskGroup` awaits the loser at scope exit.** Instrumented here, the cancelled
+   `URLSession.data(for:)` unwinds instantly (winner and exit at the same 9.26 s), so it costs
+   nothing — but that is measured on this Mac only. If CI ever shows the deadline firing on time and
+   the call still taking 31 s, this is the place to look, and the fix is an unstructured task the
+   caller never awaits.
+3. **Pool starvation is not mine, but it is now measured.** A 0.3 s `Task.sleep` taking 5.8 s inside
+   the suite is the same contention the earlier reports saw as "ten SiftUI profile tests time out
+   under load". Any future test that asserts on elapsed time in this suite needs a bound like this
+   one's, or the same measurement will bite it.
+4. **`sift --verify` now reports 21 checks, one skipped** — the sibling's remote check, gated behind
+   `SIFT_REMOTE_FACTS=1`. Not mine, but it changes the line the last report quoted as 20/20.

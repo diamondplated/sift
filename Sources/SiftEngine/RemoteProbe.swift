@@ -107,26 +107,76 @@ public func remoteIdentity(_ url: RemoteURL, timeout: TimeInterval = 5) async ->
         let target = URL(string: wireURL(url))
     else { return nil }
 
-    var request = URLRequest(
-        url: target, cachePolicy: .reloadIgnoringLocalAndRemoteCacheData, timeoutInterval: timeout
-    )
-    request.httpMethod = "HEAD"
-    guard let (_, response) = try? await URLSession.shared.data(for: request),
-        let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode)
-    else { return nil }
+    // Both knobs, on a session of our own — `URLSession.shared`'s configuration is fixed, so
+    // `timeoutIntervalForResource` cannot be set on it at all. They are belt; `withDeadline` below
+    // is the enforcement. See its comment for the measurement that made that necessary.
+    let configuration = URLSessionConfiguration.ephemeral
+    configuration.timeoutIntervalForRequest = timeout
+    configuration.timeoutIntervalForResource = timeout
+    configuration.requestCachePolicy = .reloadIgnoringLocalAndRemoteCacheData
+    let session = URLSession(configuration: configuration)
+    defer { session.finishTasksAndInvalidate() }
 
-    // `value(forHTTPHeaderField:)` is case-insensitive (macOS 13+), which matters: the loopback
-    // oracle sends `ETag` and Foundation reports it back as `Etag`.
-    let etag = http.value(forHTTPHeaderField: "ETag")?
-        .trimmingCharacters(in: .whitespaces)
-    let ranges = http.value(forHTTPHeaderField: "Accept-Ranges")?
-        .trimmingCharacters(in: .whitespaces).lowercased()
-    return RemoteIdentity(
-        etag: (etag?.isEmpty ?? true) ? nil : etag,
-        lastModifiedMs: http.value(forHTTPHeaderField: "Last-Modified").flatMap(httpDateMs),
-        contentLength: http.value(forHTTPHeaderField: "Content-Length").flatMap { Int($0) },
-        acceptsRanges: ranges == "bytes"
-    )
+    let request: URLRequest = {
+        var head = URLRequest(
+            url: target, cachePolicy: .reloadIgnoringLocalAndRemoteCacheData,
+            timeoutInterval: timeout
+        )
+        head.httpMethod = "HEAD"
+        return head
+    }()
+
+    return await withDeadline(timeout) {
+        guard let (_, response) = try? await session.data(for: request),
+            let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode)
+        else { return nil }
+
+        // `value(forHTTPHeaderField:)` is case-insensitive (macOS 13+), which matters: the loopback
+        // oracle sends `ETag` and Foundation reports it back as `Etag`.
+        let etag = http.value(forHTTPHeaderField: "ETag")?
+            .trimmingCharacters(in: .whitespaces)
+        let ranges = http.value(forHTTPHeaderField: "Accept-Ranges")?
+            .trimmingCharacters(in: .whitespaces).lowercased()
+        return RemoteIdentity(
+            etag: (etag?.isEmpty ?? true) ? nil : etag,
+            lastModifiedMs: http.value(forHTTPHeaderField: "Last-Modified").flatMap(httpDateMs),
+            contentLength: http.value(forHTTPHeaderField: "Content-Length").flatMap { Int($0) },
+            acceptsRanges: ranges == "bytes"
+        )
+    }
+}
+
+/// Run `work`, giving up and answering `nil` after `timeout` — **Sift's clock, not the host's.**
+///
+/// 🔴 MEASURED, and it is the reason this exists rather than a bare `timeoutInterval`. On the
+/// macos-15 CI runner a HEAD against a held-open socket, asked to give up after 1 s, took **31 s** —
+/// the OS default — so neither `URLRequest.timeoutInterval` nor
+/// `URLSessionConfiguration.timeoutIntervalForRequest` bounded it there. On this Mac the same knob
+/// is honoured to the millisecond (10 ms asked, 20 ms taken; 0.25/1/3 s each within 10 ms). That is
+/// the SDK skew AGENTS.md warns about in its sharpest form: the local machine makes an unbounded
+/// call look bounded, so the documented 5 s contract was really "whatever the host felt like".
+///
+/// A `TaskGroup` rather than a detached task and a continuation: the loser is cancelled by the group
+/// and the whole thing stays structured, so nothing outlives the call. `Task.sleep` and
+/// `URLSession.data(for:)` both honour cancellation, so the group exits as soon as the winner is in.
+///
+/// ponytail: generic and one call site, which is normally a smell. It is a separate function for
+/// one reason — `theDeadlineIsSiftsOwnClockAndNotTheHostOperatingSystems` can then test the
+/// mechanism directly, and on a machine where the OS knob happens to work (this one) that is the
+/// ONLY test that can tell a raced probe from an unraced one.
+func withDeadline<T: Sendable>(
+    _ timeout: TimeInterval, _ work: @Sendable @escaping () async -> T?
+) async -> T? {
+    await withTaskGroup(of: T?.self) { group in
+        group.addTask { await work() }
+        group.addTask {
+            try? await Task.sleep(nanoseconds: UInt64(max(0, timeout) * 1_000_000_000))
+            return nil
+        }
+        let first = await group.next() ?? nil
+        group.cancelAll()
+        return first
+    }
 }
 
 private let httpMonths = [
