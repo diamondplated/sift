@@ -10,7 +10,9 @@ A native Mac tool: drop a file in, explore it instantly. **One SwiftPM package, 
 SwiftUI/AppKit window over a Swift engine (`Session`, an actor) over a vendored `libduckdb`.
 No Python, no server, no web view: the 2026 rewrite deleted all three. DuckDB reads files
 **in place**, so size is not the constraint. Sift touches **no live system** — local files only,
-no credentials, no network egress. There is no port to bind because there is no server.
+no credentials, no network egress. The only listener anywhere is `LoopbackHTTPServer` —
+the test oracle for the remote-connections work — which binds 127.0.0.1 on an ephemeral
+port, is started only by tests or `--verify`, and must never grow a wildcard bind.
 
 ## The one rule: tests are the spec
 

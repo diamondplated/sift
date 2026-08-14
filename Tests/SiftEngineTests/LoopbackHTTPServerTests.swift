@@ -378,7 +378,7 @@ func remoteFactParquetReadThroughTheOracleIsRangedNotWholeObject() throws {
 
     let database = try Database.inMemory()
     database.loadExtensions(["httpfs"])
-    try #require(database.loadedExtensions["httpfs"] == true, "httpfs must be installed")
+    try #require(database.loadedExtensions["httpfs"] == .loaded, "httpfs must be installed")
     let connection = try database.connect()
     // Everything here is on 127.0.0.1, so 5 s is generous — and it is the difference between a
     // broken environment failing in seconds and burning the shipped 30 s default through its
