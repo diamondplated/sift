@@ -1,4 +1,5 @@
 import CDuckDB
+import DuckDBKit
 import Foundation
 import SiftCore
 
@@ -32,6 +33,41 @@ import SiftCore
 // cheapest connection that exists — an in-memory scratch one, opened and closed within this one
 // call — rather than threading the session's real `Connection` through (whose handle is
 // internal to DuckDBKit besides, by design; see Package.swift's comment on this target).
+
+/// Opens the gate's throwaway in-memory database, hardens it, hands the raw connection to `body`,
+/// and closes both on the way out. `nil` when DuckDB cannot start an in-memory instance at all.
+///
+/// 🔴 **This was the one connection in the engine `harden()` never reached** — a bare
+/// `duckdb_open`/`duckdb_connect` with every default in place, including `autoload_known_extensions`
+/// and an unrestricted VFS. "It only parses" was never a reason to leave the network on: binding a
+/// table function is what resolves a URL, and this file's whole job is to hand DuckDB SQL a user
+/// typed. `Database.remoteFilesystems` is the same list `harden()` denies, so the two cannot drift.
+///
+/// Raw C handles rather than `DuckDBKit.Connection`, for the reason the file header already gives:
+/// `duckdb_extract_statements` needs a `duckdb_connection`, and that handle is internal to
+/// DuckDBKit by design (see Package.swift's comment on this target).
+func withGuardScratchConnection<T>(_ body: (duckdb_connection) throws -> T) rethrows -> T? {
+    var db: duckdb_database?
+    guard duckdb_open(nil, &db) == DuckDBSuccess else { return nil }
+    defer { duckdb_close(&db) }
+
+    var con: duckdb_connection?
+    guard duckdb_connect(db, &con) == DuckDBSuccess, let con else { return nil }
+    defer {
+        var c: duckdb_connection? = con
+        duckdb_disconnect(&c)
+    }
+
+    // MEASURED: `current_setting('disabled_filesystems')` reads back `''` even on the connection
+    // that set it, so nothing can confirm this landed by asking. What confirms it is what it
+    // forbids — the disabled set only ever grows, so a narrowing SET fails once this has run, and
+    // that is what `theGateScratchConnectionIsHardenedLikeEveryOtherOne` asserts. The result is
+    // discarded for the same reason `harden()` is non-fatal: the gate is a message improver, and a
+    // hardening setting must not be what stops a query being classified.
+    _ = duckdb_query(con, "SET disabled_filesystems='\(Database.remoteFilesystems)'", nil)
+
+    return try body(con)
+}
 
 /// The leading run of a `duckdb_statement_type`'s C name, e.g. `DUCKDB_STATEMENT_TYPE_SELECT` ->
 /// `"SELECT"`. Mirrors Python's `str(statements[0].type).rsplit(".", 1)[-1].upper()`, which turns
@@ -81,53 +117,44 @@ private func statementTypeName(_ t: duckdb_statement_type) -> String {
 /// does not repeat the empty/comment-only/denied-keyword checks. Use `assertSelectOnly(_:)` below
 /// to run the full gate in the right order.
 public func assertSingleSelectStatement(_ sql: String) throws {
-    // Open-connect-close a throwaway in-memory database purely so the parser has somewhere to
-    // run — see the file header. This can realistically only fail if DuckDB itself cannot start
-    // an in-memory instance, which is not the submitted SQL's fault, so failure here falls
-    // through rather than blaming the query.
-    var db: duckdb_database?
-    guard duckdb_open(nil, &db) == DuckDBSuccess else { return }
-    defer { duckdb_close(&db) }
+    // The throwaway connection exists purely so the parser has somewhere to run — see the file
+    // header. `withGuardScratchConnection` returns nil when DuckDB cannot start an in-memory
+    // instance at all, which is not the submitted SQL's fault, so that falls through rather than
+    // blaming the query.
+    _ = try withGuardScratchConnection { con -> Void in
+        // Must be destroyed on every path — success, zero statements, and extract failure alike;
+        // duckdb.h is explicit that this holds even when nothing was extracted.
+        var extracted: duckdb_extracted_statements?
+        let count = duckdb_extract_statements(con, sql, &extracted)
+        defer { duckdb_destroy_extracted(&extracted) }
 
-    var con: duckdb_connection?
-    guard duckdb_connect(db, &con) == DuckDBSuccess, let con else { return }
-    defer {
-        var c: duckdb_connection? = con
-        duckdb_disconnect(&c)
-    }
-
-    // Must be destroyed on every path — success, zero statements, and extract failure alike;
-    // duckdb.h is explicit that this holds even when nothing was extracted.
-    var extracted: duckdb_extracted_statements?
-    let count = duckdb_extract_statements(con, sql, &extracted)
-    defer { duckdb_destroy_extracted(&extracted) }
-
-    if count == 0 {
-        let errMsg = extracted.flatMap(duckdb_extract_statements_error).map(String.init(cString:)) ?? ""
-        if !errMsg.isEmpty {
-            throw SQLRejected("That is not valid SQL: \(errMsg)")
+        if count == 0 {
+            let errMsg = extracted.flatMap(duckdb_extract_statements_error).map(String.init(cString:)) ?? ""
+            if !errMsg.isEmpty {
+                throw SQLRejected("That is not valid SQL: \(errMsg)")
+            }
+            throw SQLRejected("Nothing to run.")
         }
-        throw SQLRejected("Nothing to run.")
-    }
-    if count > 1 {
-        throw SQLRejected(
-            "Sift runs one statement at a time — it found \(count). "
-                + "Remove the semicolon and everything after it."
-        )
-    }
+        if count > 1 {
+            throw SQLRejected(
+                "Sift runs one statement at a time — it found \(count). "
+                    + "Remove the semicolon and everything after it."
+            )
+        }
 
-    // Must be destroyed on every path too — including a failed prepare, per duckdb.h.
-    var prepared: duckdb_prepared_statement?
-    let prepState = duckdb_prepare_extracted_statement(con, extracted, 0, &prepared)
-    defer { duckdb_destroy_prepare(&prepared) }
+        // Must be destroyed on every path too — including a failed prepare, per duckdb.h.
+        var prepared: duckdb_prepared_statement?
+        let prepState = duckdb_prepare_extracted_statement(con, extracted, 0, &prepared)
+        defer { duckdb_destroy_prepare(&prepared) }
 
-    // THE LANDMINE: a failed prepare is not a guard rejection — see file header. Whatever broke
-    // (most commonly a table the user hasn't opened yet) is the query path's problem to report.
-    guard prepState == DuckDBSuccess, let prepared else { return }
+        // THE LANDMINE: a failed prepare is not a guard rejection — see file header. Whatever broke
+        // (most commonly a table the user hasn't opened yet) is the query path's problem to report.
+        guard prepState == DuckDBSuccess, let prepared else { return }
 
-    let kind = statementTypeName(duckdb_prepared_statement_type(prepared))
-    if kind != "SELECT" && kind != "EXPLAIN" {
-        throw SQLRejected("Sift only runs SELECT queries; that is a \(kind) statement.")
+        let kind = statementTypeName(duckdb_prepared_statement_type(prepared))
+        if kind != "SELECT" && kind != "EXPLAIN" {
+            throw SQLRejected("Sift only runs SELECT queries; that is a \(kind) statement.")
+        }
     }
 }
 

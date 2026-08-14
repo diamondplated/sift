@@ -1,6 +1,21 @@
 import CDuckDB
 import Foundation
 
+/// What `loadExtensions` found out about one name.
+///
+/// 🔴 **Three states because `false` was two answers wearing one hat.** A legal name whose binary
+/// is not installed and a name the injection guard threw out both recorded `false`, and spec §11
+/// turns this dictionary into "a missing `delta` extension refuses the open" — so nothing above
+/// could tell "install azure" from "Sift asked DuckDB for a name it cannot use". One is a sentence
+/// with a fix in it; the other is a bug report. **Absent stays a fourth thing: never asked.**
+public enum ExtensionState: Sendable, Equatable {
+    case loaded
+    /// LOAD and INSTALL both failed — carries DuckDB's first line so the UI can say why.
+    case unavailable(String)
+    /// The name failed the injection guard. A Sift bug, never a user-fixable state.
+    case rejectedName
+}
+
 /// Owns the one `duckdb_database`. Creating connections from it is thread-safe,
 /// which is why this is `@unchecked Sendable` while `Connection` is not.
 public final class Database: @unchecked Sendable {
@@ -8,9 +23,22 @@ public final class Database: @unchecked Sendable {
     // loadedExtensions and hardened are written only during configure-time (harden/
     // loadExtensions) and read afterwards, making the unsynchronized dictionaries safe on
     // @unchecked Sendable.
-    public private(set) var loadedExtensions: [String: Bool] = [:]
+    public private(set) var loadedExtensions: [String: ExtensionState] = [:]
     /// Per-setting outcome of the last `harden()`, keyed by setting name.
     public private(set) var hardened: [String: Bool] = [:]
+
+    /// The filesystems `harden()` denies, as `disabled_filesystems` wants them: a bare
+    /// comma-separated list, no quoting.
+    ///
+    /// Public because `harden()` is not the only connection in the product that has to apply it —
+    /// `SiftEngine.assertSingleSelectStatement` opens its own scratch database for DuckDB's parser
+    /// and has to deny the same set. One constant, so the two can never drift apart, and so a task
+    /// that broadens the list broadens it everywhere at once.
+    ///
+    /// MEASURED (`docs/…/2026-08-16-duckdb-remote-facts.md` §1): `SET disabled_filesystems` never
+    /// validates a name, and the registry is not introspectable — a typo here is a security layer
+    /// that does nothing and says nothing.
+    public static let remoteFilesystems = "HTTPFileSystem,S3FileSystem"
 
     public init(path: String) throws {
         var db: duckdb_database?
@@ -56,7 +84,7 @@ public final class Database: @unchecked Sendable {
     /// for it. The four settings are a frozen contract (design spec §11).
     public func harden() {
         let settings = [
-            ("disabled_filesystems", "'HTTPFileSystem,S3FileSystem'"),
+            ("disabled_filesystems", "'\(Self.remoteFilesystems)'"),
             ("autoinstall_known_extensions", "false"),
             ("autoload_known_extensions", "false"),
             ("allow_community_extensions", "false"),
@@ -82,19 +110,24 @@ public final class Database: @unchecked Sendable {
             // Package invariant, from DBValue.swift: nothing in Sift interpolates a user
             // value into SQL text.
             guard Self.isExtensionName(name) else {
-                loadedExtensions[name] = false
+                loadedExtensions[name] = .rejectedName
                 continue
             }
             if (try? con.execute("LOAD \(name)")) != nil {
-                loadedExtensions[name] = true
+                loadedExtensions[name] = .loaded
                 continue
             }
             do {
                 try con.execute("INSTALL \(name)")
                 try con.execute("LOAD \(name)")
-                loadedExtensions[name] = true
+                loadedExtensions[name] = .loaded
             } catch {
-                loadedExtensions[name] = false
+                // The INSTALL-or-second-LOAD failure, not the first LOAD's: the first one always
+                // says the same uninteresting thing ("Extension …/<name>.duckdb_extension not
+                // found"), while this one distinguishes the two cases a user can act on — a 404
+                // from extensions.duckdb.org (no such extension) from a machine that could not
+                // reach it at all (no network). MEASURED against the vendored 1.5.5.
+                loadedExtensions[name] = .unavailable((error as? DuckDBError)?.firstLine ?? "\(error)")
             }
         }
     }

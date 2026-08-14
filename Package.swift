@@ -66,9 +66,12 @@ let package = Package(
             name: "SiftEngine",
             dependencies: ["SiftCore", "DuckDBKit", "CDuckDB"]
         ),
+        // CDuckDB for the same reason SiftEngine itself lists it: GuardStatementsTests reaches the
+        // gate's raw scratch connection (`withGuardScratchConnection`) to prove it is hardened, and
+        // that connection is a `duckdb_connection`, not a `DuckDBKit.Connection`.
         .testTarget(
             name: "SiftEngineTests",
-            dependencies: ["SiftEngine", "SiftCore", "DuckDBKit", "TestSupport"]
+            dependencies: ["SiftEngine", "SiftCore", "DuckDBKit", "CDuckDB", "TestSupport"]
         ),
         // The whole view layer, and every decision in it. No linkerSettings, for the same reason
         // SiftEngine has none: DuckDBKit's rpath flags propagate transitively, and repeating them

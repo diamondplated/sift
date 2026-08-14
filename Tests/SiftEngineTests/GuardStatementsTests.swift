@@ -1,3 +1,4 @@
+import CDuckDB
 import Testing
 @testable import SiftEngine
 import SiftCore
@@ -121,4 +122,57 @@ func allowedByTheCombinedGate(sql: String) throws {
     // already loaded, which is most of them.
     try assertSingleSelectStatement("SELECT * FROM a_table_that_does_not_exist_anywhere")
     try assertSelectOnly("SELECT * FROM a_table_that_does_not_exist_anywhere")
+}
+
+// MARK: - The one connection in the engine that harden() never reached
+
+/// 🔴 **The gate opened a raw `duckdb_open` with every default in place.** `autoload_known_extensions`
+/// on, `autoinstall_known_extensions` on, no `disabled_filesystems` — the only connection in
+/// SiftEngine outside `Database.harden()`, and the one that is handed SQL a user typed. "It only
+/// parses" is not a defence: `duckdb_prepare_extracted_statement` is a *binder* call, and binding
+/// `read_csv('http://…')` is what opens the URL.
+///
+/// **Proved by what it forbids, not by reading it back.** MEASURED
+/// (`docs/superpowers/specs/2026-08-16-duckdb-remote-facts.md` §2):
+/// `current_setting('disabled_filesystems')` returns `''` at every point, even on the connection
+/// that set it — a read-back assertion would pass with the hardening deleted. What is observable is
+/// the monotonicity: once a filesystem is disabled it can never be re-enabled, so a SET that drops
+/// one of the two names fails. Each half names the *other* name, which pins both entries of
+/// `Database.remoteFilesystems` rather than just the string being non-empty. Needs no network and
+/// no extension — the disabled set is tracked by name whether or not that filesystem is registered.
+@Test func theGateScratchConnectionIsHardenedLikeEveryOtherOne() throws {
+    // Narrowing to one name at a time: the error names whichever name is being dropped.
+    for (narrowTo, mustName) in [("HTTPFileSystem", "S3FileSystem"), ("S3FileSystem", "HTTPFileSystem")] {
+        // "" means the SET succeeded, i.e. nothing was disabled to begin with. nil would mean
+        // DuckDB could not start at all, which `#require` reports as its own thing.
+        let message = try #require(withGuardScratchConnection { con -> String in
+            var result = duckdb_result()
+            defer { duckdb_destroy_result(&result) }
+            guard duckdb_query(con, "SET disabled_filesystems='\(narrowTo)'", &result) != DuckDBSuccess
+            else { return "" }
+            return duckdb_result_error(&result).map(String.init(cString:)) ?? ""
+        })
+        #expect(!message.isEmpty,
+                "the gate's scratch connection let \(mustName) be re-enabled — it was never disabled")
+        #expect(message.contains(mustName), "expected \(mustName) to be locked out; got: \(message)")
+        #expect(message.contains("cannot be re-enabled"))
+    }
+}
+
+/// The control for the test above: the same two SETs succeed on a connection nothing hardened, so
+/// the assertion is reading the hardening rather than a property DuckDB has anyway.
+@Test func aScratchConnectionNobodyHardenedAcceptsThoseSameSets() throws {
+    // A fresh database per SET: the set is monotonic and Database-wide, so running both on one
+    // connection would itself be a narrowing and would fail for the right reason on the wrong
+    // connection — which is exactly the confusion this control exists to rule out.
+    for sql in ["SET disabled_filesystems='HTTPFileSystem'", "SET disabled_filesystems='S3FileSystem'"] {
+        var db: duckdb_database?
+        #expect(duckdb_open(nil, &db) == DuckDBSuccess)
+        defer { duckdb_close(&db) }
+        var con: duckdb_connection?
+        #expect(duckdb_connect(db, &con) == DuckDBSuccess)
+        defer { duckdb_disconnect(&con) }
+
+        #expect(duckdb_query(con, sql, nil) == DuckDBSuccess, "\(sql) failed on an un-hardened connection")
+    }
 }

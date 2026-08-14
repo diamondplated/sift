@@ -158,11 +158,12 @@ private func digest(_ rep: NSBitmapImageRep) -> UInt64 {
 }
 
 @Test func theMissingExtensionBannerIsPluralised_sorted_andCarriesItsFix() throws {
-    #expect(missingExtensionsBanner([:]) == nil)
-    #expect(missingExtensionsBanner(["excel": true, "delta": true]) == nil)
+    #expect(missingExtensionsBanner([:]).isEmpty)
+    #expect(missingExtensionsBanner(["excel": .loaded, "delta": .loaded]).isEmpty)
 
-    let one = try #require(missingExtensionsBanner(["excel": false, "delta": true]))
-    #expect(one.message.hasPrefix("DuckDB extension unavailable: excel."))
+    let one = try #require(
+        missingExtensionsBanner(["excel": .unavailable("HTTP Error: 404"), "delta": .loaded]).first)
+    #expect(one.message.hasPrefix("DuckDB extension unavailable: excel (HTTP Error: 404)."))
     #expect(one.message.hasSuffix("Fix with one online run of"))
     #expect(one.fix == "INSTALL excel")
 
@@ -171,12 +172,36 @@ private func digest(_ rep: NSBitmapImageRep) -> UInt64 {
     // themselves differently on every launch and the sentence reads like a changing situation.
     let many = try #require(
         missingExtensionsBanner(
-            ["excel": false, "delta": false, "httpfs": false, "aws": false, "spatial": false]))
+            ["excel": .unavailable("e"), "delta": .unavailable("d"), "httpfs": .unavailable("h"),
+             "aws": .unavailable("a"), "spatial": .unavailable("s")]
+        ).first)
     #expect(
         many.message.hasPrefix(
-            "DuckDB extensions unavailable: aws, delta, excel, httpfs, spatial."))
+            "DuckDB extensions unavailable: aws (a), delta (d), excel (e), httpfs (h), spatial (s)."))
     #expect(many.message.contains("refused rather than read incorrectly"))
     #expect(many.fix == "INSTALL aws; INSTALL delta; INSTALL excel; INSTALL httpfs; INSTALL spatial")
+}
+
+/// 🔴 **The reason `ExtensionState` exists, said in the one place a human reads it.** A name the
+/// injection guard threw out is not a missing binary: `INSTALL` cannot help, the user did nothing
+/// wrong, and the old boolean banner sent them off to install a string containing a semicolon. The
+/// two failures get two rows, and the bug row deliberately carries **no** `fix` — there is nothing
+/// to paste, and a sentence rendered in a keycap reads as a command to run.
+@Test func aRejectedExtensionNameSaysSiftBugRatherThanRunInstall() throws {
+    let bug = try #require(missingExtensionsBanner(["httpfs; ATTACH 'evil.db'": .rejectedName]).first)
+    #expect(bug.message.hasPrefix("Sift bug — report it:"))
+    #expect(bug.message.contains("httpfs; ATTACH 'evil.db'"))
+    #expect(bug.fix == nil, "a rejected name must not offer an INSTALL")
+    #expect(!bug.message.contains("INSTALL"))
+
+    // Both at once: two rows, unavailable first (it is the one with an action in it), and neither
+    // sentence borrows the other's advice.
+    let both = missingExtensionsBanner(["delta": .unavailable("IO Error: nope"), "zz;drop": .rejectedName])
+    #expect(both.count == 2)
+    #expect(both[0].message.contains("IO Error: nope"))
+    #expect(both[0].fix == "INSTALL delta")
+    #expect(both[1].message.hasPrefix("Sift bug"))
+    #expect(both[1].fix == nil)
 }
 
 // MARK: - the block that threw

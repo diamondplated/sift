@@ -22,7 +22,7 @@ private func tempDir() throws -> String { TestTemp.dir("engine-fixtures") }
 func extensionIsAvailable(_ name: String) -> Bool {
     guard let db = try? Database.inMemory() else { return false }
     db.loadExtensions([name])
-    return db.loadedExtensions[name] == true
+    return db.loadedExtensions[name] == .loaded
 }
 
 /// Tests/SiftCoreTests/Fixtures/<name>.xlsx — see that directory's README for why these three
@@ -262,7 +262,7 @@ func corpus() throws -> FixtureCorpus {
         ndjson: try makeNDJSON(dir: dir),
         hive: try makeHiveParquet(con: con, dir: dir),
         delta: try makeDelta(con: con, dir: dir),
-        deltaAvailable: db.loadedExtensions["delta"] == true,
-        excelAvailable: db.loadedExtensions["excel"] == true
+        deltaAvailable: db.loadedExtensions["delta"] == .loaded,
+        excelAvailable: db.loadedExtensions["excel"] == .loaded
     )
 }

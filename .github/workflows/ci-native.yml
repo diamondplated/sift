@@ -54,7 +54,7 @@ jobs:
       # `INSTALL httpfs` / `INSTALL azure` from extensions.duckdb.org is exercised on
       # macos-15, and the one place the loopback test oracle has to bind a socket inside
       # the runner sandbox. `SIFT_REMOTE_FACTS` is scoped to this step, so the main suite
-      # above stays exactly as it was: 729 tests, no network.
+      # above stays exactly as it was: 732 tests, no network.
       - name: Remote facts canary (httpfs + azure)
         env:
           SIFT_REMOTE_FACTS: "1"

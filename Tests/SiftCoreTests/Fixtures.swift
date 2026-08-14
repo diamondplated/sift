@@ -34,7 +34,7 @@ private func tempDir() throws -> String { TestTemp.dir("fixtures") }
 func extensionIsAvailable(_ name: String) -> Bool {
     guard let db = try? Database.inMemory() else { return false }
     db.loadExtensions([name])
-    return db.loadedExtensions[name] == true
+    return db.loadedExtensions[name] == .loaded
 }
 
 // MARK: - CSV
@@ -312,8 +312,8 @@ func corpus() throws -> FixtureCorpus {
         delta: try makeDelta(con: con, dir: dir),
         hive: try makeHiveParquet(con: con, dir: dir),
         empty: empty,
-        deltaAvailable: db.loadedExtensions["delta"] == true,
-        excelAvailable: db.loadedExtensions["excel"] == true
+        deltaAvailable: db.loadedExtensions["delta"] == .loaded,
+        excelAvailable: db.loadedExtensions["excel"] == .loaded
     )
 }
 

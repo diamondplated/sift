@@ -1,3 +1,4 @@
+import DuckDBKit
 import SiftCore
 import SiftEngine
 import SwiftUI
@@ -54,24 +55,54 @@ func sortTruncationText(rows: Int) -> String {
         + "\(groupDigits(String(rows))). Clear the sort to page the rest."
 }
 
-/// The missing-extension warning and its fix line, or `nil` when everything loaded.
+/// The extension warnings: one row per *kind* of failure, empty when everything loaded.
+///
+/// 🔴 **Two rows, because `ExtensionState` is two different sentences.** `.unavailable` is the
+/// user's problem and has a fix they can paste; `.rejectedName` means Sift asked DuckDB to load a
+/// name its own injection guard threw out, which no `INSTALL` can help with. Rendering both as
+/// "unavailable: <name>, run INSTALL <name>" — which is what the single boolean row did — sends a
+/// user to install something that was never the problem.
 ///
 /// 🔴 **Sorted.** The web iterated `Object.entries`, which is insertion-ordered; this reads a Swift
 /// `Dictionary`, whose order is not stable *between runs of the same process*. Unsorted, the same
 /// two missing extensions would name themselves in a different order each launch, and the sentence
 /// would look like it was describing a changing situation.
 ///
-/// Returned as two pieces because the fix is drawn as a `.kbd` — monospaced, so `INSTALL excel` is
-/// visibly a thing to paste rather than a thing to read.
-func missingExtensionsBanner(_ extensions: [String: Bool]) -> (message: String, fix: String)? {
-    let missing = extensions.filter { !$0.value }.keys.sorted()
-    guard !missing.isEmpty else { return nil }
-    return (
-        "DuckDB extension\(missing.count > 1 ? "s" : "") unavailable: "
-            + "\(missing.joined(separator: ", ")). Delta folders and .xlsx will be refused rather "
-            + "than read incorrectly. Fix with one online run of",
-        missing.map { "INSTALL \($0)" }.joined(separator: "; ")
-    )
+/// The fix comes back separately because it is drawn as a `.kbd` — monospaced, so `INSTALL excel`
+/// is visibly a thing to paste rather than a thing to read. `nil` for the bug row: there is nothing
+/// to paste, and a sentence in a keycap reads as a command.
+func missingExtensionsBanner(_ extensions: [String: ExtensionState]) -> [(message: String, fix: String?)] {
+    var rows: [(message: String, fix: String?)] = []
+
+    // 🔴 DuckDB's own first line travels with the name. Without it the banner can only say
+    // "unavailable", and "run INSTALL delta" is the wrong advice for a machine that is simply
+    // offline — which is the single most likely reason to be reading this banner at all.
+    let unavailable = extensions
+        .compactMap { name, state -> (name: String, why: String)? in
+            guard case .unavailable(let why) = state else { return nil }
+            return (name, why)
+        }
+        .sorted { $0.name < $1.name }
+    if !unavailable.isEmpty {
+        rows.append((
+            "DuckDB extension\(unavailable.count > 1 ? "s" : "") unavailable: "
+                + unavailable.map { "\($0.name) (\($0.why))" }.joined(separator: ", ")
+                + ". Delta folders and .xlsx will be refused rather than read incorrectly. "
+                + "Fix with one online run of",
+            unavailable.map { "INSTALL \($0.name)" }.joined(separator: "; ")
+        ))
+    }
+
+    let rejected = extensions.filter { $0.value == .rejectedName }.keys.sorted()
+    if !rejected.isEmpty {
+        rows.append((
+            "Sift bug — report it: Sift asked DuckDB for "
+                + "\(rejected.count > 1 ? "extension names it cannot use" : "an extension name it cannot use") "
+                + "(\(rejected.joined(separator: ", "))). Nothing you install will fix this.",
+            nil
+        ))
+    }
+    return rows
 }
 
 // MARK: - the two escape hatches
@@ -137,15 +168,21 @@ public struct BannerStack: View {
             if let table = state.active {
                 tableBanners(table)
             }
-            if let missing = missingExtensionsBanner(state.engine.extensions) {
+            // Indexed for the same reason the notes loop below is: these are plain tuples with
+            // nothing on them to be identified by.
+            ForEach(
+                Array(missingExtensionsBanner(state.engine.extensions).enumerated()), id: \.offset
+            ) { _, row in
                 BannerRow(.warning) {
-                    Text(missing.message)
-                    Text(missing.fix)
-                        .font(.system(size: 10, design: .monospaced))
-                        .padding(.horizontal, 4)
-                        .padding(.vertical, 1)
-                        .background(.quaternary, in: RoundedRectangle(cornerRadius: 3))
-                        .textSelection(.enabled)
+                    Text(row.message).textSelection(.enabled)
+                    if let fix = row.fix {
+                        Text(fix)
+                            .font(.system(size: 10, design: .monospaced))
+                            .padding(.horizontal, 4)
+                            .padding(.vertical, 1)
+                            .background(.quaternary, in: RoundedRectangle(cornerRadius: 3))
+                            .textSelection(.enabled)
+                    }
                 }
             }
             // The one free-text slot: whatever the last user action threw. Dismissible because

@@ -23,7 +23,7 @@ private func db(_ extensions: [String]) throws -> Database {
     let d = try Database.inMemory()
     d.loadExtensions(extensions)
     for name in extensions {
-        try #require(d.loadedExtensions[name] == true, "the \(name) extension must be installed")
+        try #require(d.loadedExtensions[name] == .loaded, "the \(name) extension must be installed")
     }
     return d
 }
@@ -76,7 +76,7 @@ func remoteFact1_azureRegistersTwoFilesystemsAndHardenBlocksNeither() throws {
     let hardened = try Database.inMemory()
     hardened.harden()
     hardened.loadExtensions(["azure"])
-    try #require(hardened.loadedExtensions["azure"] == true)
+    try #require(hardened.loadedExtensions["azure"] == .loaded)
     let text = failure(try hardened.connect(), "SELECT * FROM read_parquet('az://c/x.parquet')")
     #expect(!text.contains("Permission Error"), "harden() must not be assumed to cover Azure")
     #expect(text.contains("No valid Azure credentials found"))
@@ -286,7 +286,7 @@ func remoteFact6c_secretsAreTemporaryByDefaultAndRedactedOnRead() throws {
     do {
         let database = try Database(path: store)
         database.loadExtensions(["azure"])
-        try #require(database.loadedExtensions["azure"] == true)
+        try #require(database.loadedExtensions["azure"] == .loaded)
         let c = try database.connect()
         try c.execute("SET secret_directory='\(secretDir)'")
         try c.execute("""
@@ -452,7 +452,7 @@ func remoteFact8_httpTimeoutAndRetryKnobsAndTheirRealScope() throws {
     try before.execute("SET http_retries=7")
     #expect(throws: DuckDBError.self) { try before.execute("SET totally_made_up_setting=1") }
     pre.loadExtensions(["httpfs"])
-    try #require(pre.loadedExtensions["httpfs"] == true)
+    try #require(pre.loadedExtensions["httpfs"] == .loaded)
     #expect(try before.query("SELECT current_setting('http_retries')").allRows()[0][0] == .int(7))
     #expect(try pre.connect().query("SELECT current_setting('http_retries')").allRows()[0][0] == .int(3))
 }

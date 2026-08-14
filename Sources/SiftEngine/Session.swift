@@ -583,7 +583,7 @@ public actor Session {
         // is reading a Delta table as a raw parquet glob, which RESURRECTS DELETED ROWS — the
         // worst thing a tool whose entire premise is not lying about data could do. It deserves a
         // seam, not luck: `deltaLoadedForTest` is that seam and its only purpose.
-        if isDeltaDir(resolved), !(deltaLoadedForTest ?? (database.loadedExtensions["delta"] == true)) {
+        if isDeltaDir(resolved), !(deltaLoadedForTest ?? (database.loadedExtensions["delta"] == .loaded)) {
             throw SessionError(
                 "\((resolved as NSString).lastPathComponent) is a Delta table, but the DuckDB "
                     + "delta extension is not available, so Sift cannot read it correctly. Reading "
@@ -968,7 +968,7 @@ public actor Session {
 public struct EngineInfo: Sendable {
     public let duckdbVersion: String
     public let siftHome: String
-    public let extensions: [String: Bool]
+    public let extensions: [String: ExtensionState]
     public let stagedBytes: Int
     public let sharedStore: Bool
     public let dbPath: String

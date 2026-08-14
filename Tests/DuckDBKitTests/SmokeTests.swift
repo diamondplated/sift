@@ -139,7 +139,7 @@ import TestSupport
     let injected = "httpfs; ATTACH '\(evil)'"
     db.loadExtensions([injected])
 
-    #expect(db.loadedExtensions[injected] == false)
+    #expect(db.loadedExtensions[injected] == .rejectedName)
     #expect(!FileManager.default.fileExists(atPath: evil),
             "loadExtensions executed the injected ATTACH")
     #expect(Database.isExtensionName("httpfs"))
@@ -151,14 +151,35 @@ import TestSupport
     #expect(!Database.isExtensionName("httpfs\n"))
 }
 
-@Test func loadExtensionsRecordsAMissingExtensionAsFailed() throws {
-    // The dictionary this writes is what spec §11 turns into a policy decision: a missing
-    // `delta` extension must refuse the open rather than degrade to a parquet glob. It was
-    // entirely untested, LOAD→INSTALL→LOAD fallback included.
+/// 🔴 **The two failures, in one call, asserted to be DIFFERENT from each other.** The dictionary
+/// this writes is what spec §11 turns into a policy decision ("a missing `delta` extension refuses
+/// the open"), and until `ExtensionState` existed both rows said `false`: a binary nobody has
+/// installed and a name Sift's own injection guard threw out were the same answer. One of those is
+/// "run INSTALL delta"; the other is a bug report, and no amount of installing fixes it.
+///
+/// Both names go through ONE `loadExtensions` call on purpose — two separate calls could pass with
+/// the two states swapped, or with the guard rejecting everything, and nothing would notice.
+@Test func loadExtensionsTellsAMissingBinaryApartFromARejectedName() throws {
     let db = try Database.inMemory()
     db.harden()
-    db.loadExtensions(["not_a_real_extension"])
-    #expect(db.loadedExtensions["not_a_real_extension"] == false)
+    db.loadExtensions(["no_such_extension_zzz", "httpfs; ATTACH 'evil.db'"])
+
+    let missing = db.loadedExtensions["no_such_extension_zzz"]
+    let rejected = db.loadedExtensions["httpfs; ATTACH 'evil.db'"]
+
+    #expect(rejected == .rejectedName)
+    guard case .unavailable(let why) = missing else {
+        Issue.record("a legal-but-absent extension recorded \(String(describing: missing))")
+        return
+    }
+    // The payload is the whole reason `.unavailable` carries one: without DuckDB's own sentence a
+    // banner can only say "unavailable", which is the same advice for a 404 and for no network.
+    #expect(!why.isEmpty, "the reason DuckDB gave was thrown away")
+    #expect(missing != rejected, "the two failures are still one answer")
+
+    // Absent is the third state and it has to stay meaningful: never asked is not the same as
+    // asked and failed.
+    #expect(db.loadedExtensions["never_asked_for_this"] == nil)
 }
 
 /// `Connection` is deliberately not Sendable — one unit of work, one connection. `interrupt()`

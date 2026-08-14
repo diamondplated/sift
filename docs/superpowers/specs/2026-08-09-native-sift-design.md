@@ -579,10 +579,13 @@ simulated restart — keeps its shared home and gained an explicit `await first.
 `openPath` spawns a `Task.detached` that retains the actor, so scope exit alone never guaranteed
 the release.
 
-**`loadedExtensions[name] == false` conflates two failures — Plan 4 (reassigned 2026-08-11).** A legal name with
-no such extension installed, and a name rejected by the injection guard, both record
+**~~`loadedExtensions[name] == false` conflates two failures~~ — CLOSED, Plan 4 Task 1 (2026-08-13).** A legal name with
+no such extension installed, and a name rejected by the injection guard, both recorded
 `false`. Spec §11 turns this dictionary into "a missing `delta` extension refuses the
-open", so a caller cannot distinguish a missing binary from a typo in its own call.
+open", so a caller could not distinguish a missing binary from a typo in its own call.
+Now `DuckDBKit.ExtensionState`: `.loaded` / `.unavailable(String)` carrying DuckDB's own first
+line / `.rejectedName`, with absent still meaning "never asked". `missingExtensionsBanner`
+renders the two failures as two different sentences, and only `.unavailable` offers an `INSTALL`.
 
 *Reassignment note, 2026-08-11.* Both entries above were tagged "Plan 3", and Plan 3 closed
 without them — which the whole-plan review refused to let pass silently. The rulings:

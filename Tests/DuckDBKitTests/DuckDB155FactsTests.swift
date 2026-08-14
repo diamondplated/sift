@@ -74,7 +74,7 @@ private func siftCoreTestsFixture(_ name: String) -> String {
 private func extensionIsAvailable(_ name: String) -> Bool {
     guard let db = try? Database.inMemory() else { return false }
     db.loadExtensions([name])
-    return db.loadedExtensions[name] == true
+    return db.loadedExtensions[name] == .loaded
 }
 
 @Test(.enabled(if: extensionIsAvailable("excel"), "duckdb excel extension not installed"))

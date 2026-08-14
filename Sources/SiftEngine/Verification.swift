@@ -330,7 +330,7 @@ let verificationChecks: [VerificationCheck] = [
 
 @Sendable func checkOpenXLSX(_ ws: Workspace) async throws {
     let db = try scratchDatabase(loading: ["excel"])
-    guard db.loadedExtensions["excel"] == true else {
+    guard db.loadedExtensions["excel"] == .loaded else {
         throw VerifySkipped(
             message: "the DuckDB excel extension is not installed, so no .xlsx can be written or read"
         )
@@ -354,7 +354,7 @@ let verificationChecks: [VerificationCheck] = [
 
 @Sendable func checkOpenDelta(_ ws: Workspace) async throws {
     let session = try ws.session()
-    guard session.engineInfo().extensions["delta"] == true else {
+    guard session.engineInfo().extensions["delta"] == .loaded else {
         throw VerifySkipped(
             message: "the DuckDB delta extension is not installed, so Delta tables cannot be read"
         )
@@ -960,7 +960,7 @@ let verificationChecks: [VerificationCheck] = [
     let path = try writeSalesCSV(ws.path("sales.csv"), rows: 500)
     let session = try ws.session()
     let t = try await session.openPath(path)
-    let excelAvailable = session.engineInfo().extensions["excel"] == true
+    let excelAvailable = session.engineInfo().extensions["excel"] == .loaded
 
     var wrote: [String] = []
     for format in exportFormats {
