@@ -83,6 +83,22 @@ public struct RemoteURL: Sendable, Equatable {
     /// is opened as nothing at all. The query is removed *before* the extension is taken, and the
     /// extension is taken from `displayName`, which is derived from the path alone.
     public let effectiveExt: String
+
+    /// **This URL arrived carrying something `sanitized` threw away** — the ONE spelling of that
+    /// fact in the product, and the source of `RemoteRef.signed`.
+    ///
+    /// It is `query != nil` and nothing cleverer, because nothing cleverer is available: Sift cannot
+    /// tell a SAS signature from `?id=5` without parsing somebody's private auth scheme, and it does
+    /// not need to. The consequence is the same either way — the query is not persisted, so any
+    /// request re-derived from `sanitized` is a *different* request from the one that worked, and
+    /// for the shape this whole path was built around (`?sv=…&sig=…`) that difference is anonymous
+    /// versus authorised. "Signed" is the product's own word for it (`sasParquetNote`,
+    /// `ConnectionsSheet.sasNote`), so it is the word here.
+    ///
+    /// 🔴 A boolean, and it stays one. It must never grow into a length, a prefix, a hash or a
+    /// "which parameters were present" — every one of those is a fact about a bearer credential, and
+    /// this value's whole purpose is to be safe to carry into a `RemoteRef` that outlives the query.
+    public var signed: Bool { query != nil }
 }
 
 /// Classify a pasted string. `nil` = not remote → the existing local flow, untouched.

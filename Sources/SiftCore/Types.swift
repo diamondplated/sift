@@ -226,6 +226,10 @@ public enum ReadArg: Sendable, Equatable {
 /// call that needs it. A `SourceSpec` outlives that moment: it is rendered into a `CREATE VIEW`
 /// that DuckDB writes into the on-disk store, and its `key.path` is written into `_sift_sources`.
 /// A query string in either place is a bearer credential on disk.
+///
+/// `signed` below is the one thing this struct remembers about that query, and it stays inside the
+/// rule because it is a fact about the URL's SHAPE — one bit, "there was one" — and not a fact about
+/// the credential's content. Nothing derived from the signature's bytes may ever join it.
 public struct RemoteRef: Sendable, Equatable {
     /// `RemoteURL.sanitized` — no query, no fragment, no `user:password@`.
     public let url: String
@@ -244,9 +248,36 @@ public struct RemoteRef: Sendable, Equatable {
     /// file", so an extension-less cache path turns every remote workbook into that refusal.
     public let cachePath: String?
 
+    /// **The URL this came from carried a query, and `url` above does not.** `RemoteURL.signed`,
+    /// remembered — a boolean, never the query, never the signature, never a length or a prefix of
+    /// either.
+    ///
+    /// 🔴 **It exists because the alternative is every later caller guessing.** Refresh, a second
+    /// workbook sheet and the notes' re-open all re-derive a request from `url`, which by contract
+    /// has no signature — so each of them sends an anonymous request that comes back 403 and surfaces
+    /// a raw HTTP status. Two implementers hit that independently and each correctly declined to
+    /// invent a marker at their own layer. The engine knew at open time and was throwing the
+    /// knowledge away; this is the knowledge, kept.
+    ///
+    /// **It does NOT survive a relaunch, deliberately.** A `RemoteRef` is only ever built by
+    /// `buildRemoteSource` from a live `RemoteURL`; nothing reconstructs one from disk. The
+    /// `_sift_sources` row a remote table leaves behind persists the SANITIZED url and a staging
+    /// token, and its only readers are staged-copy adoption and the cache sweep — neither of which
+    /// sends a request, so there is no post-relaunch path that could fire the anonymous request this
+    /// flag exists to stop. Persisting it would therefore add a column that nothing can act on, to a
+    /// file the credential-grep tests walk, in order to record a property of a credential. The
+    /// relaunch failure is unchanged and stays as clear as it was: the table is simply not open, and
+    /// re-pasting the signed URL is the same route the refusals below name.
+    ///
+    /// It is deliberately absent from `stagingToken`. The token identifies the OBJECT, and two
+    /// fetches of one blob — one signed, one not — are the same bytes; folding this in would make a
+    /// re-issued SAS miss its own cache, which is the thing `remoteCachePath` hashes the sanitized
+    /// URL to prevent.
+    public let signed: Bool
+
     public init(
         url: String, etag: String? = nil, lastModifiedMs: Int? = nil, contentLength: Int? = nil,
-        fetchedAtNs: Int, cachePath: String? = nil
+        fetchedAtNs: Int, cachePath: String? = nil, signed: Bool = false
     ) {
         self.url = url
         self.etag = etag
@@ -254,6 +285,7 @@ public struct RemoteRef: Sendable, Equatable {
         self.contentLength = contentLength
         self.fetchedAtNs = fetchedAtNs
         self.cachePath = cachePath
+        self.signed = signed
     }
 
     /// The identity a cached copy of this object is matched on. Derived, never stored: two copies

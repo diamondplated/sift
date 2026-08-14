@@ -62,7 +62,11 @@ If you find a way to break one of these, that's a vulnerability and worth report
   signature for one DuckDB call. It must not appear in `spec.target`, `spec.key.path`, the SQL
   DuckDB stores for a created view, either persisted column of `_sift_sources`, a cache filename,
   `connections.json`, any snippet dialect, or any error message. This is why a SAS-signed parquet
-  is downloaded rather than read in place, and why the app says so.
+  is downloaded rather than read in place, and why the app says so. The one thing Sift keeps is
+  `RemoteRef.signed` — a **boolean**, "this URL arrived with a query", and never the query, the
+  signature, or a length or prefix of either. It is in memory only, it is not persisted and not part
+  of any cache identity, and it exists so that refreshing or re-opening such a source is refused with
+  a sentence naming the fix instead of quietly sent as an anonymous request.
 - **The SQL box cannot write.** The enforcement is *not* the keyword guard — it is that user SQL is
   wrapped as `SELECT * FROM (\n …\n) AS _q`. `DROP`, `COPY`, `ATTACH`, `PRAGMA` and `SET` cannot
   occupy a subquery position, so they die in DuckDB's parser before anything runs. The keyword

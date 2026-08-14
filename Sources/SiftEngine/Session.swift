@@ -1119,6 +1119,27 @@ public actor Session {
                     + "local file \u{2014} Sift already reads it from disk on every query."
             )
         }
+        // 🔴 **A signed source is refused here rather than 403'd two round trips later.** `ref.url`
+        // is `RemoteURL.sanitized` by contract, so every request this method would go on to make —
+        // the HEAD below, and `remoteOpen`'s HEAD and GET after it — carries no signature and reaches
+        // the server as somebody else. The outcome was DuckDB's own HTTP status line, which is true,
+        // clean and useless: it names a status code and no way out. This is the same knowledge the
+        // open had and used to throw away.
+        //
+        // FIRST of the refusals, ahead of the staging one below, because it is the one that cannot
+        // become false by waiting. "Wait for that copy to finish, then refresh" is the wrong sentence
+        // to give someone whose refresh will still be anonymous afterwards.
+        //
+        // The fix it names is real as of T12: the sidebar's path box takes a whole URL, query
+        // included, and `Session.openPath` → `classifyRemote` → `wireURL` is the choke point that
+        // keeps the signature in memory on the way through.
+        guard !ref.signed else {
+            throw SessionError(
+                "\(name) was opened from a signed URL and Sift never saved the signature, so a "
+                    + "refresh would reach the server as an anonymous request \u{2014} paste the "
+                    + "whole URL into Sift's path box again to re-open it."
+            )
+        }
         guard let url = classifyRemote(ref.url) else {
             // Unreachable through `openPath` (every remote spec was built from a URL that
             // classified), and a sentence rather than a crash because "unreachable" is a claim about
@@ -1624,7 +1645,12 @@ func buildRemoteOpen(
     let token = remoteObjectToken(url, identity, fetchedAtNs: fetchedAtNs)
 
     var notes: [String] = []
-    let sasParquet = fmt == .parquet && url.query != nil
+    // `url.signed`, which is also what `buildRemoteSource` writes into `RemoteRef.signed` below —
+    // one spelling of "this arrived with a query", read twice, rather than two `query != nil` tests
+    // that can drift. It is NOT read back off the ref: the ref does not exist yet, and cannot, since
+    // this line is what decides whether there is a cache file for `buildRemoteSource` to build the
+    // spec from.
+    let sasParquet = fmt == .parquet && url.signed
     if sasParquet { notes.append(sasParquetNote) }
 
     var cachePath: String?

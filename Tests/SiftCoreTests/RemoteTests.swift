@@ -84,6 +84,12 @@ private let table: [Case] = [
         #expect(u.host == c.host, "\(c.input) host")
         #expect(u.displayName == c.displayName, "\(c.input) displayName")
         #expect(u.effectiveExt == c.ext, "\(c.input) effectiveExt")
+        // `signed` is the ONE spelling of "this arrived with a query", read by the download decision
+        // (`sasParquetNote`) and written into `RemoteRef.signed`, which is what lets refresh and the
+        // sheet re-opens refuse instead of firing an anonymous request. Pinned against the `query`
+        // column already in this table, so every row above is a case for it too: 20 URLs, both
+        // answers, one line.
+        #expect(u.signed == (c.query != nil), "\(c.input) signed")
     }
 }
 
@@ -165,6 +171,9 @@ private let table: [Case] = [
     let u = try #require(classifyRemote("https://h/f.csv?"))
     #expect(u.query == nil)
     #expect(u.sanitized == "https://h/f.csv")
+    // …and therefore not signed either: a bare `?` carries nothing to have been dropped, so refusing
+    // to refresh it would be a refusal with no cause behind it.
+    #expect(!u.signed)
 }
 
 // MARK: - secret SQL

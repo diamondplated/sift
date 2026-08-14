@@ -588,9 +588,14 @@ public func buildRemoteSource(
         mtimeNs: identity?.lastModifiedMs.map { $0 * 1_000_000 } ?? fetchedAtNs,
         size: identity?.contentLength ?? 0
     )
+    // `url.signed` is the ONE spelling of "this arrived with a query" — the same property
+    // `buildRemoteOpen` reads to decide a SAS'd parquet has to be downloaded. This is where it stops
+    // being a fact about a `RemoteURL` that dies with the call and becomes a fact the catalog keeps,
+    // which is what lets refresh and the sheet re-opens refuse instead of guessing.
     let ref = RemoteRef(
         url: url.sanitized, etag: identity?.etag, lastModifiedMs: identity?.lastModifiedMs,
-        contentLength: identity?.contentLength, fetchedAtNs: fetchedAtNs, cachePath: cachePath
+        contentLength: identity?.contentLength, fetchedAtNs: fetchedAtNs, cachePath: cachePath,
+        signed: url.signed
     )
 
     guard let cachePath else {
