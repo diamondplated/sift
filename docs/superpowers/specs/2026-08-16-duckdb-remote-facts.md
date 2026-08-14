@@ -621,6 +621,13 @@ validate against and the object is refetched in full.
    adopted across opens either. The two mechanisms degrade together, which is the honest behaviour
    but means the worst case is a full refetch every time.
 
+**And it is a trap for tests, which Task 10 walked into and out of.** A test asserting *zero* GETs
+proves nothing while this cache is on: DuckDB's cache and Sift's cache produce the identical request
+log, so the assertion passes with the feature under test deleted. Any test whose subject is Sift's
+own download decision must `SET enable_external_file_cache=false` first, so the empty log has
+exactly one possible cause. This is the same failure the phase's timeout saga was: a correct-looking
+value with two possible provenances is not evidence.
+
 ---
 
 ## Requires the manual checklist (an Azure account, not guessable)
