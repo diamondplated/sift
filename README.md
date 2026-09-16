@@ -51,6 +51,25 @@ imported — a 20 GB CSV opens as fast as a 2 MB one, and never has to fit in me
 
 ---
 
+## Install
+
+```sh
+brew install --cask diamondplated/tap/sift
+```
+
+Or download `Sift-x.y.z.zip` from [Releases](https://github.com/diamondplated/sift/releases/latest)
+(Apple silicon, macOS 14+). The bundle is self-contained: libduckdb rides inside it.
+
+**macOS will block the first launch** — the build is ad-hoc signed, not notarized. Approve it once
+under **System Settings → Privacy & Security**, or strip the quarantine attribute yourself if you
+trust the build:
+
+```sh
+xattr -dr com.apple.quarantine /Applications/Sift.app
+```
+
+Or build it yourself — two commands, below.
+
 ## Quick start
 
 ```bash
@@ -68,8 +87,9 @@ swift run sift ~/Desktop/orders.csv    # schema + first rows at your terminal
 swift run sift --verify                # the engine proving itself: 26 checks, every format
 ```
 
-**Requirements:** macOS 14+. No Xcode needed — everything builds with SwiftPM and the Command Line
-Tools. No Python, no Node, no third-party Swift dependencies. None.
+**Requirements:** macOS 14+ to run. To build, Xcode 16 or newer: the app is SwiftUI, and from the
+macOS 27 SDK on, SwiftUI's property-wrapper macros only ship inside Xcode, so the Command Line Tools
+alone no longer compile it. No Python, no Node, no third-party Swift dependencies. None.
 
 ---
 
