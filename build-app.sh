@@ -70,8 +70,14 @@ set_plist CFBundlePackageType         string  "APPL"
 set_plist CFBundleIdentifier          string  "io.github.diamondplated.sift"
 set_plist CFBundleName                string  "Sift"
 set_plist CFBundleDisplayName         string  "Sift"
-set_plist CFBundleShortVersionString  string  "0.1.0"
-set_plist CFBundleVersion             string  "1"
+# The bundle's version is the newest tag reachable from HEAD (2.0.0, 2.0.1, ...),
+# so a release zip and "About Sift" agree with the tag it was built from. Override
+# with SIFT_VERSION=x.y.z for a build off an untagged commit. CFBundleVersion is the
+# commit count, which only ever goes up.
+VERSION="${SIFT_VERSION:-$(git describe --tags --abbrev=0 2>/dev/null | sed 's/^v//')}"
+VERSION="${VERSION:-0.0.0}"
+set_plist CFBundleShortVersionString  string  "$VERSION"
+set_plist CFBundleVersion             string  "$(git rev-list --count HEAD 2>/dev/null || echo 1)"
 set_plist LSMinimumSystemVersion      string  "14.0"
 set_plist NSHumanReadableCopyright    string  "Engine Data Management"
 set_plist NSHighResolutionCapable     bool    true
