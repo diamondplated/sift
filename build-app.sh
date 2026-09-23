@@ -79,7 +79,7 @@ VERSION="${VERSION:-0.0.0}"
 set_plist CFBundleShortVersionString  string  "$VERSION"
 set_plist CFBundleVersion             string  "$(git rev-list --count HEAD 2>/dev/null || echo 1)"
 set_plist LSMinimumSystemVersion      string  "14.0"
-set_plist NSHumanReadableCopyright    string  "Engine Data Management"
+set_plist NSHumanReadableCopyright    string  "Copyright © 2026 diamondplated"
 set_plist NSHighResolutionCapable     bool    true
 # NSAppTransportSecurity is gone with the WKWebView it existed for. The app talks to no network.
 
@@ -167,7 +167,7 @@ function run(argv) {
     null, size, size, 8, 4, true, false, $.NSCalibratedRGBColorSpace, 0, 0)
   $.NSGraphicsContext.setCurrentContext($.NSGraphicsContext.graphicsContextWithBitmapImageRep(rep))
   const pad = size * 0.055, r = size * 0.22
-  $.NSColor.colorWithCalibratedRedGreenBlueAlpha(240/255, 83/255, 35/255, 1).setFill  // Engine orange
+  $.NSColor.colorWithCalibratedRedGreenBlueAlpha(240/255, 83/255, 35/255, 1).setFill  // Sift orange
   $.NSBezierPath.bezierPathWithRoundedRectXRadiusYRadius($.NSMakeRect(pad, pad, size - 2*pad, size - 2*pad), r, r).fill
   $.NSColor.whiteColor.setFill
   for (const [cy, hw, hh] of [[0.335, 0.300, 0.052], [0.500, 0.215, 0.052], [0.665, 0.130, 0.052]])
