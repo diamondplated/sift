@@ -173,10 +173,10 @@ private func appKitReady() { _ = NSApplication.shared }
 // MARK: - the source tab
 
 /// 🔴 Built by hand, not by opening a file. `stats` is a pure map from `Table` to rows, and every
-/// opened `Session` in this target is a real `SUMMARIZE` competing with the five-second `waitFor`
-/// budgets the rest of the suite runs on — MEASURED: this file's fixtures were enough to time three
-/// of those out on a loaded machine. The real-open path is still covered, once, by the Source-tab
-/// render below.
+/// opened `Session` in this target is a real `SUMMARIZE` competing with the `waitFor` budgets the
+/// rest of the suite runs on (five seconds then, thirty since #5) — MEASURED: this file's
+/// fixtures were enough to time three of those out on a loaded machine. The real-open path is
+/// still covered, once, by the Source-tab render below.
 @Test func theStatsGridSaysWhatIsKnownLeavesOutWhatIsNotAndTildesAnEstimate() throws {
     var table = fakeTable(fmt: .csv)
     table.spec = SourceSpec(
