@@ -47,8 +47,13 @@ func makeCSV(in dir: URL, name: String = "t.csv", rows: Int = 12) throws -> Stri
 /// background assertion in this target polls for a real signal instead, and the polling itself is
 /// what makes the assertion honest: it fails by timing out, not by reading a value that was never
 /// going to change.
+///
+/// MEASURED (#5): the default was 5 s, and on the `air` runner at load average 17–28 four profile
+/// waits ran out of it in tests whose neighbours took 35–37 s to pass. The default bounds a wait for
+/// something that WILL happen, so it costs nothing until a test is already failing; every
+/// wait-for-absence (`== false`) passes its own short budget and is unaffected.
 func waitFor(
-    _ timeout: Double = 5, _ condition: @MainActor () -> Bool
+    _ timeout: Double = 30, _ condition: @MainActor () -> Bool
 ) async -> Bool {
     let deadline = Date().addingTimeInterval(timeout)
     while Date() < deadline {

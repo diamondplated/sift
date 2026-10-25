@@ -7,7 +7,7 @@ maintenance cost" rather than "is this a nice idea".
 
 ```bash
 ./scripts/fetch-duckdb.sh    # once, needs network — the pinned prebuilt libduckdb
-swift build && swift test    # 910 declared (37 gated off), ~30 s
+swift build && swift test    # 938 declared (39 gated off), ~30 s
 ./build-app.sh               # -> ./Sift.app
 ```
 
@@ -16,7 +16,7 @@ The `delta` and `excel` DuckDB extensions install themselves from DuckDB's own r
 first use (one-time, needs network), and so do `httpfs` and `azure` the first time someone
 saves a remote connection.
 
-37 of those tests carry the `remoteFact` prefix and are gated behind `SIFT_REMOTE_FACTS=1` — the
+39 of those tests carry the `remoteFact` prefix and are gated behind `SIFT_REMOTE_FACTS=1` — the
 ones allowed to `INSTALL` an extension, so the default run stays offline; CI runs them as a separate
 step. If
 you touch anything under `Remote`, `Connections`, `Keychain` or the remote half of `Session`,
@@ -59,9 +59,10 @@ subtle bugs in this codebase's history were only visible with a real multi-milli
 If you touched the grid or the sort, test against a large file with a *non-unique* sort column;
 more than one real bug here was invisible on unique keys.
 
-One more oracle: **CI runs macos-15, and your Mac's SDK is probably newer.** Code that compiles
-locally has failed there repeatedly (stricter Sendable inference, different system-color
-resolution). Treat a local green build as provisional until CI agrees.
+One more oracle: **CI runs on a self-hosted Mac on the macOS 26 SDK.** When it ran on hosted
+`macos-15`, code that compiled on a newer local SDK failed there repeatedly (stricter Sendable
+inference, different system-color resolution); nothing catches that class of break now. Treat a
+local green build as provisional until CI agrees.
 
 ## Things not to simplify away
 

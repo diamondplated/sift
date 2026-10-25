@@ -28,7 +28,7 @@ verdict from — which binds 127.0.0.1 on an ephemeral port, is started only by 
 
 ## The one rule: tests are the spec
 
-`Tests/**` is the source of truth for behavior — **936** declared across `DuckDBKitTests`,
+`Tests/**` is the source of truth for behavior — **938** declared across `DuckDBKitTests`,
 `SiftCoreTests`, `SiftEngineTests`, `SiftUITests`. **39** of them carry the `remoteFact` prefix and
 are gated behind `SIFT_REMOTE_FACTS=1`: those are the ones allowed to `INSTALL` an extension over
 the network, and CI runs them as a separate step.
@@ -63,7 +63,7 @@ optional. Temp paths go through `Tests/TestSupport`'s `TestTemp` — a bare
 
 ```bash
 ./scripts/fetch-duckdb.sh          # once, needs network — the pinned prebuilt libduckdb
-swift build && swift test          # 936 declared, 39 gated off, ~30 s; warning-free is the bar
+swift build && swift test          # 938 declared, 39 gated off, ~30 s; warning-free is the bar
 swift run sift --verify            # the engine end to end: 26 checks, every format
 SIFT_REMOTE_FACTS=1 swift test     # + the 39 that may INSTALL an extension over the network
 ./build-app.sh                     # -> ./Sift.app; verify by MOVING it away from the repo
@@ -81,9 +81,10 @@ several real bugs here were invisible on small files. The window cannot be scree
 machine (no Screen Recording); the working capture is `cacheDisplay(in:to:)` on a live `NSView`,
 control-render-first. `ImageRenderer` is measurably unstable for pixel comparison — don't.
 
-**CI on macos-15 is the only SDK oracle.** This Mac carries a newer SDK and has accepted code
-the runner rejects (Sendable inference, system-color resolution) multiple times. Push and read
-CI rather than trusting a local green build.
+**CI is a self-hosted MacBook Air on the macOS 26 SDK**, not GitHub's `macos-15` any more, so
+nothing now catches a break only an older SDK would reject (hosted macos-15 caught Sendable
+inference and system-color resolution breaks multiple times). It runs on PRs and on pushes to
+`main`; loopback-HTTP tests flake when the Air is busy (#5). Push and read CI anyway.
 
 ## Architecture, and where the state lives
 
