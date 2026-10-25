@@ -314,6 +314,15 @@ private func fetch(
     for server in servers { #expect(server.requestLog.count == 5) }
 }
 
+/// AGENTS.md: the listener "must never grow a wildcard bind". Asked of the kernel, not of the
+/// source: a bind to `INADDR_ANY` still answers every `127.0.0.1` request above, so nothing else in
+/// this file would notice one.
+@Test func theListenerIsBoundToLoopbackAndNothingElse() throws {
+    let server = try LoopbackHTTPServer()
+    defer { server.stop() }
+    #expect(server.boundAddress == INADDR_LOOPBACK.bigEndian)
+}
+
 @Test func stopLeavesNoSocketsBehind() throws {
     // 50 servers, started and stopped. Each holds one listening socket and one thread that only
     // exits when the socket is closed, so a `stop()` that fails to unblock `accept()` shows up

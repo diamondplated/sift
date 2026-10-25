@@ -7,7 +7,7 @@ maintenance cost" rather than "is this a nice idea".
 
 ```bash
 ./scripts/fetch-duckdb.sh    # once, needs network — the pinned prebuilt libduckdb
-swift build && swift test    # 938 declared (39 gated off), ~30 s
+swift build && swift test    # 939 declared (39 gated off), ~30 s
 ./build-app.sh               # -> ./Sift.app
 ```
 
