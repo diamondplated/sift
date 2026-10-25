@@ -154,14 +154,14 @@ sift/
     SiftUI/             every view and view model
     SiftApp/            @main, menus, LaunchServices — nothing with a decision in it
     sift/               the CLI
-  Tests/                910 tests; the spec
+  Tests/                938 tests; the spec
 ```
 
 `SiftCore` is pure on purpose — importable with no connection and no state, which is why most of
 the suite runs in milliseconds:
 
 ```bash
-swift test          # 910 tests, ~30 s, fully parallel
+swift test          # 938 tests, ~30 s, fully parallel
 ```
 
 ---

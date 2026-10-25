@@ -3,7 +3,7 @@ name: CI (native)
 on:
   pull_request:
   push:
-    branches: [native]
+    branches: [main]
   workflow_dispatch:
 
 permissions:
@@ -25,8 +25,8 @@ jobs:
         with:
           persist-credentials: false
 
-      # This machine has only the macOS 26 SDK, so macos-15 is the only oracle for
-      # SDK-version build breaks. latent hit two that were invisible locally.
+      # The Air carries the macOS 26 SDK. Since hosted macos-15 went away, nothing here
+      # catches a break that only an older SDK would reject.
       - name: Show toolchain
         run: |
           sw_vers
@@ -49,13 +49,10 @@ jobs:
       - name: Verify end to end
         run: swift run sift --verify
 
-      # P1-T0 CANARY — draft-PR probe, not for merge.
-      #
       # Everything the `Test` step above runs is offline. This is the one place a cold
-      # `INSTALL httpfs` / `INSTALL azure` from extensions.duckdb.org is exercised on
-      # macos-15, and the one place the loopback test oracle has to bind a socket inside
-      # the runner sandbox. `SIFT_REMOTE_FACTS` is scoped to this step, so the main suite
-      # above stays exactly as it was: 732 tests, no network.
+      # `INSTALL httpfs` / `INSTALL azure` from extensions.duckdb.org is exercised, and the
+      # one place the loopback test oracle has to bind a socket inside the runner.
+      # `SIFT_REMOTE_FACTS` is scoped to this step, so the main suite above stays offline.
       - name: Remote facts canary (httpfs + azure)
         env:
           SIFT_REMOTE_FACTS: "1"
