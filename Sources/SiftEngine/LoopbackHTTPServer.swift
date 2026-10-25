@@ -66,6 +66,11 @@ public final class LoopbackHTTPServer: @unchecked Sendable {
     /// The ephemeral port the kernel handed out. Distinct per server, so servers are parallel-safe.
     public let port: UInt16
 
+    /// The address the kernel says the listener is bound to, in network byte order, read back by
+    /// `getsockname` rather than taken from what was asked for. The one fact that keeps this
+    /// server off the network, so `theListenerIsBoundToLoopbackAndNothingElse` pins it.
+    let boundAddress: in_addr_t
+
     /// `http://127.0.0.1:<port>` — the prefix every registered path hangs off.
     public var baseURL: String { "http://127.0.0.1:\(port)" }
 
@@ -113,6 +118,7 @@ public final class LoopbackHTTPServer: @unchecked Sendable {
         }
         fd = sock
         port = UInt16(bigEndian: me.sin_port)
+        boundAddress = me.sin_addr.s_addr
 
         Thread.detachNewThread { [self] in acceptLoop() }
     }

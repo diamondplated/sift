@@ -17,6 +17,10 @@ jobs:
   build:
     name: Build and test
     runs-on: [self-hosted, macOS, air]
+    # The runner is someone's desktop and this repo is public: a fork's PR would run its own
+    # Package.swift, tests and scripts on that machine. Only branches of this repo get a run;
+    # a fork PR is re-pushed to a branch here by a maintainer once its diff has been read.
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
 
     timeout-minutes: 20
 
