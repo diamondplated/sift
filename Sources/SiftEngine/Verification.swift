@@ -940,7 +940,9 @@ func permissiveSession(_ ws: Workspace) throws -> Session {
     try Session.writeRemoteConfig(
         RemoteConfig(allowRemote: true), to: Session.connectionsPath(in: ws.home)
     )
-    let session = try ws.session()
+    // A loopback HEAD has no business taking 5 s, but a starved one has done (#5), and the checks
+    // built on this session assert what that HEAD carried. 60 s is `parsingBudget`'s number.
+    let session = try Session(home: ws.home, keychainService: Keychain.service, identityBudget: 60)
 
     try requireEqual(session.allowRemoteAtLaunch, true, "the posture the Database opened with")
     // MEASURED (remote facts §2): the permissive posture never issues the SET at all, so the key is

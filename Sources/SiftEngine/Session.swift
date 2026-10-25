@@ -161,6 +161,13 @@ public actor Session {
     /// trips without ever touching an item a user actually saved — the same namespace split
     /// `KeychainTests` makes, applied one layer up. There is no public way to set it.
     nonisolated let keychainService: String
+    /// How long a remote open or refresh waits for its identity HEAD before going on without one.
+    ///
+    /// Production is always `remoteIdentity`'s 5 s. The seam exists for `--verify`'s remote checks,
+    /// which assert the ETag that HEAD carries: MEASURED (#5) on the `air` runner under load, a HEAD
+    /// that succeeded was cut off at 5 s and the check read `nil`, the same starvation
+    /// `RemoteProbeTests`' `parsingBudget` already exists for. There is no public way to set it.
+    nonisolated let identityBudget: TimeInterval
     /// `@unchecked Sendable` (Database.swift) and immutable after `init`, so `nonisolated` lets
     /// the detached background pipeline in `runAfterOpen` reach it without an actor hop — the
     /// whole point of that path being detached in the first place.
@@ -256,7 +263,7 @@ public actor Session {
         try self.init(home: home, keychainService: Keychain.service)
     }
 
-    init(home: String?, keychainService: String) throws {
+    init(home: String?, keychainService: String, identityBudget: TimeInterval = 5) throws {
         let resolvedHome = Self.resolveHome(home)
         // Read once into a local: the failure path below needs it while `self` is still only
         // partly initialized, and it must be the SAME value `deinit` will release with.
@@ -332,6 +339,7 @@ public actor Session {
             self.remoteConfig = config
             self.allowRemoteAtLaunch = config.allowRemote
             self.keychainService = keychainService
+            self.identityBudget = identityBudget
 
             db.harden(allowRemote: config.allowRemote)
             db.loadExtensions(sessionExtensions + remoteExtensions(for: config))
@@ -1085,13 +1093,14 @@ public actor Session {
     ) async throws -> RemoteOpen {
         let database = self.database
         let home = self.siftHome
+        let identityBudget = self.identityBudget
         let fetchedAtNs = fetchClockNs()
         do {
             return try await Task.detached {
                 try await buildRemoteOpen(
                     database: database, home: home, url: url, fetchedAtNs: fetchedAtNs,
                     sheet: sheet, nullPadding: nullPadding, skipPreamble: skipPreamble,
-                    knownToken: knownToken
+                    knownToken: knownToken, identityBudget: identityBudget
                 )
             }.value
         } catch let error as UnsupportedSource {
@@ -1192,7 +1201,7 @@ public actor Session {
         // `remoteIdentity` is `URLSession` only — no DuckDB call, nothing that blocks a thread — so
         // it awaits here on the actor rather than in a detached task, and the actor is free for the
         // duration. The DuckDB half below is still detached, for the reason `remoteOpen` states.
-        let identity = await remoteIdentity(url)
+        let identity = await remoteIdentity(url, timeout: identityBudget)
         // RECORDED SURVIVING MUTANT, both this guard and its twin below: they close the window
         // opened by the two `await`s in this method (a tab closed mid-probe, mid-download), and
         // reaching either one means losing a race deliberately, which is not reproducible at unit
@@ -1663,11 +1672,12 @@ let sasParquetNote =
 /// save one fetch on the rarest shape of URL there is.
 func buildRemoteOpen(
     database: Database, home: String, url: RemoteURL, fetchedAtNs: Int,
-    sheet: String?, nullPadding: Bool, skipPreamble: Bool, knownToken: String? = nil
+    sheet: String?, nullPadding: Bool, skipPreamble: Bool, knownToken: String? = nil,
+    identityBudget: TimeInterval = 5
 ) async throws -> RemoteOpen {
     let con = try database.connect()
     let fmt = try remoteFormat(url, con: con)
-    let identity = await remoteIdentity(url)
+    let identity = await remoteIdentity(url, timeout: identityBudget)
     let token = remoteObjectToken(url, identity, fetchedAtNs: fetchedAtNs)
 
     var notes: [String] = []
