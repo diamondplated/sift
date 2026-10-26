@@ -1,3 +1,9 @@
+> [!IMPORTANT]
+> **Sift has moved to [diamondplated/mac-apps](https://github.com/diamondplated/mac-apps/tree/main/Sift).**
+> This repository is archived and read-only. Its full history, tags (as `sift-v*`) and open
+> issues moved with it. Existing release downloads here keep working, and
+> `brew install --cask diamondplated/tap/sift` is unchanged.
+
 <h1 align="center">Sift</h1>
 
 <p align="center"><strong>Drop a file in. Explore it instantly.</strong></p>
